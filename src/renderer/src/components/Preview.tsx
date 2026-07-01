@@ -42,6 +42,7 @@ export default function Preview() {
   const compRef = useRef<Compositor | null>(null)
   const audioRef = useRef<AudioPool | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [gpuStatus, setGpuStatus] = useState<'ok' | 'reconnecting' | 'failed'>('ok')
 
   const project = useEditor((s) => s.project)
   const playhead = useEditor((s) => s.playheadSec)
@@ -68,6 +69,23 @@ export default function Preview() {
     }
     compRef.current = comp
 
+    // WebGL context-loss recovery: a lost GPU context rebuilds its GL resources
+    // instead of black-screening. The overlay tells the user what's happening.
+    let stableTimer = 0
+    const onLost = (e: Event): void => {
+      comp.handleContextLoss(e)
+      setGpuStatus('reconnecting')
+    }
+    const onRestored = (): void => {
+      comp.handleContextRestore()
+      setGpuStatus(comp.restoreFailed ? 'failed' : 'ok')
+      // Mark stable after a short delay so a flapping context is caught.
+      window.clearTimeout(stableTimer)
+      stableTimer = window.setTimeout(() => comp.markStable(), 1000)
+    }
+    canvas.addEventListener('webglcontextlost', onLost)
+    canvas.addEventListener('webglcontextrestored', onRestored)
+
     let pool: AudioPool | null = null
     try {
       pool = new AudioPool()
@@ -87,6 +105,9 @@ export default function Preview() {
     return () => {
       window.removeEventListener('pointerdown', unlock)
       window.removeEventListener('keydown', unlock)
+      canvas.removeEventListener('webglcontextlost', onLost)
+      canvas.removeEventListener('webglcontextrestored', onRestored)
+      window.clearTimeout(stableTimer)
       comp.dispose()
       compRef.current = null
       pool?.dispose()
@@ -111,6 +132,17 @@ export default function Preview() {
         <div className="monitor-overlay">
           {project.width}×{project.height} · {project.fps} fps · {playhead.toFixed(2)}s
         </div>
+        {gpuStatus === 'reconnecting' && (
+          <div className="monitor-overlay warn">Reconnecting GPU…</div>
+        )}
+        {gpuStatus === 'failed' && (
+          <div className="monitor-overlay warn">
+            GPU context lost.{' '}
+            <button className="btn small" onClick={() => window.location.reload()}>
+              Reload
+            </button>
+          </div>
+        )}
       </div>
     </section>
   )

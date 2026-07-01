@@ -9,6 +9,7 @@ interface RecoveryInfo {
   json: string
   savedPath: string | null
   timestamp: number
+  fromBackup: boolean
 }
 
 export default function RecoveryModal() {
@@ -21,7 +22,12 @@ export default function RecoveryModal() {
       ?.checkRecovery()
       .then((r) => {
         if (active && r.available && r.json) {
-          setInfo({ json: r.json, savedPath: r.savedPath ?? null, timestamp: r.timestamp ?? 0 })
+          setInfo({
+            json: r.json,
+            savedPath: r.savedPath ?? null,
+            timestamp: r.timestamp ?? 0,
+            fromBackup: !!r.fromBackup
+          })
         }
       })
       .catch(() => undefined)
@@ -55,6 +61,7 @@ export default function RecoveryModal() {
           <p className="modal-note">
             Cutroom didn&apos;t close cleanly last time. There is autosaved work from {when}.
             {info.savedPath ? ` It was based on ${info.savedPath}.` : ''}
+            {info.fromBackup && ' The latest snapshot was damaged, so this is a slightly older backup.'}
           </p>
         </div>
         <div className="modal-foot">

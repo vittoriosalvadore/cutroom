@@ -109,6 +109,9 @@ function useAutosave(): void {
     let timer: number | undefined
     const flush = (): void => {
       const st = useEditor.getState()
+      // Feed the in-memory rollback ring on the same tick as the disk autosave
+      // (independent of the undo stack, so a corrupted past[] can't lose it).
+      st.pushRollback()
       const json = serializeProject(st.project, { savedPath: st.projectFilePath, timestamp: Date.now() })
       void window.cutroom?.writeRecovery(json)
     }
@@ -120,6 +123,36 @@ function useAutosave(): void {
     return () => {
       if (timer) window.clearTimeout(timer)
       unsub()
+    }
+  }, [])
+}
+
+/**
+ * Last-resort crash net BELOW React's ErrorBoundary: a throw outside React's
+ * tree (or a promise rejection it didn't catch) still flags recovery pending,
+ * so the next launch can offer recovered work. The boundary catches the rest.
+ */
+function useLastResortCrashNet(): void {
+  useEffect(() => {
+    const onError = (): void => {
+      void window.cutroom?.markRecoveryPending()
+      // Best-effort synchronous final flush before the page might die.
+      try {
+        const st = useEditor.getState()
+        const json = serializeProject(st.project, { savedPath: st.projectFilePath, timestamp: Date.now() })
+        void window.cutroom?.writeRecovery(json)
+      } catch {
+        /* if this throws too, we at least flagged pending above */
+      }
+    }
+    const onRejection = (): void => {
+      void window.cutroom?.markRecoveryPending()
+    }
+    window.addEventListener('error', onError)
+    window.addEventListener('unhandledrejection', onRejection)
+    return () => {
+      window.removeEventListener('error', onError)
+      window.removeEventListener('unhandledrejection', onRejection)
     }
   }, [])
 }
@@ -236,6 +269,7 @@ export default function App() {
   useAudioProbe()
   useAutosave()
   useDocumentTitle()
+  useLastResortCrashNet()
   const dirty = useEditor((s) => s.project !== s.savedProject)
   const setSettingsOpen = useEditor((s) => s.setSettingsOpen)
   const importMedia = useEditor((s) => s.importMedia)

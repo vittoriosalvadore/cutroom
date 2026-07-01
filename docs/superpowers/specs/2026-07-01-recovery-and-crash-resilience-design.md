@@ -92,7 +92,7 @@ All in the **main process** (`src/main/index.ts` + a new pure
 | Signal | Event | Action |
 |---|---|---|
 | Renderer gone | `webContents.on('render-process-gone', …)` — reasons: `oom`, `crashed`, `killed` | `writeRecoveryPending()` |
-| GPU process crashed | `app.on('gpu-process-crashed', …)` | `writeRecoveryPending()` + reload renderer |
+| GPU process crashed | `app.on('child-process-gone', …)` with `details.type === 'GPU'` (the typed Electron 33 event; the legacy `gpu-process-crashed` name is untyped on the `App` interface) | `flagRecoveryPending()` |
 | Renderer frozen | `webContents.on('unresponsive', …)` | `writeRecoveryPending()` + log |
 | Main uncaught | `process.on('uncaughtException'/'unhandledRejection', …)` | already kept-alive; add: ensure the ring is left intact (do NOT clear `recovery.pending`) so the next launch still offers recovery. The main process has no project state of its own to flush — it only holds whatever the renderer last handed it, which is already in the ring. |
 
