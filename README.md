@@ -69,7 +69,7 @@ Go to the [Releases](../../releases/latest) page and download:
 Requirements: **Node.js 18+**
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/cutroom.git
+git clone https://github.com/vittoriosalvadore/cutroom.git
 cd cutroom
 npm install
 npm run dev          # launch with hot-reload
