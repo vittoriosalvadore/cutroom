@@ -12,6 +12,17 @@ import { pipeline, env } from '@xenova/transformers'
 // Fetch models from the hub rather than expecting them bundled locally.
 env.allowLocalModels = false
 
+// onnxruntime-web 1.14's auto-detection of WebAssembly multi-threading is
+// buggy when the page isn't crossOriginIsolated (no COOP/COEP headers, which
+// this app doesn't set) — it can leave the WASM backend half-initialized
+// instead of cleanly falling back, surfacing later as a "Cannot read
+// properties of undefined (reading 'registerBackend')" crash. Forcing
+// single-threaded WASM sidesteps the detection bug entirely.
+if (env.backends.onnx.wasm) {
+  env.backends.onnx.wasm.numThreads = 1
+  env.backends.onnx.wasm.proxy = false
+}
+
 const MODEL = 'Xenova/whisper-tiny.en'
 
 // transformers.js types are loose; the transcriber is an async-callable.
@@ -31,18 +42,18 @@ async function getTranscriber(): Promise<Transcriber> {
 }
 
 self.onmessage = async (e: MessageEvent): Promise<void> => {
-  const data = e.data as { type: string; pcm?: Float32Array }
+  const data = e.data as { type: string; id?: number; pcm?: Float32Array }
   if (data.type !== 'transcribe' || !data.pcm) return
   try {
     const t = await getTranscriber()
-    self.postMessage({ type: 'status', status: 'transcribing' })
+    self.postMessage({ type: 'status', id: data.id, status: 'transcribing' })
     const output = await t(data.pcm, {
       return_timestamps: true,
       chunk_length_s: 30,
       stride_length_s: 5
     })
-    self.postMessage({ type: 'result', chunks: output.chunks ?? [], text: output.text })
+    self.postMessage({ type: 'result', id: data.id, chunks: output.chunks ?? [], text: output.text })
   } catch (err) {
-    self.postMessage({ type: 'error', error: err instanceof Error ? err.message : String(err) })
+    self.postMessage({ type: 'error', id: data.id, error: err instanceof Error ? err.message : String(err) })
   }
 }

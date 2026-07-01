@@ -1,5 +1,11 @@
 import type { Clip, Keyframe, Project } from '../types'
 import { mediaUrl } from './media'
+import { WorkerJob, JobCancelled } from './workerJob'
+
+/** Re-exported under this module's name so existing callers (AutoReframeModal)
+ *  keep working unchanged — it's the same JobCancelled sentinel every worker
+ *  job now throws, not a distinct reframe-specific error type. */
+export { JobCancelled as ReframeCancelled }
 
 // ---------------------------------------------------------------------------
 // AI auto-reframe. Samples frames from a video clip, detects the subject in each
@@ -37,11 +43,17 @@ interface Box {
   box: { xmin: number; ymin: number; xmax: number; ymax: number }
 }
 
-let worker: Worker | null = null
-function getWorker(): Worker {
-  if (!worker) worker = new Worker(new URL('./detect.worker.ts', import.meta.url), { type: 'module' })
-  return worker
+interface DetectIn {
+  type: 'detect'
+  image: { data: Uint8ClampedArray; width: number; height: number }
 }
+interface DetectOut {
+  boxes: Box[]
+}
+
+const detectJob = new WorkerJob<DetectIn, DetectOut>(
+  () => new Worker(new URL('./detect.worker.ts', import.meta.url), { type: 'module' })
+)
 
 /**
  * Seek a video element and resolve once the new frame is ready. Mirrors
@@ -104,7 +116,7 @@ async function sampleFrames(
     if (!ctx) throw new Error('Could not create an analysis canvas.')
     const frames: Frame[] = []
     for (let i = 0; i < count; i++) {
-      if (shouldCancel()) throw new ReframeCancelled()
+      if (shouldCancel()) throw new JobCancelled()
       const tRel = count <= 1 ? 0 : (clip.durationSec * i) / (count - 1)
       await seekTo(video, clip.inSec + tRel)
       ctx.drawImage(video, 0, 0, W, H)
@@ -116,43 +128,6 @@ async function sampleFrames(
     video.removeAttribute('src')
     video.load()
   }
-}
-
-/** Run one frame through the detector worker. */
-function detectFrame(
-  w: Worker,
-  id: number,
-  image: ImageData,
-  onProgress: (p: ReframeProgress) => void
-): Promise<Box[]> {
-  return new Promise((resolve, reject) => {
-    const handler = (e: MessageEvent): void => {
-      const msg = e.data as {
-        type: string
-        id?: number
-        boxes?: Box[]
-        error?: string
-        data?: { status?: string; file?: string; progress?: number }
-      }
-      if (msg.type === 'progress') {
-        if (msg.data?.status === 'progress') {
-          onProgress({ stage: 'loading', progress: (msg.data.progress ?? 0) / 100, file: msg.data.file })
-        } else {
-          onProgress({ stage: 'loading', file: msg.data?.file })
-        }
-        return
-      }
-      if (msg.id !== id) return
-      w.removeEventListener('message', handler)
-      if (msg.type === 'detected') resolve(msg.boxes ?? [])
-      else if (msg.type === 'error') reject(new Error(msg.error || 'Detection failed.'))
-    }
-    w.addEventListener('message', handler)
-    // Transfer the pixel buffer (a fresh copy per frame) to avoid a clone.
-    w.postMessage({ type: 'detect', id, image: { data: image.data, width: image.width, height: image.height } }, [
-      image.data.buffer
-    ])
-  })
 }
 
 /** Subject centre (0..1) for a frame, or null when nothing suitable was found. */
@@ -201,13 +176,6 @@ function smooth(centers: { cx: number; cy: number }[], r: number): { cx: number;
   })
 }
 
-export class ReframeCancelled extends Error {
-  constructor() {
-    super('cancelled')
-    this.name = 'ReframeCancelled'
-  }
-}
-
 export async function autoReframe(
   project: Project,
   clip: Clip,
@@ -222,12 +190,18 @@ export async function autoReframe(
   const count = Math.max(2, Math.min(120, Math.round(opts.samples)))
   const frames = await sampleFrames(clip, media.path, count, onProgress, shouldCancel)
 
-  const w = getWorker()
   const centers: ({ cx: number; cy: number } | null)[] = []
   for (let i = 0; i < frames.length; i++) {
-    if (shouldCancel()) throw new ReframeCancelled()
     onProgress({ stage: 'detecting', progress: (i + 1) / frames.length })
-    const boxes = await detectFrame(w, i, frames[i].image, onProgress)
+    const image = frames[i].image
+    const { boxes } = await detectJob.call(
+      { type: 'detect', image: { data: image.data, width: image.width, height: image.height } },
+      {
+        onProgress: (p) => onProgress({ stage: 'loading', progress: p.progress, file: p.file }),
+        shouldCancel,
+        transfer: [image.data.buffer]
+      }
+    )
     centers.push(pickCenter(boxes, opts.target))
   }
 
