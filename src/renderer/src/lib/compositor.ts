@@ -232,6 +232,54 @@ export class Compositor {
   private playing = false
   private hidePlaceholders = false
 
+  // render()/renderExact() re-group clips by trackId on every call (every
+  // animation frame during playback). project.clips is replaced wholesale on
+  // any real edit (store.ts's immutable-update convention), so caching the
+  // grouping by that object's identity is safe and skips the regroup on the
+  // common case: playhead-only ticks, where `clips` is the same reference
+  // frame after frame.
+  private clipsByTrackRef: Project['clips'] | null = null
+  private clipsByTrack = new Map<string, Clip[]>()
+
+  private groupClipsByTrack(clips: Project['clips']): Map<string, Clip[]> {
+    if (this.clipsByTrackRef === clips) return this.clipsByTrack
+    const map = new Map<string, Clip[]>()
+    for (const clip of Object.values(clips)) {
+      let arr = map.get(clip.trackId)
+      if (!arr) {
+        arr = []
+        map.set(clip.trackId, arr)
+      }
+      arr.push(clip)
+    }
+    this.clipsByTrackRef = clips
+    this.clipsByTrack = map
+    return map
+  }
+
+  // Per-clip cache key for title/subtitle text, avoiding a JSON.stringify of
+  // the whole TextProps object every frame (drawClip runs once per visible
+  // title/subtitle clip per frame). Valid as long as the SAME object reference
+  // is still current (store.ts replaces clip.text wholesale on any real edit,
+  // same immutable-update convention as clips/tracks) and the render size
+  // hasn't changed; otherwise mint a fresh key so cachedCanvas() correctly
+  // misses and re-rasterizes. Capped like canvasCache so creating/deleting
+  // many title clips over a long session can't grow this map unboundedly.
+  private textKeyCache = new Map<string, { ref: TextProps; w: number; h: number; key: string }>()
+  private textKeyCounter = 0
+
+  private textCacheKey(clipId: string, text: TextProps): string {
+    const cached = this.textKeyCache.get(clipId)
+    if (cached && cached.ref === text && cached.w === this.W && cached.h === this.H) return cached.key
+    const key = `text:${this.W}x${this.H}:${clipId}:${this.textKeyCounter++}`
+    this.textKeyCache.set(clipId, { ref: text, w: this.W, h: this.H, key })
+    if (this.textKeyCache.size > 64) {
+      const oldest = this.textKeyCache.keys().next().value
+      if (oldest !== undefined) this.textKeyCache.delete(oldest)
+    }
+    return key
+  }
+
   constructor(
     canvas: HTMLCanvasElement,
     needsRender: () => void,
@@ -457,7 +505,7 @@ export class Compositor {
 
     if (clip.role === 'title' || clip.role === 'subtitle') {
       if (!clip.text || !clip.text.content.trim()) return
-      const key = `text:${this.W}x${this.H}:${JSON.stringify(clip.text)}`
+      const key = this.textCacheKey(clip.id, clip.text)
       const tex = this.cachedCanvas(key, () => renderTextCanvas(clip.text as TextProps, this.W, this.H))
       this.drawQuad({ x: 0, y: 0, w: 1, h: 1 }, tex.tex, null, effects, tf, opacity)
       return
@@ -527,14 +575,15 @@ export class Compositor {
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
 
     const t = playheadSec
-    const allClips = Object.values(project.clips)
+    const byTrack = this.groupClipsByTrack(project.clips)
 
     // Bottom track first so the topmost track ends up on top of the stack.
     for (let ti = project.tracks.length - 1; ti >= 0; ti--) {
       const track = project.tracks[ti]
       if (track.kind !== 'video' || track.hidden) continue
-      for (const clip of allClips) {
-        if (clip.trackId !== track.id) continue
+      const clips = byTrack.get(track.id)
+      if (!clips) continue
+      for (const clip of clips) {
         if (t < clip.startSec || t >= clip.startSec + clip.durationSec) continue
         this.drawClip(project, clip, t)
       }
@@ -566,11 +615,12 @@ export class Compositor {
    */
   async renderExact(project: Project, t: number): Promise<void> {
     const seeks: Promise<void>[] = []
-    const allClips = Object.values(project.clips)
+    const byTrack = this.groupClipsByTrack(project.clips)
     for (const track of project.tracks) {
       if (track.kind !== 'video' || track.hidden) continue
-      for (const clip of allClips) {
-        if (clip.trackId !== track.id) continue
+      const clips = byTrack.get(track.id)
+      if (!clips) continue
+      for (const clip of clips) {
         if (t < clip.startSec || t >= clip.startSec + clip.durationSec) continue
         if (!clip.mediaId) continue
         const media = project.media[clip.mediaId]
@@ -597,6 +647,9 @@ export class Compositor {
     this.canvasCache.clear()
     this.videoTextures.clear()
     this.cacheOrder = []
+    this.textKeyCache.clear()
+    this.clipsByTrackRef = null
+    this.clipsByTrack.clear()
     this.videos.dispose()
     gl.deleteBuffer(this.quad)
     gl.deleteProgram(this.prog)
