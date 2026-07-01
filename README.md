@@ -113,7 +113,7 @@ npm run build        # compile to out/ without packaging
 
 Cutroom is free and open-source. If it saves you time or money, consider buying me a coffee:
 
-[![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/YOUR_KOFI_USERNAME)
+[![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/vittoriosalvadore)
 
 ---
 
