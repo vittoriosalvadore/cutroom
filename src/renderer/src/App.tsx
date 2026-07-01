@@ -16,6 +16,7 @@ import RecoveryModal from './components/RecoveryModal'
 import TranscribeModal from './components/TranscribeModal'
 import SettingsModal from './components/SettingsModal'
 import AutoReframeModal from './components/AutoReframeModal'
+import AutoCutSilenceModal from './components/AutoCutSilenceModal'
 
 /**
  * Drives the playhead while playing. Uses requestAnimationFrame and reads the
@@ -324,6 +325,7 @@ export default function App() {
       <TranscribeModal />
       <SettingsModal />
       <AutoReframeModal />
+      <AutoCutSilenceModal />
     </div>
   )
 }

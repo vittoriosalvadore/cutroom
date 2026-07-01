@@ -1,3 +1,6 @@
+import type { AnimProp, Keyframe } from '../types'
+import { splitTracksAt } from './keyframes'
+
 // ---------------------------------------------------------------------------
 // Pure timeline-editing math: snapping and clip trimming. No DOM/state deps, so
 // it is unit-tested directly. The Timeline component owns hit-testing and calls
@@ -126,4 +129,102 @@ export function computeCrossfade(
   }
   overlap = Math.max(0, Math.min(overlap, e.durationSec, l.durationSec))
   return { overlap, lStart }
+}
+
+/** Minimal split input: whatever a split needs to touch, decoupled from the
+ *  full Clip type (same minimalism as ClipBounds) so this stays testable
+ *  without constructing a full Project. */
+export interface SplittableClip {
+  startSec: number
+  durationSec: number
+  inSec: number
+  speed?: number
+  fadeInSec?: number
+  fadeOutSec?: number
+  keyframes?: Partial<Record<AnimProp, Keyframe[]>>
+}
+
+export interface SplitResult<T> {
+  left: T
+  right: T
+}
+
+/**
+ * Split one clip at absolute timeline time `atSec`. Returns undefined if atSec
+ * doesn't actually fall strictly inside the clip. Mirrors the inline split
+ * logic `splitAtPlayhead` (store.ts) already applies at the playhead, factored
+ * out so auto-cut-silence can call it many times per job. The two returned
+ * pieces carry no id/trackId — the caller assigns those (existing id for
+ * `left`, a fresh id for `right`), matching how splitAtPlayhead does it today.
+ */
+export function splitClipAt<T extends SplittableClip>(clip: T, atSec: number): SplitResult<T> | undefined {
+  if (atSec <= clip.startSec + 1e-4 || atSec >= clip.startSec + clip.durationSec - 1e-4) return undefined
+  const offset = atSec - clip.startSec
+  const rightDur = clip.durationSec - offset
+  const kf = clip.keyframes ? splitTracksAt(clip.keyframes, offset) : undefined
+  return {
+    left: {
+      ...clip,
+      durationSec: offset,
+      fadeInSec: Math.min(clip.fadeInSec ?? 0, offset),
+      fadeOutSec: 0,
+      keyframes: kf?.left
+    },
+    right: {
+      ...clip,
+      startSec: atSec,
+      durationSec: rightDur,
+      inSec: clip.inSec + offset * (clip.speed ?? 1),
+      fadeInSec: 0,
+      fadeOutSec: Math.min(clip.fadeOutSec ?? 0, rightDur),
+      keyframes: kf?.right
+    }
+  }
+}
+
+/** Minimal ripple-delete input. */
+export interface RippleClip {
+  trackId: string
+  startSec: number
+}
+
+/**
+ * Ripple-shift: every clip on `trackId` whose start is at/after the removed
+ * range's start moves left by `removedDurationSec`, closing the gap. Clips on
+ * OTHER tracks are untouched — ripple is per-lane, matching the existing
+ * product decision in rippleDelete/rippleDeleteSelected (store.ts).
+ */
+export function rippleShift<T extends RippleClip>(
+  clips: T[],
+  trackId: string,
+  removedStartSec: number,
+  removedDurationSec: number
+): T[] {
+  return clips.map((c) =>
+    c.trackId === trackId && c.startSec >= removedStartSec - 1e-6
+      ? { ...c, startSec: Math.max(0, c.startSec - removedDurationSec) }
+      : c
+  )
+}
+
+/** Minimal marker/region input: a point (timeSec) or a region (+ endSec). */
+export interface RippleMarker {
+  timeSec: number
+  endSec?: number
+}
+
+/**
+ * Shift markers/regions the same way rippleShift shifts clips: any time at/
+ * after removedStartSec moves left by removedDurationSec. Ripple-delete today
+ * (store.ts) only shifts clips, never markers — silently desyncing marker
+ * positions whenever something is ripple-deleted. Auto-cut-silence calls
+ * ripple-delete far more densely than today's manual usage, so this fixes it.
+ */
+export function rippleShiftMarkers<T extends RippleMarker>(
+  markers: T[],
+  removedStartSec: number,
+  removedDurationSec: number
+): T[] {
+  const shift = (t: number): number => (t >= removedStartSec - 1e-6 ? Math.max(0, t - removedDurationSec) : t)
+  return markers.map((m) => ({ ...m, timeSec: shift(m.timeSec), endSec: m.endSec != null ? shift(m.endSec) : m.endSec }))
 }

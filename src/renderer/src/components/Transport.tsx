@@ -23,6 +23,7 @@ export default function Transport() {
   const importSubtitles = useEditor((s) => s.importSubtitles)
   const setExportOpen = useEditor((s) => s.setExportOpen)
   const setTranscribeOpen = useEditor((s) => s.setTranscribeOpen)
+  const setAutoCutSilenceOpen = useEditor((s) => s.setAutoCutSilenceOpen)
   const undo = useEditor((s) => s.undo)
   const redo = useEditor((s) => s.redo)
   const canUndo = useEditor((s) => s.past.length > 0)
@@ -78,6 +79,13 @@ export default function Transport() {
         onClick={() => setTranscribeOpen(true)}
       >
         ✨ AI Subs
+      </button>
+      <button
+        className="btn"
+        title="Detect and ripple-delete quiet ranges in the selected clip's audio"
+        onClick={() => setAutoCutSilenceOpen(true)}
+      >
+        🔇 Cut Silence
       </button>
       <div className="timecode">{timecode(playhead, fps)}</div>
       <div className="spacer" />
