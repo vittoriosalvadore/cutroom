@@ -262,6 +262,15 @@ interface EditorState {
   undo: () => void
   redo: () => void
 
+  // --- in-memory rollback ring (mid-session catastrophe net) ---
+  /** Last few project states kept independent of the undo stack, so a bug that
+   *  corrupts past[] can't also lose everything. Fed on the autosave tick. */
+  rollback: Project[]
+  /** Push the current project onto the rollback ring (capped at 4 entries). */
+  pushRollback: () => void
+  /** Roll back to the newest rollback entry (or no-op if empty). */
+  rollbackOnce: () => void
+
   // --- project file ---
   /** Path of the saved project file, or null if never saved. */
   projectFilePath: string | null
@@ -438,6 +447,7 @@ export const useEditor = create<EditorState>((set) => {
   selectedMarkerId: null,
   past: [],
   future: [],
+  rollback: [],
 
   importMedia: (paths) =>
     set((s) => {
@@ -1161,6 +1171,25 @@ export const useEditor = create<EditorState>((set) => {
       return { past: [...s.past, s.project].slice(-HISTORY_LIMIT), future: [] }
     }),
 
+  // Rollback ring is independent of the undo stack (a bug that corrupts past[]
+  // shouldn't also lose the net). Capped at 4 references — cheap, and deep
+  // enough to step out of a recent degenerate state.
+  pushRollback: () =>
+    set((s) => ({
+      rollback: [...s.rollback, s.project].slice(-4)
+    })),
+
+  rollbackOnce: () =>
+    set((s) => {
+      if (s.rollback.length === 0) return {}
+      const prev = s.rollback[s.rollback.length - 1]
+      // Keep media (probes aren't part of rollback), like undo does.
+      return {
+        project: { ...prev, media: s.project.media },
+        rollback: s.rollback.slice(0, -1)
+      }
+    }),
+
   undo: () =>
     set((s) => {
       if (s.past.length === 0) return {}
@@ -1196,6 +1225,7 @@ export const useEditor = create<EditorState>((set) => {
       projectFilePath: filePath,
       past: [],
       future: [],
+      rollback: [],
       selectedClipId: null,
       selectedClipIds: new Set(),
       selectedMarkerId: null,
@@ -1214,6 +1244,7 @@ export const useEditor = create<EditorState>((set) => {
       projectFilePath: null,
       past: [],
       future: [],
+      rollback: [],
       selectedClipId: null,
       selectedClipIds: new Set(),
       selectedMarkerId: null,
@@ -1223,7 +1254,11 @@ export const useEditor = create<EditorState>((set) => {
     })
   },
 
-  markSaved: (filePath) => set((s) => ({ savedProject: s.project, projectFilePath: filePath })),
+  markSaved: (filePath) =>
+    set((s) => {
+      void window.cutroom?.clearRecoveryRing()
+      return { savedProject: s.project, projectFilePath: filePath }
+    }),
 
   exportOpen: false,
   setExportOpen: (open) => set({ exportOpen: open }),

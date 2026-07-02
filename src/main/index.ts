@@ -5,8 +5,9 @@ import { readFile, stat, writeFile } from 'fs/promises'
 import { Readable } from 'stream'
 import { registerExportIpc } from './export'
 import { registerAudioMuxIpc } from './audioMux'
-import { clearSessionLock, initProjectStore, registerProjectIpc } from './projectStore'
+import { clearSessionLock, flagRecoveryPending, initProjectStore, registerProjectIpc } from './projectStore'
 import { readSettingsSync, registerSettingsIpc } from './settings'
+import { shouldFlagRecovery } from './crashFlags'
 
 // Keep the main process alive on unexpected errors rather than hard-crashing —
 // the renderer autosaves to recovery, and a logged error beats a dead window.
@@ -146,6 +147,19 @@ function createWindow(): void {
     return { action: 'deny' }
   })
 
+  // Crash detection: flag recovery when the renderer dies abnormally (OOM,
+  // native crash, kill) or hangs, so the next launch offers recovered work. The
+  // React ErrorBoundary only catches throws inside its tree; these catch the
+  // rest. A clean renderer exit is not flagged.
+  mainWindow.webContents.on('render-process-gone', (_e, details) => {
+    if (shouldFlagRecovery({ kind: 'render-process-gone', reason: details.reason })) {
+      void flagRecoveryPending()
+    }
+  })
+  mainWindow.webContents.on('unresponsive', () => {
+    if (shouldFlagRecovery({ kind: 'unresponsive' })) void flagRecoveryPending()
+  })
+
   if (process.env['ELECTRON_RENDERER_URL']) {
     // Dev: load Vite's dev server for hot module replacement.
     mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
@@ -237,6 +251,17 @@ app.whenReady().then(() => {
 // Removing the session lock here records a clean shutdown, so the next launch
 // won't offer recovery. A crash/kill skips this, leaving the lock as the signal.
 app.on('will-quit', () => clearSessionLock())
+
+// A utility/GPU process crash can take the renderer's WebGL context with it.
+// Flag recovery so the next launch offers recovered work; the compositor
+// handles a lost context in-page via webglcontextlost/restored when the
+// process survives. Electron 33 surfaces this as the typed `child-process-gone`
+// event (the legacy `gpu-process-crashed` name is untyped on the App iface).
+app.on('child-process-gone', (_e, details) => {
+  if (details.type === 'GPU' && shouldFlagRecovery({ kind: 'gpu-process-crashed' })) {
+    void flagRecoveryPending()
+  }
+})
 
 app.on('window-all-closed', () => {
   // macOS apps typically stay alive until the user quits explicitly.

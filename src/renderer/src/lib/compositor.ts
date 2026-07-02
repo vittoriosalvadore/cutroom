@@ -4,6 +4,7 @@ import { sampleOpacity, sampleTransform } from './keyframes'
 import { mediaUrl } from './media'
 import { VideoPool } from './videoPool'
 import { roundRectPath } from './canvas'
+import { RestoreMachine } from './webglRestore'
 
 // ---------------------------------------------------------------------------
 // WebGL preview compositor.
@@ -214,8 +215,11 @@ type ImageEntry = {
 
 export class Compositor {
   private gl: WebGLRenderingContext
-  private prog: WebGLProgram
-  private quad: WebGLBuffer
+  // Assigned by buildGLResources() (shared by constructor + context restore),
+  // not inline — the `!` satisfies definite-assignment since it can't be read
+  // before the constructor calls that method.
+  private prog!: WebGLProgram
+  private quad!: WebGLBuffer
   private needsRender: () => void
 
   private aPos = 0
@@ -280,6 +284,20 @@ export class Compositor {
     return key
   }
 
+  // WebGL context-loss recovery. A lost GPU context must restore (rebuild GL
+  // resources) instead of black-screening — the exact "looks like a crash"
+  // symptom we want to avoid. State machine is pure (webglRestore.ts); this
+  // class owns the rebuild side-effects.
+  private restore = new RestoreMachine()
+  /** True while a lost WebGL context is being recovered (drives the overlay). */
+  get restoring(): boolean {
+    return this.restore.state === 'reconnecting'
+  }
+  /** True when the context could not be recovered after repeated losses. */
+  get restoreFailed(): boolean {
+    return this.restore.state === 'failed'
+  }
+
   constructor(
     canvas: HTMLCanvasElement,
     needsRender: () => void,
@@ -297,6 +315,16 @@ export class Compositor {
     this.needsRender = needsRender
     this.videos = new VideoPool(needsRender)
 
+    this.buildGLResources()
+
+    canvas.width = this.W
+    canvas.height = this.H
+  }
+
+  /** Build (or rebuild after a context loss) the program, quad buffer, and
+   *  uniform/attribute locations. Shared by the constructor and restore path. */
+  private buildGLResources(): void {
+    const gl = this.gl
     this.prog = this.buildProgram(VERT, FRAG)
     gl.useProgram(this.prog)
 
@@ -312,9 +340,6 @@ export class Compositor {
     ]) {
       this.u[name] = gl.getUniformLocation(this.prog, name)
     }
-
-    canvas.width = this.W
-    canvas.height = this.H
   }
 
   private buildProgram(vs: string, fs: string): WebGLProgram {
@@ -558,6 +583,9 @@ export class Compositor {
     playing = false,
     opts: { hidePlaceholders?: boolean } = {}
   ): void {
+    // While a lost context is being recovered, drawing would hit a dead GL
+    // context. Skip silently — the overlay tells the user what's happening.
+    if (this.restore.state === 'reconnecting') return
     this.setSize(project.width, project.height)
     this.playing = playing
     this.hidePlaceholders = opts.hidePlaceholders ?? false
@@ -636,6 +664,30 @@ export class Compositor {
   /** The video pool, so the audio engine can tap video-element audio. */
   getVideoPool(): VideoPool {
     return this.videos
+  }
+
+  /** Call from the canvas 'webglcontextlost' listener. preventDefault signals
+   *  we'll restore; cached GL resources belong to the dead context and are
+   *  dropped so the next render repopulates them from content caches. */
+  handleContextLoss(e: Event): void {
+    e.preventDefault()
+    this.restore.onLost()
+    this.images.clear()
+    this.canvasCache.clear()
+    this.videoTextures.clear()
+    this.cacheOrder = []
+  }
+
+  /** Call from the canvas 'webglcontextrestored' listener. Rebuilds the GL
+   *  program/buffers exactly once; textures repopulate lazily on next render. */
+  handleContextRestore(): void {
+    if (this.restore.onRestored()) this.buildGLResources()
+  }
+
+  /** Call once a restored context has survived a stable render cycle, so a
+   *  later, unrelated loss doesn't count against this recovery's retry budget. */
+  markStable(): void {
+    this.restore.markStable()
   }
 
   dispose(): void {

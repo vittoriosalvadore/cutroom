@@ -2,6 +2,7 @@ import { app, dialog, ipcMain } from 'electron'
 import { existsSync, unlinkSync, writeFileSync } from 'fs'
 import { readFile, rename, unlink, writeFile } from 'fs/promises'
 import { join } from 'path'
+import { writeRing, findNewestValid, clearRing } from './recoveryRing'
 
 // ---------------------------------------------------------------------------
 // Project file IO + crash recovery (main process).
@@ -16,6 +17,7 @@ import { join } from 'path'
 //    renderer crash even when the process itself kept running.
 // ---------------------------------------------------------------------------
 
+let recoveryDir = ''
 let recoveryFile = ''
 let sessionLock = ''
 let pendingFile = ''
@@ -23,14 +25,24 @@ let previousCrash = false
 
 /** Call once after app `ready`, before windows open. */
 export function initProjectStore(): void {
-  const dir = app.getPath('userData')
-  recoveryFile = join(dir, 'recovery.json')
-  sessionLock = join(dir, 'session.lock')
-  pendingFile = join(dir, 'recovery.pending')
+  recoveryDir = app.getPath('userData')
+  recoveryFile = join(recoveryDir, 'recovery.json')
+  sessionLock = join(recoveryDir, 'session.lock')
+  pendingFile = join(recoveryDir, 'recovery.pending')
 
   previousCrash = existsSync(sessionLock)
   try {
     writeFileSync(sessionLock, String(Date.now()))
+  } catch {
+    /* non-fatal */
+  }
+}
+
+/** Write the recovery.pending flag so the next launch offers recovery. */
+export async function flagRecoveryPending(): Promise<void> {
+  if (!pendingFile) return
+  try {
+    await writeFile(pendingFile, '1', 'utf-8')
   } catch {
     /* non-fatal */
   }
@@ -91,55 +103,88 @@ export function registerProjectIpc(): void {
     }
   })
 
-  // Autosave the recovery snapshot (silent, no dialog).
+  // Autosave the recovery snapshot into the rotating ring (silent, no dialog).
   ipcMain.handle('project:writeRecovery', async (_e, json: string) => {
     try {
-      await writeAtomic(recoveryFile, json)
+      await writeRing(recoveryDir, json)
       return true
     } catch {
       return false
     }
   })
 
-  // The renderer error boundary flags a renderer crash.
+  // The renderer error boundary (or the main crash wiring) flags a crash.
   ipcMain.handle('project:markRecoveryPending', async () => {
-    try {
-      await writeFile(pendingFile, '1', 'utf-8')
-      return true
-    } catch {
-      return false
-    }
+    await flagRecoveryPending()
+    return true
   })
 
-  // On launch the renderer asks whether to offer recovery.
+  // On launch the renderer asks whether to offer recovery. If the primary
+  // recovery file is missing/corrupt, walk the backup ring to the newest valid
+  // snapshot so a single bad write can't lose everything.
   ipcMain.handle('project:checkRecovery', async () => {
     try {
-      if (!recoveryFile || !existsSync(recoveryFile)) return { available: false }
+      if (!recoveryDir || !existsSync(recoveryFile)) return { available: false }
       if (!previousCrash && !existsSync(pendingFile)) return { available: false }
-      const json = await readFile(recoveryFile, 'utf-8')
-      let savedPath: string | null = null
-      let timestamp = 0
-      try {
-        const d = JSON.parse(json)
-        savedPath = typeof d?.savedPath === 'string' ? d.savedPath : null
-        timestamp = typeof d?.timestamp === 'number' ? d.timestamp : 0
-      } catch {
-        /* still offer the raw json */
+
+      const validate = (
+        raw: string
+      ): { json: string; savedPath: string | null; timestamp: number; backup: boolean } | null => {
+        try {
+          const d = JSON.parse(raw)
+          const savedPath = typeof d?.savedPath === 'string' ? d.savedPath : null
+          const timestamp = typeof d?.timestamp === 'number' ? d.timestamp : 0
+          return { json: raw, savedPath, timestamp, backup: false }
+        } catch {
+          return null
+        }
       }
-      return { available: true, json, savedPath, timestamp }
+      // First try the primary.
+      let found = validate(await readFile(recoveryFile, 'utf-8').catch(() => ''))
+      // Walk the ring on corrupt primary.
+      if (!found) {
+        found = await findNewestValid(recoveryDir, (raw) => {
+          const v = validate(raw)
+          if (v) v.backup = true
+          return v
+        })
+      }
+      if (!found) return { available: false }
+      return {
+        available: true,
+        json: found.json,
+        savedPath: found.savedPath,
+        timestamp: found.timestamp,
+        fromBackup: found.backup
+      }
     } catch {
       return { available: false }
     }
   })
 
-  // User recovered or discarded — don't offer again this session.
+  // User recovered or discarded — don't offer again this session. Also clear
+  // the backup ring so a discarded session isn't offered next launch.
   ipcMain.handle('project:clearRecovery', async () => {
     try {
       if (existsSync(pendingFile)) await unlink(pendingFile)
+      if (recoveryDir) await clearRing(recoveryDir)
     } catch {
       /* non-fatal */
     }
     previousCrash = false
+    return true
+  })
+
+  // On explicit Save (Ctrl+S), a saved project needs no recovery offer: clear
+  // the ring + pending flag without touching the session lock. Distinct from
+  // clearRecovery (which also discards a *crashed* session's offer).
+  ipcMain.handle('project:clearRecoveryRing', async () => {
+    try {
+      if (existsSync(pendingFile)) await unlink(pendingFile)
+      if (recoveryDir) await clearRing(recoveryDir)
+    } catch {
+      /* non-fatal */
+    }
     return true
   })
 }
