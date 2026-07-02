@@ -1,38 +1,38 @@
-import { mediaUrl } from './media'
+import type { VideoSource, FrameSource } from './videoSource'
+import { VideoElementSource } from './videoElementSource'
+import { WebCodecsSource } from './webCodecsSource'
+import { resolveTier } from './videoTier'
 
 // ---------------------------------------------------------------------------
-// Drives a hidden <video> element per source clip and exposes its current frame
-// as a texture source for the compositor. Using the platform decoder gets real,
-// keyable video into the preview across every format the runtime supports.
+// Drives one VideoSource per source clip and exposes its current frame to the
+// compositor. This is the dispatch boundary: the compositor asks for a frame
+// and never knows whether it came from a <video> element (the fallback) or a
+// WebCodecs VideoDecoder (the frame-precise MP4 path).
 //
-// It is NOT frame-accurate: seeking snaps to the decoder's nearest decodable
-// frame and resolves asynchronously. Good enough for a draft preview; a
-// WebCodecs path can replace this later for exact stepping.
+// Tier resolution is async but want() stays SYNCHRONOUS (the compositor calls
+// it every frame; an async return would force the whole render loop async).
+// On cache miss we create a VideoElementSource immediately so the clip shows
+// up right now, then asynchronously probe whether WebCodecs can handle it; if
+// so, we swap in a WebCodecsSource and trigger a re-render. A failed probe
+// leaves the VideoElementSource in place — a silent fallback, not a crash.
 // ---------------------------------------------------------------------------
 
-/** A decodable frame ready to upload as a texture. */
+/** A decodable frame ready to upload as a texture. `source` is the actual
+ *  texImage2D source — an HTMLVideoElement (legacy path) or a WebCodecs
+ *  VideoFrame (frame-precise path); the compositor uploads either unchanged. */
 export interface VideoFrame {
-  el: HTMLVideoElement
+  source: FrameSource
   width: number
   height: number
 }
 
-interface Entry {
-  el: HTMLVideoElement
-  wantedThisFrame: boolean
-  lastSeek: number
-}
-
-// While paused, ignore seek requests within this many seconds of the current
-// position so scrubbing doesn't fire a storm of redundant seeks.
-const SEEK_EPSILON = 0.04
-// While playing, only hard-correct the element if it drifts past this.
-const DRIFT_TOLERANCE = 0.3
-
 export class VideoPool {
-  private map = new Map<string, Entry>()
+  private map = new Map<string, VideoSource>()
+  /** Media ids whose tier probe is already in flight (don't re-probe). */
+  private probing = new Set<string>()
   private host: HTMLDivElement
   private onFrameReady: () => void
+  private wanted = new Set<string>()
 
   constructor(onFrameReady: () => void) {
     this.onFrameReady = onFrameReady
@@ -43,130 +43,98 @@ export class VideoPool {
     document.body.appendChild(this.host)
   }
 
-  private ensure(mediaId: string, path: string): Entry {
+  /** Get (or lazily create) the source for a media id. Creates a
+   *  VideoElementSource immediately and asynchronously probes for an upgrade
+   *  to WebCodecsSource (MP4/MOV only). The probe runs once per id. */
+  private ensure(mediaId: string, path: string): VideoSource {
     const found = this.map.get(mediaId)
     if (found) return found
-
-    const el = document.createElement('video')
-    el.src = mediaUrl(path)
-    el.muted = true // audio comes with the dedicated audio pipeline later
-    el.playsInline = true
-    el.preload = 'auto'
-    el.crossOrigin = 'anonymous'
-    const entry: Entry = { el, wantedThisFrame: false, lastSeek: -1 }
-
-    const ready = (): void => this.onFrameReady()
-    el.addEventListener('loadeddata', ready)
-    el.addEventListener('seeked', ready)
-    el.addEventListener('canplay', ready)
-
-    this.host.appendChild(el)
-    this.map.set(mediaId, entry)
-    return entry
+    // Start with the fallback so the clip shows immediately while probing.
+    const fallback = new VideoElementSource(path, this.onFrameReady)
+    this.map.set(mediaId, fallback)
+    this.maybeUpgradeToWebCodecs(mediaId, path, fallback)
+    return fallback
   }
 
-  /**
-   * Ask for `mediaId`'s frame at source time `srcTime`. Returns null until the
-   * element can produce a frame. Mark a render pass with endFrame() afterward.
-   */
-  want(mediaId: string, path: string, srcTime: number, playing: boolean, speed = 1): VideoFrame | null {
-    const entry = this.ensure(mediaId, path)
-    entry.wantedThisFrame = true
-    const el = entry.el
-
-    if (el.readyState < 1) return null // no metadata/dimensions yet
-
-    // Play the element at the clip's speed so its currentTime tracks srcTime
-    // (which advances at `speed`); preservesPitch:false makes the audio pitch
-    // with speed, matching the BufferSource audio path.
-    if (el.playbackRate !== speed) el.playbackRate = speed
-    el.preservesPitch = false
-
-    const dur = el.duration || 0
-    const target = dur > 0 ? Math.min(Math.max(0, srcTime), Math.max(0, dur - 0.05)) : Math.max(0, srcTime)
-
-    if (playing) {
-      if (el.paused) {
-        el.currentTime = target
-        void el.play().catch(() => undefined)
-      } else if (Math.abs(el.currentTime - target) > DRIFT_TOLERANCE) {
-        el.currentTime = target
-      }
-    } else {
-      if (!el.paused) el.pause()
-      if (Math.abs(el.currentTime - target) > SEEK_EPSILON && Math.abs(entry.lastSeek - target) > 0.001) {
-        entry.lastSeek = target
-        el.currentTime = target
-      }
-    }
-
-    if (el.readyState < 2) return null // not enough data for a current frame
-    return { el, width: el.videoWidth, height: el.videoHeight }
-  }
-
-  /**
-   * Seek a video to an exact source time and resolve once the frame is ready.
-   * Used by export, which must capture the correct frame before moving on. Falls
-   * back to a timeout so a stuck decoder can't hang the whole render.
-   */
-  seekTo(mediaId: string, path: string, srcTime: number): Promise<void> {
-    const entry = this.ensure(mediaId, path)
-    entry.wantedThisFrame = true
-    const el = entry.el
-
-    return new Promise<void>((resolve) => {
-      let settled = false
-      let timer = 0
-
-      const finish = (): void => {
-        if (settled) return
-        settled = true
-        el.removeEventListener('seeked', onSeeked)
-        el.removeEventListener('loadedmetadata', onMeta)
-        if (timer) window.clearTimeout(timer)
-        resolve()
-      }
-      const onSeeked = (): void => finish()
-      const seek = (): void => {
-        if (!el.paused) el.pause()
-        const dur = el.duration || 0
-        const target = dur > 0 ? Math.min(Math.max(0, srcTime), Math.max(0, dur - 0.05)) : Math.max(0, srcTime)
-        entry.lastSeek = target
-        if (Math.abs(el.currentTime - target) < 0.001 && el.readyState >= 2) {
-          finish()
-          return
+  /** Async probe: if the file is MP4/MOV and WebCodecs can decode it, swap in
+   *  a WebCodecsSource. Any failure is swallowed — the fallback stays. */
+  private maybeUpgradeToWebCodecs(mediaId: string, path: string, fallback: VideoSource): void {
+    if (this.probing.has(mediaId)) return
+    this.probing.add(mediaId)
+    // A throwaway source parses the moov just to read the codec for resolveTier.
+    const probe = new WebCodecsSource(path, () => undefined)
+    resolveTier(
+      { id: mediaId, name: '', path, kind: 'video', durationSec: 0 },
+      async () => {
+        try {
+          await probe.ensureInit()
+          return probe.resolvedCodec
+        } catch {
+          return null
+        } finally {
+          probe.dispose()
         }
-        el.addEventListener('seeked', onSeeked)
-        el.currentTime = target
       }
-      const onMeta = (): void => seek()
+    )
+      .then((tier) => {
+        // Only upgrade if this id is still mapped AND still on the fallback
+        // (dispose may have removed it; a later source may have replaced it).
+        if (tier === 'webcodecs' && this.map.get(mediaId) === fallback) {
+          const wc = new WebCodecsSource(path, this.onFrameReady)
+          this.map.set(mediaId, wc)
+          fallback.dispose()
+          this.onFrameReady()
+        }
+      })
+      .catch(() => {
+        /* stay on the fallback */
+      })
+  }
 
-      timer = window.setTimeout(finish, 4000)
-      if (el.readyState < 1) el.addEventListener('loadedmetadata', onMeta, { once: true })
-      else seek()
-    })
+  /**
+   * Ask for `mediaId`'s frame at source time `srcTime`. Returns null until a
+   * frame is ready. Mark a render pass with endFrame() afterward.
+   */
+  want(
+    mediaId: string,
+    path: string,
+    srcTime: number,
+    playing: boolean,
+    speed = 1
+  ): VideoFrame | null {
+    const src = this.ensure(mediaId, path)
+    this.wanted.add(mediaId)
+    src.requestTime(srcTime, playing, speed)
+    const f = src.frame
+    if (!f || src.width === 0 || src.height === 0) return null
+    return { source: f, width: src.width, height: src.height }
+  }
+
+  /** Seek a video to an exact source time and resolve once the frame is ready. */
+  seekTo(mediaId: string, path: string, srcTime: number): Promise<void> {
+    return this.ensure(mediaId, path).seekTo(srcTime)
   }
 
   /** The <video> element for a media id, if it exists (for audio routing). */
   getElement(mediaId: string): HTMLVideoElement | null {
-    return this.map.get(mediaId)?.el ?? null
+    const src = this.map.get(mediaId)
+    return src ? src.getElement() : null
   }
 
-  /** Pause any videos that weren't requested this render pass. */
+  /** Pause any video elements no longer under the playhead. */
   endFrame(): void {
-    for (const entry of this.map.values()) {
-      if (!entry.wantedThisFrame && !entry.el.paused) entry.el.pause()
-      entry.wantedThisFrame = false
+    for (const [id, src] of this.map) {
+      if (!this.wanted.has(id)) src.endFrame()
     }
+    this.wanted.clear()
   }
 
   dispose(): void {
-    for (const entry of this.map.values()) {
-      entry.el.pause()
-      entry.el.removeAttribute('src')
-      entry.el.load()
-    }
+    for (const src of this.map.values()) src.dispose()
     this.map.clear()
+    this.probing.clear()
+    this.wanted.clear()
     this.host.remove()
   }
 }
+
