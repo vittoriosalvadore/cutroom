@@ -13,8 +13,12 @@ import { resolveTier } from './videoTier'
 // it every frame; an async return would force the whole render loop async).
 // On cache miss we create a VideoElementSource immediately so the clip shows
 // up right now, then asynchronously probe whether WebCodecs can handle it; if
-// so, we swap in a WebCodecsSource and trigger a re-render. A failed probe
-// leaves the VideoElementSource in place — a silent fallback, not a crash.
+// so, the WebCodecs source takes over RENDERING while the element source is
+// kept as the AUDIO COMPANION — the audio engine taps video-clip audio via
+// getElement() (audioPool.sync), and a VideoFrame has no audio to give it.
+// The companion is driven only while playing (audio is silent when paused),
+// so export scrubbing never pays for element seeks. A failed probe leaves the
+// element source doing both jobs — a silent fallback, not a crash.
 // ---------------------------------------------------------------------------
 
 /** A decodable frame ready to upload as a texture. `source` is the actual
@@ -26,8 +30,16 @@ export interface VideoFrame {
   height: number
 }
 
+interface PoolEntry {
+  /** The source rendering video frames. */
+  active: VideoSource
+  /** The <video>-element source kept alive for audio after a WebCodecs
+   *  upgrade. Null while the element source IS the active one. */
+  audioCompanion: VideoElementSource | null
+}
+
 export class VideoPool {
-  private map = new Map<string, VideoSource>()
+  private map = new Map<string, PoolEntry>()
   /** Media ids whose tier probe is already in flight (don't re-probe). */
   private probing = new Set<string>()
   private host: HTMLDivElement
@@ -43,51 +55,52 @@ export class VideoPool {
     document.body.appendChild(this.host)
   }
 
-  /** Get (or lazily create) the source for a media id. Creates a
+  /** Get (or lazily create) the entry for a media id. Creates a
    *  VideoElementSource immediately and asynchronously probes for an upgrade
    *  to WebCodecsSource (MP4/MOV only). The probe runs once per id. */
-  private ensure(mediaId: string, path: string): VideoSource {
+  private ensure(mediaId: string, path: string): PoolEntry {
     const found = this.map.get(mediaId)
     if (found) return found
     // Start with the fallback so the clip shows immediately while probing.
-    const fallback = new VideoElementSource(path, this.onFrameReady)
-    this.map.set(mediaId, fallback)
-    this.maybeUpgradeToWebCodecs(mediaId, path, fallback)
-    return fallback
+    const entry: PoolEntry = {
+      active: new VideoElementSource(path, this.onFrameReady, this.host),
+      audioCompanion: null
+    }
+    this.map.set(mediaId, entry)
+    this.maybeUpgradeToWebCodecs(mediaId, path, entry)
+    return entry
   }
 
-  /** Async probe: if the file is MP4/MOV and WebCodecs can decode it, swap in
-   *  a WebCodecsSource. Any failure is swallowed — the fallback stays. */
-  private maybeUpgradeToWebCodecs(mediaId: string, path: string, fallback: VideoSource): void {
+  /** Async probe: if the file is MP4/MOV and WebCodecs can decode it, promote
+   *  a WebCodecsSource to render and keep the element for audio. The probe
+   *  source IS the promoted source (init is the expensive part — demux +
+   *  decoder config — so it's done exactly once). Any failure is swallowed
+   *  and disposes the probe — the element source keeps doing both jobs. */
+  private maybeUpgradeToWebCodecs(mediaId: string, path: string, entry: PoolEntry): void {
     if (this.probing.has(mediaId)) return
     this.probing.add(mediaId)
-    // A throwaway source parses the moov just to read the codec for resolveTier.
-    const probe = new WebCodecsSource(path, () => undefined)
-    resolveTier(
-      { id: mediaId, name: '', path, kind: 'video', durationSec: 0 },
-      async () => {
-        try {
-          await probe.ensureInit()
-          return probe.resolvedCodec
-        } catch {
-          return null
-        } finally {
-          probe.dispose()
-        }
+    const candidate = new WebCodecsSource(path, this.onFrameReady)
+    resolveTier({ id: mediaId, name: '', path, kind: 'video', durationSec: 0 }, async () => {
+      try {
+        await candidate.ensureInit()
+        return candidate.resolvedCodec
+      } catch {
+        return null
       }
-    )
+    })
       .then((tier) => {
-        // Only upgrade if this id is still mapped AND still on the fallback
-        // (dispose may have removed it; a later source may have replaced it).
-        if (tier === 'webcodecs' && this.map.get(mediaId) === fallback) {
-          const wc = new WebCodecsSource(path, this.onFrameReady)
-          this.map.set(mediaId, wc)
-          fallback.dispose()
+        const live = this.map.get(mediaId)
+        // Only upgrade if this id is still mapped AND still on the fallback.
+        if (tier === 'webcodecs' && live === entry && entry.active instanceof VideoElementSource) {
+          entry.audioCompanion = entry.active
+          entry.active = candidate
           this.onFrameReady()
+        } else {
+          candidate.dispose()
         }
       })
       .catch(() => {
-        /* stay on the fallback */
+        candidate.dispose()
       })
   }
 
@@ -95,46 +108,51 @@ export class VideoPool {
    * Ask for `mediaId`'s frame at source time `srcTime`. Returns null until a
    * frame is ready. Mark a render pass with endFrame() afterward.
    */
-  want(
-    mediaId: string,
-    path: string,
-    srcTime: number,
-    playing: boolean,
-    speed = 1
-  ): VideoFrame | null {
-    const src = this.ensure(mediaId, path)
+  want(mediaId: string, path: string, srcTime: number, playing: boolean, speed = 1): VideoFrame | null {
+    const entry = this.ensure(mediaId, path)
     this.wanted.add(mediaId)
-    src.requestTime(srcTime, playing, speed)
-    const f = src.frame
-    if (!f || src.width === 0 || src.height === 0) return null
-    return { source: f, width: src.width, height: src.height }
+    entry.active.requestTime(srcTime, playing, speed)
+    // Keep the audio companion's element rolling in sync while playing (the
+    // audio engine taps it). While paused just hard-pause it — no per-frame
+    // seeks (export scrubs every output frame; paused audio is silent anyway).
+    if (playing) entry.audioCompanion?.requestTime(srcTime, playing, speed)
+    else entry.audioCompanion?.pause()
+    const f = entry.active.frame
+    if (!f || entry.active.width === 0 || entry.active.height === 0) return null
+    return { source: f, width: entry.active.width, height: entry.active.height }
   }
 
   /** Seek a video to an exact source time and resolve once the frame is ready. */
   seekTo(mediaId: string, path: string, srcTime: number): Promise<void> {
-    return this.ensure(mediaId, path).seekTo(srcTime)
+    return this.ensure(mediaId, path).active.seekTo(srcTime)
   }
 
-  /** The <video> element for a media id, if it exists (for audio routing). */
+  /** The <video> element for a media id, if one exists (for audio routing). */
   getElement(mediaId: string): HTMLVideoElement | null {
-    const src = this.map.get(mediaId)
-    return src ? src.getElement() : null
+    const entry = this.map.get(mediaId)
+    if (!entry) return null
+    return entry.audioCompanion?.getElement() ?? entry.active.getElement()
   }
 
-  /** Pause any video elements no longer under the playhead. */
+  /** Pause any sources no longer under the playhead. */
   endFrame(): void {
-    for (const [id, src] of this.map) {
-      if (!this.wanted.has(id)) src.endFrame()
+    for (const [id, entry] of this.map) {
+      if (!this.wanted.has(id)) {
+        entry.active.endFrame()
+        entry.audioCompanion?.endFrame()
+      }
     }
     this.wanted.clear()
   }
 
   dispose(): void {
-    for (const src of this.map.values()) src.dispose()
+    for (const entry of this.map.values()) {
+      entry.active.dispose()
+      entry.audioCompanion?.dispose()
+    }
     this.map.clear()
     this.probing.clear()
     this.wanted.clear()
     this.host.remove()
   }
 }
-

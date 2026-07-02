@@ -23,14 +23,19 @@ export class VideoElementSource implements VideoSource {
 
   constructor(
     path: string,
-    private onFrameReady: () => void
+    private onFrameReady: () => void,
+    host?: HTMLElement
   ) {
     this.el = document.createElement('video')
     this.el.src = mediaUrl(path)
-    this.el.muted = true // audio comes with the dedicated audio pipeline later
+    this.el.muted = true // audible playback goes through the WebAudio graph, not the element
     this.el.playsInline = true
     this.el.preload = 'auto'
     this.el.crossOrigin = 'anonymous'
+    // Attach to the pool's off-screen host: a detached element usually still
+    // decodes in Chromium, but attached-off-screen is the battle-tested setup
+    // the original pool used, so keep it.
+    host?.appendChild(this.el)
     const ready = (): void => this.onFrameReady()
     this.el.addEventListener('loadeddata', ready)
     this.el.addEventListener('seeked', ready)
@@ -116,6 +121,13 @@ export class VideoElementSource implements VideoSource {
     return this.el
   }
 
+  /** Hard-pause without seeking. Used on the audio-companion path, where a
+   *  paused timeline must not trigger per-frame element seeks (export scrubs
+   *  every output frame; the companion's audio is silent while paused anyway). */
+  pause(): void {
+    if (!this.el.paused) this.el.pause()
+  }
+
   endFrame(): void {
     if (!this.wantedThisFrame && !this.el.paused) this.el.pause()
     this.wantedThisFrame = false
@@ -125,5 +137,6 @@ export class VideoElementSource implements VideoSource {
     this.el.pause()
     this.el.removeAttribute('src')
     this.el.load()
+    this.el.remove()
   }
 }
