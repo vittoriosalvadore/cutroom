@@ -60,6 +60,17 @@ function computePeaks(buffer: AudioBuffer): Float32Array {
   return peaks
 }
 
+/** Get a media item's decoded AudioBuffer directly — reuses the cache if
+ *  ready, else decodes on demand. For features needing synchronous buffer
+ *  access outside the normal ensureAudioDecoded cache-and-notify flow (e.g.
+ *  transcription, silence detection). */
+export async function getOrDecodeBuffer(mediaId: string, path: string): Promise<AudioBuffer> {
+  const entry = getAudioEntry(mediaId)
+  if (entry?.status === 'ready' && entry.buffer) return entry.buffer
+  const arr = await fetch(mediaUrl(path)).then((r) => r.arrayBuffer())
+  return getAudioContext().decodeAudioData(arr)
+}
+
 /** Decode a media file's audio once. Safe to call repeatedly (idempotent).
  *  Pass durationSec=0 when the probe failed or returned an unknown duration —
  *  the post-decode buffer.duration check still guards against long files. */

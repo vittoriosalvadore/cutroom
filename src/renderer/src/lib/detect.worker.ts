@@ -9,6 +9,15 @@ import { pipeline, env, RawImage } from '@xenova/transformers'
 
 env.allowLocalModels = false
 
+// See transcribe.worker.ts for why: onnxruntime-web 1.14's multi-threading
+// auto-detection is buggy outside a crossOriginIsolated page, leaving the WASM
+// backend half-initialized ("Cannot read properties of undefined (reading
+// 'registerBackend')") instead of falling back cleanly. Force single-threaded.
+if (env.backends.onnx.wasm) {
+  env.backends.onnx.wasm.numThreads = 1
+  env.backends.onnx.wasm.proxy = false
+}
+
 const MODEL = 'Xenova/yolos-tiny'
 
 interface Box {
@@ -41,7 +50,7 @@ self.onmessage = async (e: MessageEvent): Promise<void> => {
     // Build an RGB image from the RGBA pixels; the model's processor resizes it.
     const img = new RawImage(new Uint8ClampedArray(data.image.data), data.image.width, data.image.height, 4).rgb()
     const boxes = await d(img, { threshold: data.threshold ?? 0.4, percentage: true })
-    self.postMessage({ type: 'detected', id: data.id, boxes })
+    self.postMessage({ type: 'result', id: data.id, boxes })
   } catch (err) {
     self.postMessage({ type: 'error', id: data.id, error: err instanceof Error ? err.message : String(err) })
   }

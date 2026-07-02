@@ -585,6 +585,19 @@ input[type='color']:hover {
   border-radius: var(--r-sm);
   pointer-events: none;
 }
+
+/* GPU context-loss banner: needs to stand out and accept interaction. */
+.monitor-overlay.warn {
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  color: #fff;
+  background: rgba(180, 60, 0, 0.82);
+  padding: 6px 14px;
+  font-family: var(--font-ui);
+  font-size: var(--fs-12);
+  pointer-events: auto;
+}
 .ph-frame {
   text-align: center;
 }

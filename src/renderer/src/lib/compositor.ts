@@ -4,6 +4,8 @@ import { sampleOpacity, sampleTransform } from './keyframes'
 import { mediaUrl } from './media'
 import { VideoPool } from './videoPool'
 import { roundRectPath } from './canvas'
+import { RestoreMachine } from './webglRestore'
+import type { FrameSource } from './videoSource'
 
 // ---------------------------------------------------------------------------
 // WebGL preview compositor.
@@ -214,8 +216,11 @@ type ImageEntry = {
 
 export class Compositor {
   private gl: WebGLRenderingContext
-  private prog: WebGLProgram
-  private quad: WebGLBuffer
+  // Assigned by buildGLResources() (shared by constructor + context restore),
+  // not inline — the `!` satisfies definite-assignment since it can't be read
+  // before the constructor calls that method.
+  private prog!: WebGLProgram
+  private quad!: WebGLBuffer
   private needsRender: () => void
 
   private aPos = 0
@@ -231,6 +236,68 @@ export class Compositor {
   private videoTextures = new Map<string, WebGLTexture>()
   private playing = false
   private hidePlaceholders = false
+
+  // render()/renderExact() re-group clips by trackId on every call (every
+  // animation frame during playback). project.clips is replaced wholesale on
+  // any real edit (store.ts's immutable-update convention), so caching the
+  // grouping by that object's identity is safe and skips the regroup on the
+  // common case: playhead-only ticks, where `clips` is the same reference
+  // frame after frame.
+  private clipsByTrackRef: Project['clips'] | null = null
+  private clipsByTrack = new Map<string, Clip[]>()
+
+  private groupClipsByTrack(clips: Project['clips']): Map<string, Clip[]> {
+    if (this.clipsByTrackRef === clips) return this.clipsByTrack
+    const map = new Map<string, Clip[]>()
+    for (const clip of Object.values(clips)) {
+      let arr = map.get(clip.trackId)
+      if (!arr) {
+        arr = []
+        map.set(clip.trackId, arr)
+      }
+      arr.push(clip)
+    }
+    this.clipsByTrackRef = clips
+    this.clipsByTrack = map
+    return map
+  }
+
+  // Per-clip cache key for title/subtitle text, avoiding a JSON.stringify of
+  // the whole TextProps object every frame (drawClip runs once per visible
+  // title/subtitle clip per frame). Valid as long as the SAME object reference
+  // is still current (store.ts replaces clip.text wholesale on any real edit,
+  // same immutable-update convention as clips/tracks) and the render size
+  // hasn't changed; otherwise mint a fresh key so cachedCanvas() correctly
+  // misses and re-rasterizes. Capped like canvasCache so creating/deleting
+  // many title clips over a long session can't grow this map unboundedly.
+  private textKeyCache = new Map<string, { ref: TextProps; w: number; h: number; key: string }>()
+  private textKeyCounter = 0
+
+  private textCacheKey(clipId: string, text: TextProps): string {
+    const cached = this.textKeyCache.get(clipId)
+    if (cached && cached.ref === text && cached.w === this.W && cached.h === this.H) return cached.key
+    const key = `text:${this.W}x${this.H}:${clipId}:${this.textKeyCounter++}`
+    this.textKeyCache.set(clipId, { ref: text, w: this.W, h: this.H, key })
+    if (this.textKeyCache.size > 64) {
+      const oldest = this.textKeyCache.keys().next().value
+      if (oldest !== undefined) this.textKeyCache.delete(oldest)
+    }
+    return key
+  }
+
+  // WebGL context-loss recovery. A lost GPU context must restore (rebuild GL
+  // resources) instead of black-screening — the exact "looks like a crash"
+  // symptom we want to avoid. State machine is pure (webglRestore.ts); this
+  // class owns the rebuild side-effects.
+  private restore = new RestoreMachine()
+  /** True while a lost WebGL context is being recovered (drives the overlay). */
+  get restoring(): boolean {
+    return this.restore.state === 'reconnecting'
+  }
+  /** True when the context could not be recovered after repeated losses. */
+  get restoreFailed(): boolean {
+    return this.restore.state === 'failed'
+  }
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -249,6 +316,16 @@ export class Compositor {
     this.needsRender = needsRender
     this.videos = new VideoPool(needsRender)
 
+    this.buildGLResources()
+
+    canvas.width = this.W
+    canvas.height = this.H
+  }
+
+  /** Build (or rebuild after a context loss) the program, quad buffer, and
+   *  uniform/attribute locations. Shared by the constructor and restore path. */
+  private buildGLResources(): void {
+    const gl = this.gl
     this.prog = this.buildProgram(VERT, FRAG)
     gl.useProgram(this.prog)
 
@@ -264,9 +341,6 @@ export class Compositor {
     ]) {
       this.u[name] = gl.getUniformLocation(this.prog, name)
     }
-
-    canvas.width = this.W
-    canvas.height = this.H
   }
 
   private buildProgram(vs: string, fs: string): WebGLProgram {
@@ -428,8 +502,9 @@ export class Compositor {
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
   }
 
-  /** (Re)upload the video element's current frame into its reused texture. */
-  private uploadVideoFrame(id: string, video: HTMLVideoElement): WebGLTexture {
+  /** (Re)upload the current frame (a <video> OR a WebCodecs VideoFrame) into
+   *  its reused texture. Both are valid texImage2D sources. */
+  private uploadVideoFrame(id: string, video: FrameSource): WebGLTexture {
     const gl = this.gl
     let tex = this.videoTextures.get(id)
     if (!tex) {
@@ -457,7 +532,7 @@ export class Compositor {
 
     if (clip.role === 'title' || clip.role === 'subtitle') {
       if (!clip.text || !clip.text.content.trim()) return
-      const key = `text:${this.W}x${this.H}:${JSON.stringify(clip.text)}`
+      const key = this.textCacheKey(clip.id, clip.text)
       const tex = this.cachedCanvas(key, () => renderTextCanvas(clip.text as TextProps, this.W, this.H))
       this.drawQuad({ x: 0, y: 0, w: 1, h: 1 }, tex.tex, null, effects, tf, opacity)
       return
@@ -470,7 +545,7 @@ export class Compositor {
       const srcTime = clip.inSec + (playheadSec - clip.startSec) * speed
       const frame = this.videos.want(media.id, media.path, srcTime, this.playing, speed)
       if (frame && frame.width > 0 && frame.height > 0) {
-        const tex = this.uploadVideoFrame(media.id, frame.el)
+        const tex = this.uploadVideoFrame(media.id, frame.source)
         this.drawQuad(containRect(frame.width, frame.height, this.W, this.H), tex, null, effects, tf, opacity)
         return
       }
@@ -510,6 +585,9 @@ export class Compositor {
     playing = false,
     opts: { hidePlaceholders?: boolean } = {}
   ): void {
+    // While a lost context is being recovered, drawing would hit a dead GL
+    // context. Skip silently — the overlay tells the user what's happening.
+    if (this.restore.state === 'reconnecting') return
     this.setSize(project.width, project.height)
     this.playing = playing
     this.hidePlaceholders = opts.hidePlaceholders ?? false
@@ -527,14 +605,15 @@ export class Compositor {
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
 
     const t = playheadSec
-    const allClips = Object.values(project.clips)
+    const byTrack = this.groupClipsByTrack(project.clips)
 
     // Bottom track first so the topmost track ends up on top of the stack.
     for (let ti = project.tracks.length - 1; ti >= 0; ti--) {
       const track = project.tracks[ti]
       if (track.kind !== 'video' || track.hidden) continue
-      for (const clip of allClips) {
-        if (clip.trackId !== track.id) continue
+      const clips = byTrack.get(track.id)
+      if (!clips) continue
+      for (const clip of clips) {
         if (t < clip.startSec || t >= clip.startSec + clip.durationSec) continue
         this.drawClip(project, clip, t)
       }
@@ -566,11 +645,12 @@ export class Compositor {
    */
   async renderExact(project: Project, t: number): Promise<void> {
     const seeks: Promise<void>[] = []
-    const allClips = Object.values(project.clips)
+    const byTrack = this.groupClipsByTrack(project.clips)
     for (const track of project.tracks) {
       if (track.kind !== 'video' || track.hidden) continue
-      for (const clip of allClips) {
-        if (clip.trackId !== track.id) continue
+      const clips = byTrack.get(track.id)
+      if (!clips) continue
+      for (const clip of clips) {
         if (t < clip.startSec || t >= clip.startSec + clip.durationSec) continue
         if (!clip.mediaId) continue
         const media = project.media[clip.mediaId]
@@ -588,6 +668,30 @@ export class Compositor {
     return this.videos
   }
 
+  /** Call from the canvas 'webglcontextlost' listener. preventDefault signals
+   *  we'll restore; cached GL resources belong to the dead context and are
+   *  dropped so the next render repopulates them from content caches. */
+  handleContextLoss(e: Event): void {
+    e.preventDefault()
+    this.restore.onLost()
+    this.images.clear()
+    this.canvasCache.clear()
+    this.videoTextures.clear()
+    this.cacheOrder = []
+  }
+
+  /** Call from the canvas 'webglcontextrestored' listener. Rebuilds the GL
+   *  program/buffers exactly once; textures repopulate lazily on next render. */
+  handleContextRestore(): void {
+    if (this.restore.onRestored()) this.buildGLResources()
+  }
+
+  /** Call once a restored context has survived a stable render cycle, so a
+   *  later, unrelated loss doesn't count against this recovery's retry budget. */
+  markStable(): void {
+    this.restore.markStable()
+  }
+
   dispose(): void {
     const gl = this.gl
     for (const e of this.images.values()) if (e.tex) gl.deleteTexture(e.tex)
@@ -597,6 +701,9 @@ export class Compositor {
     this.canvasCache.clear()
     this.videoTextures.clear()
     this.cacheOrder = []
+    this.textKeyCache.clear()
+    this.clipsByTrackRef = null
+    this.clipsByTrack.clear()
     this.videos.dispose()
     gl.deleteBuffer(this.quad)
     gl.deleteProgram(this.prog)

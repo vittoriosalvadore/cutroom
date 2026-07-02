@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useEditor } from '../state/store'
 import { transcribeClip, type TranscribeProgress } from '../lib/transcribe'
 
@@ -18,6 +18,7 @@ export default function TranscribeModal() {
   const [progress, setProgress] = useState<TranscribeProgress>({ stage: 'extracting' })
   const [error, setError] = useState<string | null>(null)
   const [count, setCount] = useState(0)
+  const cancelRef = useRef(false)
 
   if (!open) return null
 
@@ -39,22 +40,42 @@ export default function TranscribeModal() {
 
   const run = async (): Promise<void> => {
     if (!clip) return
+    cancelRef.current = false
     setStatus('running')
     setError(null)
     setProgress({ stage: 'extracting' })
+    setCount(0)
     try {
-      const cues = await transcribeClip(useEditor.getState().project, clip, setProgress)
-      importSubtitles(cues)
+      // Each cue is committed to the project the moment its 30s window resolves
+      // (not batched until the whole clip finishes) — a crash mid-transcription
+      // only loses the window in flight, not everything already transcribed.
+      const cues = await transcribeClip(
+        useEditor.getState().project,
+        clip,
+        setProgress,
+        (cue) => {
+          importSubtitles([cue])
+          setCount((c) => c + 1)
+        },
+        () => cancelRef.current
+      )
       setCount(cues.length)
       setStatus('done')
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Transcription failed.')
-      setStatus('error')
+      if (e instanceof Error && e.message === 'cancelled') {
+        setStatus('idle') // user stopped it; already-committed cues stay on the timeline
+      } else {
+        setError(e instanceof Error ? e.message : 'Transcription failed.')
+        setStatus('error')
+      }
     }
   }
 
   const close = (): void => {
-    if (running) return
+    if (running) {
+      cancelRef.current = true // let the in-flight window finish, then it can be reopened
+      return
+    }
     setStatus('idle')
     setError(null)
     setOpen(false)
@@ -94,8 +115,8 @@ export default function TranscribeModal() {
           )}
         </div>
         <div className="modal-foot">
-          <button className="btn" onClick={close} disabled={running}>
-            Close
+          <button className="btn" onClick={close}>
+            {running ? 'Stop' : 'Close'}
           </button>
           {transcribable && status !== 'done' && (
             <button className="btn primary" onClick={run} disabled={running}>

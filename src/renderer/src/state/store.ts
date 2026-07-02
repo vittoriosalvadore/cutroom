@@ -31,7 +31,8 @@ import {
   defaultTrackEQ,
   defaultTrackComp
 } from '../types'
-import { computeCrossfade, MIN_CLIP_SEC } from '../lib/editing'
+import { computeCrossfade, MIN_CLIP_SEC, rippleShift, rippleShiftMarkers, splitClipAt } from '../lib/editing'
+import { clampFades } from '../lib/fades'
 import { clampProp, keyIndexAt, KEY_EPS, rebaseTracks, sortKeys, splitTracksAt, withTransformProp } from '../lib/keyframes'
 import { useSettings } from './settings'
 
@@ -166,6 +167,15 @@ interface EditorState {
   splitAtPlayhead: () => void
   removeClip: (clipId: string) => void
   rippleDelete: (clipId: string) => void
+  /** Split a clip at both ends of [startSec, endSec) and ripple-delete the
+   *  middle piece, shifting later same-track clips and markers left to close
+   *  the gap. One recorded history step. */
+  cutSilenceRange: (clipId: string, range: { startSec: number; endSec: number }) => void
+  /** Apply every detected silence range to a clip in one recorded history
+   *  step (a single undo for the whole auto-cut, not one per range). Ranges
+   *  are given in ORIGINAL (pre-cut) timeline positions; later ranges are
+   *  re-targeted internally as earlier cuts ripple-shift the timeline. */
+  applySilenceCuts: (clipId: string, ranges: Array<{ startSec: number; endSec: number }>) => void
   /** Crossfade a clip with its nearest adjacent/overlapping same-track neighbor. */
   crossfadeWithNeighbor: (clipId: string) => void
   selectClip: (clipId: string | null) => void
@@ -252,6 +262,15 @@ interface EditorState {
   undo: () => void
   redo: () => void
 
+  // --- in-memory rollback ring (mid-session catastrophe net) ---
+  /** Last few project states kept independent of the undo stack, so a bug that
+   *  corrupts past[] can't also lose everything. Fed on the autosave tick. */
+  rollback: Project[]
+  /** Push the current project onto the rollback ring (capped at 4 entries). */
+  pushRollback: () => void
+  /** Roll back to the newest rollback entry (or no-op if empty). */
+  rollbackOnce: () => void
+
   // --- project file ---
   /** Path of the saved project file, or null if never saved. */
   projectFilePath: string | null
@@ -278,6 +297,10 @@ interface EditorState {
   setReframeOpen: (open: boolean) => void
   /** Apply auto-reframe output: posX/posY keyframes + a static zoom. */
   applyReframe: (clipId: string, r: { posX: Keyframe[]; posY: Keyframe[]; scale: number }) => void
+
+  // --- auto-cut silence ---
+  autoCutSilenceOpen: boolean
+  setAutoCutSilenceOpen: (open: boolean) => void
 }
 
 const HISTORY_LIMIT = 100
@@ -289,6 +312,63 @@ let clipboard: Clip[] = []
 /** History fields for a discrete, undoable mutation (always records). */
 function recordHistory(s: EditorState): { past: Project[]; future: Project[] } {
   return { past: [...s.past, s.project].slice(-HISTORY_LIMIT), future: [] }
+}
+
+/**
+ * Core mutation for cutting one silence range out of a clip: split at both
+ * ends, ripple-delete the middle, ripple-shift markers. Operates on plain
+ * clips/markers maps (no zustand `set`/history) so both the single-range
+ * `cutSilenceRange` action and the bulk `applySilenceCuts` action can share
+ * it without duplicating the split/ripple math or each other's undo-step
+ * semantics — the former wraps one call in one recordHistory, the latter
+ * wraps a whole loop of calls in ONE recordHistory for a single undo step.
+ */
+function applyOneSilenceCut(
+  clips: EditorState['project']['clips'],
+  markers: NonNullable<EditorState['project']['markers']>,
+  clipId: string,
+  range: { startSec: number; endSec: number }
+): { clips: EditorState['project']['clips']; markers: NonNullable<EditorState['project']['markers']> } | null {
+  const clip = clips[clipId]
+  if (!clip) return null
+  const durationSec = range.endSec - range.startSec
+  if (durationSec <= 1e-4) return null
+
+  // Split at the range end first, then the range start, so the second split's
+  // offset (against the still-unsplit clip) doesn't need adjusting for the first.
+  const next = { ...clips }
+  let middleId = clipId
+  let middleStart = range.startSec
+  let middleDur = durationSec
+
+  const atEnd = splitClipAt(clip, range.endSec)
+  if (atEnd) {
+    const afterId = uid('c')
+    next[clipId] = atEnd.left
+    next[afterId] = { ...atEnd.right, id: afterId, trackId: clip.trackId }
+  }
+  const beforeSplitTarget = next[clipId]
+  const atStart = splitClipAt(beforeSplitTarget, range.startSec)
+  if (atStart) {
+    middleId = uid('c')
+    next[clipId] = atStart.left
+    next[middleId] = { ...atStart.right, id: middleId, trackId: clip.trackId }
+    middleStart = atStart.right.startSec
+    middleDur = atStart.right.durationSec
+  } else {
+    // The range start coincides with the clip start (no left remainder) —
+    // the whole (possibly already end-split) clip IS the silent piece.
+    middleStart = next[clipId].startSec
+    middleDur = next[clipId].durationSec
+  }
+
+  delete next[middleId]
+  const shifted = rippleShift(Object.values(next), clip.trackId, middleStart, middleDur)
+  const nextClips: EditorState['project']['clips'] = {}
+  for (const c of shifted) nextClips[c.id] = c
+  const nextMarkers = rippleShiftMarkers(markers, middleStart, middleDur)
+
+  return { clips: nextClips, markers: nextMarkers }
 }
 
 /** Selection after some clips are removed: drop them from the set, fix the primary. */
@@ -367,6 +447,7 @@ export const useEditor = create<EditorState>((set) => {
   selectedMarkerId: null,
   past: [],
   future: [],
+  rollback: [],
 
   importMedia: (paths) =>
     set((s) => {
@@ -450,11 +531,18 @@ export const useEditor = create<EditorState>((set) => {
       // must rebase by the same delta or the animation drifts (mirrors the split).
       const delta = bounds.startSec - clip.startSec
       const keyframes = clip.keyframes ? rebaseTracks(clip.keyframes, delta) : clip.keyframes
+      // Trimming can shorten the clip below its current fade lengths. Playback/
+      // export already rescale via clampFades at read time, but the STORED value
+      // should match reality too (e.g. the Inspector fade slider shouldn't show
+      // an 8s fade-out on a clip that's now only 3s long).
+      const { fadeInSec, fadeOutSec } = clampFades(clip.fadeInSec ?? 0, clip.fadeOutSec ?? 0, bounds.durationSec)
       const next: Clip = {
         ...clip,
         startSec: bounds.startSec,
         durationSec: bounds.durationSec,
         inSec: bounds.inSec,
+        fadeInSec,
+        fadeOutSec,
         keyframes
       }
       return { project: { ...s.project, clips: { ...s.project.clips, [clipId]: next } } }
@@ -522,11 +610,52 @@ export const useEditor = create<EditorState>((set) => {
           clips[c.id] = { ...c, startSec: Math.max(0, c.startSec - target.durationSec) }
         }
       }
+      // Markers must ripple too, or they silently drift out of sync with the footage.
+      const markers = rippleShiftMarkers(s.project.markers ?? [], target.startSec, target.durationSec)
       return {
         ...recordHistory(s),
-        project: { ...s.project, clips },
+        project: { ...s.project, clips, markers },
         ...pruneSelection(s, new Set([clipId]))
       }
+    }),
+
+  cutSilenceRange: (clipId, range) =>
+    set((s) => {
+      const cut = applyOneSilenceCut(s.project.clips, s.project.markers ?? [], clipId, range)
+      if (!cut) return {}
+      return { ...recordHistory(s), project: { ...s.project, clips: cut.clips, markers: cut.markers } }
+    }),
+
+  applySilenceCuts: (clipId, ranges) =>
+    set((s) => {
+      const trackId = s.project.clips[clipId]?.trackId
+      if (!trackId) return {}
+      // Ranges are detected up front, in ORIGINAL (pre-cut) timeline positions.
+      // Each cut ripple-shifts everything after it, so later ranges must be
+      // re-targeted against the running total already removed, and against
+      // whichever clip currently spans that (shifted) position — the earlier
+      // cut's "after" piece gets a fresh id that can't be predicted ahead of
+      // time. One recordHistory for the WHOLE batch (not per-range) so the
+      // entire auto-cut is a single undo step, matching rippleDeleteSelected's
+      // convention for other multi-clip operations.
+      let clips = s.project.clips
+      let markers = s.project.markers ?? []
+      let removed = 0
+      for (const r of [...ranges].sort((a, b) => a.startSec - b.startSec)) {
+        const startSec = r.startSec - removed
+        const endSec = r.endSec - removed
+        const target = Object.values(clips).find(
+          (c) => c.trackId === trackId && startSec >= c.startSec - 1e-6 && startSec < c.startSec + c.durationSec - 1e-6
+        )
+        if (!target) continue // a prior cut already consumed this span; skip rather than crash
+        const cut = applyOneSilenceCut(clips, markers, target.id, { startSec, endSec })
+        if (!cut) continue
+        clips = cut.clips
+        markers = cut.markers
+        removed += r.endSec - r.startSec
+      }
+      if (clips === s.project.clips) return {} // nothing was actually cut
+      return { ...recordHistory(s), project: { ...s.project, clips, markers } }
     }),
 
   crossfadeWithNeighbor: (clipId) =>
@@ -633,11 +762,13 @@ export const useEditor = create<EditorState>((set) => {
       const clips = { ...s.project.clips }
       // Per track: total deleted duration that STARTS at or before each survivor.
       const delByTrack = new Map<string, { startSec: number; durationSec: number }[]>()
+      const delRanges: { startSec: number; durationSec: number }[] = []
       for (const id of removed) {
         const c = s.project.clips[id]
         if (!c) continue
         if (!delByTrack.has(c.trackId)) delByTrack.set(c.trackId, [])
         delByTrack.get(c.trackId)!.push({ startSec: c.startSec, durationSec: c.durationSec })
+        delRanges.push({ startSec: c.startSec, durationSec: c.durationSec })
       }
       for (const id of removed) delete clips[id]
       for (const c of Object.values(clips)) {
@@ -647,7 +778,27 @@ export const useEditor = create<EditorState>((set) => {
         for (const d of dels) if (d.startSec <= c.startSec + 1e-6) shift += d.durationSec
         if (shift > 0) clips[c.id] = { ...c, startSec: Math.max(0, c.startSec - shift) }
       }
-      return { ...recordHistory(s), project: { ...s.project, clips }, selectedClipId: null, selectedClipIds: new Set() }
+      // Markers must ripple too, or they silently drift out of sync with the footage.
+      // Same one-pass "sum against the ORIGINAL position" pattern as the clip-shift
+      // above — sequentially re-shifting per range would be order-dependent (an
+      // earlier shift could move a marker below a later range's own start
+      // threshold, silently skipping it depending on iteration order).
+      const shiftFor = (t: number): number => {
+        let total = 0
+        for (const d of delRanges) if (d.startSec <= t + 1e-6) total += d.durationSec
+        return total
+      }
+      const markers = (s.project.markers ?? []).map((m) => ({
+        ...m,
+        timeSec: Math.max(0, m.timeSec - shiftFor(m.timeSec)),
+        endSec: m.endSec != null ? Math.max(0, m.endSec - shiftFor(m.endSec)) : m.endSec
+      }))
+      return {
+        ...recordHistory(s),
+        project: { ...s.project, clips, markers },
+        selectedClipId: null,
+        selectedClipIds: new Set()
+      }
     }),
 
   copySelectedClips: () =>
@@ -1020,6 +1171,25 @@ export const useEditor = create<EditorState>((set) => {
       return { past: [...s.past, s.project].slice(-HISTORY_LIMIT), future: [] }
     }),
 
+  // Rollback ring is independent of the undo stack (a bug that corrupts past[]
+  // shouldn't also lose the net). Capped at 4 references — cheap, and deep
+  // enough to step out of a recent degenerate state.
+  pushRollback: () =>
+    set((s) => ({
+      rollback: [...s.rollback, s.project].slice(-4)
+    })),
+
+  rollbackOnce: () =>
+    set((s) => {
+      if (s.rollback.length === 0) return {}
+      const prev = s.rollback[s.rollback.length - 1]
+      // Keep media (probes aren't part of rollback), like undo does.
+      return {
+        project: { ...prev, media: s.project.media },
+        rollback: s.rollback.slice(0, -1)
+      }
+    }),
+
   undo: () =>
     set((s) => {
       if (s.past.length === 0) return {}
@@ -1055,6 +1225,7 @@ export const useEditor = create<EditorState>((set) => {
       projectFilePath: filePath,
       past: [],
       future: [],
+      rollback: [],
       selectedClipId: null,
       selectedClipIds: new Set(),
       selectedMarkerId: null,
@@ -1073,6 +1244,7 @@ export const useEditor = create<EditorState>((set) => {
       projectFilePath: null,
       past: [],
       future: [],
+      rollback: [],
       selectedClipId: null,
       selectedClipIds: new Set(),
       selectedMarkerId: null,
@@ -1082,7 +1254,11 @@ export const useEditor = create<EditorState>((set) => {
     })
   },
 
-  markSaved: (filePath) => set((s) => ({ savedProject: s.project, projectFilePath: filePath })),
+  markSaved: (filePath) =>
+    set((s) => {
+      void window.cutroom?.clearRecoveryRing()
+      return { savedProject: s.project, projectFilePath: filePath }
+    }),
 
   exportOpen: false,
   setExportOpen: (open) => set({ exportOpen: open }),
@@ -1106,6 +1282,9 @@ export const useEditor = create<EditorState>((set) => {
       const keyframes = tidyKeyframes({ ...restKf, posX: r.posX, posY: r.posY })
       const transform = withTransformProp(clip.transform ?? defaultTransform(), 'scale', r.scale)
       return { ...recordHistory(s), project: patchClip(s.project, clipId, { transform, keyframes }) }
-    })
+    }),
+
+  autoCutSilenceOpen: false,
+  setAutoCutSilenceOpen: (open) => set({ autoCutSilenceOpen: open })
   }
 })

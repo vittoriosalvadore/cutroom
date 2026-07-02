@@ -1,5 +1,15 @@
 import { describe, it, expect } from 'vitest'
-import { computeCrossfade, computeTrim, snapMove, snapTime, MIN_CLIP_SEC, type ClipBounds } from './editing'
+import {
+  computeCrossfade,
+  computeTrim,
+  rippleShift,
+  rippleShiftMarkers,
+  snapMove,
+  snapTime,
+  splitClipAt,
+  MIN_CLIP_SEC,
+  type ClipBounds
+} from './editing'
 
 const PX = 100 // 100 px/sec -> 8px threshold = 0.08s
 
@@ -82,6 +92,75 @@ describe('computeTrim left edge', () => {
     })
     expect(r.startSec).toBeCloseTo(3)
     expect(r.inSec).toBeCloseTo(6) // 4 + 1*2
+  })
+})
+
+describe('splitClipAt', () => {
+  const clip = { startSec: 2, durationSec: 4, inSec: 1 } // spans [2, 6)
+
+  it('returns undefined at or before the clip start', () => {
+    expect(splitClipAt(clip, 2)).toBeUndefined()
+    expect(splitClipAt(clip, 1)).toBeUndefined()
+  })
+  it('returns undefined at or after the clip end', () => {
+    expect(splitClipAt(clip, 6)).toBeUndefined()
+    expect(splitClipAt(clip, 7)).toBeUndefined()
+  })
+  it('splits into two adjacent pieces at the cut', () => {
+    const r = splitClipAt(clip, 3.5)! // offset 1.5 into the clip
+    expect(r.left).toEqual({ startSec: 2, durationSec: 1.5, inSec: 1, fadeInSec: 0, fadeOutSec: 0, keyframes: undefined })
+    expect(r.right.startSec).toBe(3.5)
+    expect(r.right.durationSec).toBeCloseTo(2.5)
+    expect(r.right.inSec).toBeCloseTo(2.5) // 1 + 1.5*speed(1)
+  })
+  it('scales the right piece inSec by speed', () => {
+    const r = splitClipAt({ startSec: 0, durationSec: 4, inSec: 0, speed: 2 }, 1)!
+    expect(r.right.inSec).toBeCloseTo(2) // offset 1 * speed 2
+  })
+  it('clamps fades so they cannot straddle the cut', () => {
+    const r = splitClipAt({ ...clip, fadeInSec: 3, fadeOutSec: 3 }, 3)! // offset 1
+    expect(r.left.fadeInSec).toBeCloseTo(1) // min(3, offset=1)
+    expect(r.left.fadeOutSec).toBe(0)
+    expect(r.right.fadeInSec).toBe(0)
+    expect(r.right.fadeOutSec).toBeCloseTo(3) // min(3, rightDur=3)
+  })
+})
+
+describe('rippleShift', () => {
+  const clips = [
+    { id: 'a', trackId: 't1', startSec: 0 },
+    { id: 'b', trackId: 't1', startSec: 5 },
+    { id: 'c', trackId: 't1', startSec: 10 },
+    { id: 'd', trackId: 't2', startSec: 10 } // other track, must not move
+  ]
+  it('shifts same-track clips at/after the removed start, left by the removed duration', () => {
+    const r = rippleShift(clips, 't1', 5, 2)
+    expect(r.find((c) => c.id === 'a')!.startSec).toBe(0) // before the range, untouched
+    expect(r.find((c) => c.id === 'b')!.startSec).toBe(3) // at the range start, shifted
+    expect(r.find((c) => c.id === 'c')!.startSec).toBe(8) // after, shifted
+    expect(r.find((c) => c.id === 'd')!.startSec).toBe(10) // other track, untouched
+  })
+  it('clamps the shifted start at 0', () => {
+    const r = rippleShift([{ id: 'a', trackId: 't1', startSec: 1 }], 't1', 0, 5)
+    expect(r[0].startSec).toBe(0)
+  })
+})
+
+describe('rippleShiftMarkers', () => {
+  it('shifts point markers at/after the removed start', () => {
+    const markers = [{ timeSec: 2 }, { timeSec: 5 }, { timeSec: 10 }]
+    const r = rippleShiftMarkers(markers, 5, 3)
+    expect(r.map((m) => m.timeSec)).toEqual([2, 2, 7])
+  })
+  it('shifts both endpoints of a region marker', () => {
+    const markers = [{ timeSec: 6, endSec: 9 }]
+    const r = rippleShiftMarkers(markers, 5, 3)
+    expect(r[0]).toEqual({ timeSec: 3, endSec: 6 })
+  })
+  it('leaves markers strictly before the removed range untouched', () => {
+    const markers = [{ timeSec: 1, endSec: 4 }]
+    const r = rippleShiftMarkers(markers, 5, 3)
+    expect(r[0]).toEqual({ timeSec: 1, endSec: 4 })
   })
 })
 

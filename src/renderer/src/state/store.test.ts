@@ -229,6 +229,58 @@ describe('transform & keyframes', () => {
     expect(useEditor.getState().project.clips.c1.speed).toBe(4) // clamped to MAX_SPEED
   })
 
+  it('applyTrim clamps stored fades to the new (shorter) duration', () => {
+    const st = useEditor.getState()
+    st.updateAudio('c1', { fadeInSec: 2, fadeOutSec: 8 }) // c1 starts at durationSec 5
+    st.applyTrim('c1', { startSec: 0, durationSec: 3, inSec: 0 }) // trim to 3s, shorter than fadeOutSec
+    const clip = useEditor.getState().project.clips.c1
+    expect(clip.fadeInSec! + clip.fadeOutSec!).toBeLessThanOrEqual(3)
+    expect(clip.fadeOutSec!).toBeLessThan(8) // must not keep the stale, now-oversized value
+  })
+
+  it('applySilenceCuts removes the ranges and closes the gaps (single call)', () => {
+    // c1 [0,5) c2 [5,10) c3 [10,15) on v1. Two 1s ranges: one inside c1, one inside c2.
+    const before = Object.values(useEditor.getState().project.clips).reduce((n, c) => n + c.durationSec, 0)
+    useEditor.getState().applySilenceCuts('c1', [
+      { startSec: 1, endSec: 2 },
+      { startSec: 7, endSec: 8 }
+    ])
+    const clips = Object.values(useEditor.getState().project.clips)
+    const after = clips.reduce((n, c) => n + c.durationSec, 0)
+    expect(before - after).toBeCloseTo(2) // exactly the 2 seconds removed, nothing else lost
+    // The last clip (originally c3, starting at 10) must end up 2s earlier.
+    const last = clips.reduce((a, b) => (b.startSec + b.durationSec > a.startSec + a.durationSec ? b : a))
+    expect(last.startSec + last.durationSec).toBeCloseTo(13) // was 15, minus 2s removed
+  })
+
+  it('applySilenceCuts is a single undo step regardless of range count', () => {
+    useEditor.getState().applySilenceCuts('c1', [
+      { startSec: 1, endSec: 2 },
+      { startSec: 7, endSec: 8 }
+    ])
+    expect(useEditor.getState().past.length).toBe(1)
+    useEditor.getState().undo()
+    const clips = useEditor.getState().project.clips
+    expect(clips.c1).toEqual({ id: 'c1', trackId: 'v1', mediaId: 'm1', startSec: 0, durationSec: 5, inSec: 0 })
+    expect(clips.c3).toEqual({ id: 'c3', trackId: 'v1', mediaId: 'm1', startSec: 10, durationSec: 5, inSec: 0 })
+  })
+
+  it('applySilenceCuts shifts markers along with the ripple', () => {
+    useEditor.getState().addMarker(12) // inside c3, after both ranges
+    useEditor.getState().applySilenceCuts('c1', [
+      { startSec: 1, endSec: 2 },
+      { startSec: 7, endSec: 8 }
+    ])
+    const markers = useEditor.getState().project.markers ?? []
+    expect(markers[0].timeSec).toBeCloseTo(10) // 12 - 2s removed
+  })
+
+  it('applySilenceCuts skips a range with no matching clip instead of throwing', () => {
+    expect(() =>
+      useEditor.getState().applySilenceCuts('c1', [{ startSec: 999, endSec: 1000 }])
+    ).not.toThrow()
+  })
+
   it('applyTrim rebases keyframes on a head (left) trim', () => {
     const st = useEditor.getState()
     st.setKeyframe('c1', 'scale', 0, 1)

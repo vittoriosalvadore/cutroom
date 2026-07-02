@@ -108,6 +108,9 @@ export interface RecoveryResult {
   json?: string
   savedPath?: string | null
   timestamp?: number
+  /** True when the primary recovery file was corrupt/missing and the offered
+   *  snapshot came from a backup slot in the ring. */
+  fromBackup?: boolean
 }
 
 // The single, typed surface the renderer is allowed to call. Anything the UI
@@ -157,6 +160,8 @@ const api = {
   checkRecovery: (): Promise<RecoveryResult> => ipcRenderer.invoke('project:checkRecovery'),
   /** Dismiss the recovery offer for this session. */
   clearRecovery: (): Promise<boolean> => ipcRenderer.invoke('project:clearRecovery'),
+  /** Clear the recovery ring + pending flag (called on explicit Save). */
+  clearRecoveryRing: (): Promise<boolean> => ipcRenderer.invoke('project:clearRecoveryRing'),
 
   // --- app settings ---
   /** Read the persisted settings JSON (or null if never saved). */

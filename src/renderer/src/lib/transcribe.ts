@@ -1,8 +1,7 @@
 import type { Clip, Project } from '../types'
 import type { SubtitleCue } from '../state/store'
-import { getAudioContext } from './audioContext'
-import { getAudioEntry } from './audioCache'
-import { mediaUrl } from './media'
+import { getOrDecodeBuffer } from './audioCache'
+import { WorkerJob, JobCancelled } from './workerJob'
 
 // ---------------------------------------------------------------------------
 // Drives the Whisper worker: extract a clip's audio to 16 kHz mono PCM (Whisper's
@@ -25,11 +24,7 @@ interface WhisperChunk {
 async function getSourceBuffer(project: Project, clip: Clip): Promise<AudioBuffer> {
   const media = clip.mediaId ? project.media[clip.mediaId] : null
   if (!media || !media.path) throw new Error('This clip has no audio to transcribe.')
-  // Reuse the cached decode for audio clips; decode on demand otherwise.
-  const entry = getAudioEntry(media.id)
-  if (entry?.status === 'ready' && entry.buffer) return entry.buffer
-  const arr = await fetch(mediaUrl(media.path)).then((r) => r.arrayBuffer())
-  return getAudioContext().decodeAudioData(arr)
+  return getOrDecodeBuffer(media.id, media.path)
 }
 
 /** Render the clip's used span to 16 kHz mono PCM. */
@@ -64,43 +59,67 @@ function chunksToCues(chunks: WhisperChunk[], clipStartSec: number): SubtitleCue
   return cues
 }
 
-let worker: Worker | null = null
-function getWorker(): Worker {
-  if (!worker) {
-    worker = new Worker(new URL('./transcribe.worker.ts', import.meta.url), { type: 'module' })
-  }
-  return worker
+interface TranscribeIn {
+  type: 'transcribe'
+  pcm: Float32Array
+}
+interface TranscribeOut {
+  chunks: WhisperChunk[]
+  text: string
 }
 
+const job = new WorkerJob<TranscribeIn, TranscribeOut>(
+  () => new Worker(new URL('./transcribe.worker.ts', import.meta.url), { type: 'module' })
+)
+
+const SAMPLE_RATE = 16000
+// 30s per call so a crash mid-transcription only loses the current window's
+// cues, not the whole clip — each window's cues are surfaced via onCue as
+// soon as they resolve, so the caller can commit them into the project
+// immediately (see TranscribeModal.tsx) rather than batching until the end.
+const CHUNK_SEC = 30
+
+/**
+ * Transcribe a clip window by window. Resolves with every cue once done (for
+ * convenience), but callers should treat `onCue` as the source of truth for
+ * incremental, crash-safe commits.
+ */
 export async function transcribeClip(
   project: Project,
   clip: Clip,
-  onProgress: (p: TranscribeProgress) => void
+  onProgress: (p: TranscribeProgress) => void,
+  onCue: (cue: SubtitleCue) => void,
+  shouldCancel: () => boolean = () => false
 ): Promise<SubtitleCue[]> {
   onProgress({ stage: 'extracting' })
   const pcm = await getClipPcm16k(project, clip)
-  const w = getWorker()
+  const chunkLen = CHUNK_SEC * SAMPLE_RATE
+  const chunkCount = Math.max(1, Math.ceil(pcm.length / chunkLen))
+  const allCues: SubtitleCue[] = []
 
-  return new Promise<SubtitleCue[]>((resolve, reject) => {
-    const handler = (e: MessageEvent): void => {
-      const msg = e.data as { type: string; data?: { status?: string; file?: string; progress?: number }; chunks?: WhisperChunk[]; error?: string }
-      if (msg.type === 'progress') {
-        if (msg.data?.status === 'progress') {
-          onProgress({ stage: 'loading', progress: (msg.data.progress ?? 0) / 100, file: msg.data.file })
-        } else {
-          onProgress({ stage: 'loading', file: msg.data?.file })
-        }
-      } else if (msg.type === 'status') {
-        onProgress({ stage: 'transcribing' })
-      } else if (msg.type === 'result') {
-        w.removeEventListener('message', handler)
-        resolve(chunksToCues(msg.chunks ?? [], clip.startSec))
-      } else if (msg.type === 'error') {
-        w.removeEventListener('message', handler)
-        reject(new Error(msg.error || 'Transcription failed.'))
+  for (let i = 0; i < chunkCount; i++) {
+    if (shouldCancel()) throw new JobCancelled()
+    const start = i * chunkLen
+    // .slice() (not .subarray()) copies into a fresh buffer per chunk, so it's
+    // safe to transfer to the worker without affecting the other chunks.
+    const chunkPcm = pcm.slice(start, Math.min(pcm.length, start + chunkLen))
+    const chunkStartSec = clip.startSec + start / SAMPLE_RATE
+
+    const { chunks } = await job.call(
+      { type: 'transcribe', pcm: chunkPcm },
+      {
+        onProgress: (p) => onProgress({ stage: 'loading', progress: p.progress, file: p.file }),
+        onStatus: (msg) => {
+          if ((msg as { status?: string }).status === 'transcribing') onProgress({ stage: 'transcribing' })
+        },
+        shouldCancel,
+        transfer: [chunkPcm.buffer]
       }
+    )
+    for (const cue of chunksToCues(chunks, chunkStartSec)) {
+      allCues.push(cue)
+      onCue(cue)
     }
-    w.addEventListener('message', handler)
-    w.postMessage({ type: 'transcribe', pcm })
-  })
+  }
+  return allCues
 }
