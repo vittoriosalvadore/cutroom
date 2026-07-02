@@ -5,6 +5,7 @@ import { mediaUrl } from './media'
 import { VideoPool } from './videoPool'
 import { roundRectPath } from './canvas'
 import { RestoreMachine } from './webglRestore'
+import type { FrameSource } from './videoSource'
 
 // ---------------------------------------------------------------------------
 // WebGL preview compositor.
@@ -501,8 +502,9 @@ export class Compositor {
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
   }
 
-  /** (Re)upload the video element's current frame into its reused texture. */
-  private uploadVideoFrame(id: string, video: HTMLVideoElement): WebGLTexture {
+  /** (Re)upload the current frame (a <video> OR a WebCodecs VideoFrame) into
+   *  its reused texture. Both are valid texImage2D sources. */
+  private uploadVideoFrame(id: string, video: FrameSource): WebGLTexture {
     const gl = this.gl
     let tex = this.videoTextures.get(id)
     if (!tex) {
@@ -543,7 +545,7 @@ export class Compositor {
       const srcTime = clip.inSec + (playheadSec - clip.startSec) * speed
       const frame = this.videos.want(media.id, media.path, srcTime, this.playing, speed)
       if (frame && frame.width > 0 && frame.height > 0) {
-        const tex = this.uploadVideoFrame(media.id, frame.el)
+        const tex = this.uploadVideoFrame(media.id, frame.source)
         this.drawQuad(containRect(frame.width, frame.height, this.W, this.H), tex, null, effects, tf, opacity)
         return
       }
