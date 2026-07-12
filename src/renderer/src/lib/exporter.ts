@@ -3,6 +3,7 @@ import type { AudioClipPlanEntry } from '../../../preload'
 import { Compositor } from './compositor'
 import { resolveDuck } from '../state/selectors'
 import { useSettings } from '../state/settings'
+import { ensureDenoisedForExport, getDenoiseEntry } from './denoiseCache'
 
 // ---------------------------------------------------------------------------
 // Export driver (renderer side). Two passes:
@@ -63,8 +64,13 @@ function buildAudioPlan(project: Project): AudioClipPlanEntry[] {
             makeupDb: track.comp.makeupDb
           }
         : undefined
+    // Denoise is a source-media substitution: swap in the cached temp WAV
+    // (readied by the export preflight below) when enabled, falling back to
+    // the original on any glitch — export must never hard-fail over denoise.
+    const denoised = clip.denoiseEnabled ? getDenoiseEntry(media.id) : undefined
+    const path = denoised?.status === 'ready' && denoised.tempPath ? denoised.tempPath : media.path
     plan.push({
-      path: media.path,
+      path,
       startSec: clip.startSec,
       durationSec: clip.durationSec,
       inSec: clip.inSec,
@@ -165,6 +171,10 @@ export async function exportTimeline(
   try {
     onProgress({ phase: 'preparing' })
     await comp.preload(project)
+    // Ensure every denoise-enabled clip's temp audio is ready BEFORE the plan
+    // is built below — otherwise a job still in flight would silently export
+    // the original (undenoised) audio for that clip.
+    await ensureDenoisedForExport(project)
 
     // Pass 1: render the silent video to a temp file.
     silentPath = await window.cutroom.exportTempVideoPath()

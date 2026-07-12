@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import { useEditor } from '../state/store'
 import {
   defaultAudio,
@@ -11,6 +12,7 @@ import {
 import { sampleOpacity, sampleTransform, KEY_EPS } from '../lib/keyframes'
 import { useT } from '../lib/i18n'
 import { normalizeGainDb } from '../lib/normalize'
+import { denoiseCacheVersion, ensureDenoised, getDenoiseEntry, subscribeDenoiseCache } from '../lib/denoiseCache'
 import type { AnimProp, Marker, TextAlign, Track, TrackGate, TrackDuck, TrackEQ, TrackComp } from '../types'
 
 /** Labelled range slider that shows its current value. */
@@ -531,6 +533,10 @@ export default function Inspector() {
   const updateColor = useEditor((s) => s.updateColor)
   const setSpeed = useEditor((s) => s.setSpeed)
   const updateAudio = useEditor((s) => s.updateAudio)
+  const setDenoiseEnabled = useEditor((s) => s.setDenoiseEnabled)
+  // Re-render when a denoise job's status changes (processing -> ready/error).
+  const [, setDenoiseVersion] = useState(0)
+  useEffect(() => subscribeDenoiseCache(() => setDenoiseVersion(denoiseCacheVersion())), [])
   // Subscribe to the playhead so keyframe sliders track the value live as you scrub.
   const playhead = useEditor((s) => s.playheadSec)
   const tracks = useEditor((s) => s.project.tracks)
@@ -997,6 +1003,35 @@ export default function Inspector() {
               onChange={(v) => updateAudio(id, { fadeOutSec: v })}
               format={(v) => `${v.toFixed(2)}s`}
             />
+            {media?.path && (
+              <>
+                <label className="insp-switch">
+                  <input
+                    type="checkbox"
+                    checked={!!clip.denoiseEnabled}
+                    onChange={(e) => {
+                      const enabled = e.target.checked
+                      setDenoiseEnabled(id, enabled)
+                      if (enabled) ensureDenoised(media.id, media.path as string)
+                    }}
+                  />
+                  <span>Denoise (AI)</span>
+                </label>
+                {clip.denoiseEnabled &&
+                  (() => {
+                    const entry = getDenoiseEntry(media.id)
+                    return (
+                      <p className="insp-note">
+                        {entry?.status === 'ready'
+                          ? 'Noise removal applied — reused for export.'
+                          : entry?.status === 'error'
+                            ? `Denoise failed: ${entry.error ?? 'unknown error'}`
+                            : 'Processing… this can take a while for long clips.'}
+                      </p>
+                    )
+                  })()}
+              </>
+            )}
             {media?.kind === 'video' && (
               <p className="insp-note">This is the video clip&apos;s own audio (plays in preview and export).</p>
             )}

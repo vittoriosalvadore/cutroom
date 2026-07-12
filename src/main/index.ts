@@ -5,6 +5,7 @@ import { readFile, stat, writeFile } from 'fs/promises'
 import { Readable } from 'stream'
 import { registerExportIpc } from './export'
 import { registerAudioMuxIpc } from './audioMux'
+import { registerDenoiseIpc } from './denoise'
 import { clearSessionLock, flagRecoveryPending, initProjectStore, registerProjectIpc } from './projectStore'
 import { readSettingsSync, registerSettingsIpc } from './settings'
 import { shouldFlagRecovery } from './crashFlags'
@@ -205,6 +206,7 @@ function registerIpc(): void {
   // Video export over FFmpeg (frame streaming) + the audio mux pass.
   registerExportIpc()
   registerAudioMuxIpc()
+  registerDenoiseIpc()
 
   // Project save/load + crash recovery.
   registerProjectIpc()
