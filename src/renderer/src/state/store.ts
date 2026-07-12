@@ -222,6 +222,7 @@ interface EditorState {
     clipId: string,
     patch: { volume?: number; fadeInSec?: number; fadeOutSec?: number }
   ) => void
+  setDenoiseEnabled: (clipId: string, enabled: boolean) => void
   toggleTrackMute: (trackId: string, muted: boolean) => void
   addAudioTrack: (name?: string) => void
   selectTrack: (trackId: string | null) => void
@@ -979,6 +980,13 @@ export const useEditor = create<EditorState>((set) => {
       const c = s.project.clips[clipId]
       if (!c) return {}
       return { project: { ...s.project, clips: { ...s.project.clips, [clipId]: { ...c, ...patch } } } }
+    }),
+
+  setDenoiseEnabled: (clipId, enabled) =>
+    set((s) => {
+      const c = s.project.clips[clipId]
+      if (!c) return {}
+      return { project: { ...s.project, clips: { ...s.project.clips, [clipId]: { ...c, denoiseEnabled: enabled } } } }
     }),
 
   toggleTrackMute: (trackId, muted) =>
