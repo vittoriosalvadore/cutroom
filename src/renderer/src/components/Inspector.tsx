@@ -537,6 +537,15 @@ export default function Inspector() {
   // Re-render when a denoise job's status changes (processing -> ready/error).
   const [, setDenoiseVersion] = useState(0)
   useEffect(() => subscribeDenoiseCache(() => setDenoiseVersion(denoiseCacheVersion())), [])
+  // If denoise was already enabled on this clip from a previous session (e.g.
+  // a recovered project), start the job here instead of relying solely on the
+  // checkbox's own onChange — otherwise nothing ever kicks it off and the
+  // Inspector is stuck showing "Processing…" forever.
+  useEffect(() => {
+    if (clip?.denoiseEnabled && media?.path && !getDenoiseEntry(media.id)) {
+      ensureDenoised(media.id, media.path)
+    }
+  }, [clip?.id, clip?.denoiseEnabled, media?.id, media?.path])
   // Subscribe to the playhead so keyframe sliders track the value live as you scrub.
   const playhead = useEditor((s) => s.playheadSec)
   const tracks = useEditor((s) => s.project.tracks)
@@ -1015,7 +1024,7 @@ export default function Inspector() {
                       if (enabled) ensureDenoised(media.id, media.path as string)
                     }}
                   />
-                  <span>Denoise (AI)</span>
+                  <span>Denoise</span>
                 </label>
                 {clip.denoiseEnabled &&
                   (() => {

@@ -11,10 +11,21 @@ const ffmpegPath: string | null = ffmpegPathRaw && app.isPackaged
   : ffmpegPathRaw
 
 // ---------------------------------------------------------------------------
-// AI noise removal: FFmpeg's arnndn (RNNoise) filter, run ONCE per source media
-// to a temp WAV that both the preview (decoded to an AudioBuffer) and the
-// export mux (fed straight in as a clip's input path) reuse — no separate
-// in-browser model, no drift between what you hear and what exports.
+// Noise removal: FFmpeg's afftdn (FFT denoiser), run ONCE per source media to
+// a temp WAV that both the preview (decoded to an AudioBuffer) and the export
+// mux (fed straight in as a clip's input path) reuse — no drift between what
+// you hear and what exports.
+//
+// NOT arnndn (RNNoise): confirmed directly, by hand, across many repeated
+// runs of the identical command/input, that this ffmpeg-static build's arnndn
+// is non-deterministic — the SAME input produces a different amount of
+// suppression from run to run (sometimes barely any), with no error or
+// warning printed. Reproduces even on a pure mono input, so it isn't a
+// stereo/channel-handling bug (ruling out threads=1 and per-channel
+// splitting, both tried first) — it's the filter itself, in this build.
+// afftdn is deterministic (byte-identical output across repeated runs,
+// verified) and needs no external model file, at the cost of being a
+// classical spectral-subtraction filter rather than a neural one.
 // ---------------------------------------------------------------------------
 
 interface DenoiseResult {
@@ -30,12 +41,17 @@ function tempDenoisePath(): string {
   return join(tmpdir(), `cutroom-${process.pid}-${Date.now()}-${counter}-denoised.wav`)
 }
 
-/** arnndn expects 48kHz; resample first so any source rate works. PCM output
- *  (not AAC) avoids stacking a second lossy encode on top of export's own. */
 function runDenoise(sourcePath: string): Promise<DenoiseResult> {
   if (!ffmpegPath) return Promise.resolve({ ok: false, error: 'Bundled FFmpeg binary not found for this platform.' })
   const tempPath = tempDenoisePath()
-  const args = ['-y', '-i', sourcePath, '-vn', '-af', 'aresample=48000,arnndn', '-c:a', 'pcm_s16le', tempPath]
+  const args = [
+    '-y',
+    '-i', sourcePath,
+    '-vn',
+    '-af', 'aresample=48000,afftdn',
+    '-c:a', 'pcm_s16le',
+    tempPath
+  ]
 
   return new Promise<DenoiseResult>((resolve) => {
     const proc = spawn(ffmpegPath as string, args, { stdio: ['ignore', 'ignore', 'pipe'] })
