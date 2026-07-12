@@ -832,6 +832,15 @@ export default function Inspector() {
                   🎯 AI Reframe
                 </button>
               )}
+              {media?.kind === 'video' && (
+                <button
+                  className="btn small"
+                  title="Find hard cuts and split the clip at each one"
+                  onClick={() => useEditor.getState().setSceneDetectOpen(true)}
+                >
+                  🎬 Detect Scenes
+                </button>
+              )}
             </div>
             <details className="insp-crop">
               <summary>Crop</summary>

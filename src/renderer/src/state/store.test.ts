@@ -290,6 +290,51 @@ describe('transform & keyframes', () => {
     expect(kf[0].t).toBe(0) // rebased to the new head
     expect(kf[0].v).toBeCloseTo(3) // value held at the cut
   })
+
+  it('splitClipAtTimes splits into three pieces with no content lost', () => {
+    // c1 [0,5). Splitting at absolute times 1 and 3 -> [0,1) [1,3) [3,5).
+    useEditor.getState().splitClipAtTimes('c1', [1, 3])
+    const clips = Object.values(useEditor.getState().project.clips).filter((c) => c.startSec < 5)
+    expect(clips).toHaveLength(3)
+    const sorted = clips.sort((a, b) => a.startSec - b.startSec)
+    expect(sorted.map((c) => [c.startSec, c.durationSec])).toEqual([
+      [0, 1],
+      [1, 2],
+      [3, 2]
+    ])
+    // c2/c3 (untouched) keep their original spans — a split never ripples.
+    expect(useEditor.getState().project.clips.c2.startSec).toBe(5)
+    expect(useEditor.getState().project.clips.c3.startSec).toBe(10)
+  })
+
+  it('splitClipAtTimes rebases inSec across each cut', () => {
+    useEditor.getState().splitClipAtTimes('c1', [1, 3])
+    const sorted = Object.values(useEditor.getState().project.clips)
+      .filter((c) => c.startSec < 5)
+      .sort((a, b) => a.startSec - b.startSec)
+    expect(sorted.map((c) => c.inSec)).toEqual([0, 1, 3])
+  })
+
+  it('splitClipAtTimes is a single undo step regardless of split count', () => {
+    useEditor.getState().splitClipAtTimes('c1', [1, 3])
+    expect(useEditor.getState().past.length).toBe(1)
+    useEditor.getState().undo()
+    expect(useEditor.getState().project.clips.c1).toEqual({
+      id: 'c1',
+      trackId: 'v1',
+      mediaId: 'm1',
+      startSec: 0,
+      durationSec: 5,
+      inSec: 0
+    })
+    expect(Object.values(useEditor.getState().project.clips)).toHaveLength(3) // back to c1/c2/c3
+  })
+
+  it('splitClipAtTimes ignores a time outside the clip instead of throwing', () => {
+    expect(() => useEditor.getState().splitClipAtTimes('c1', [20])).not.toThrow()
+    expect(useEditor.getState().past.length).toBe(0) // no-op: nothing was actually split
+    expect(useEditor.getState().project.clips.c1.durationSec).toBe(5)
+  })
 })
 
 describe('multi-select', () => {

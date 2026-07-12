@@ -176,6 +176,10 @@ interface EditorState {
    *  are given in ORIGINAL (pre-cut) timeline positions; later ranges are
    *  re-targeted internally as earlier cuts ripple-shift the timeline. */
   applySilenceCuts: (clipId: string, ranges: Array<{ startSec: number; endSec: number }>) => void
+  /** Split a clip at every given ABSOLUTE timeline time (e.g. scene-detect
+   *  cuts), content preserved — plain splits, no ripple-delete. One recorded
+   *  history step for the whole batch. */
+  splitClipAtTimes: (clipId: string, atSecs: number[]) => void
   /** Crossfade a clip with its nearest adjacent/overlapping same-track neighbor. */
   crossfadeWithNeighbor: (clipId: string) => void
   selectClip: (clipId: string | null) => void
@@ -301,6 +305,10 @@ interface EditorState {
   // --- auto-cut silence ---
   autoCutSilenceOpen: boolean
   setAutoCutSilenceOpen: (open: boolean) => void
+
+  // --- scene detection ---
+  sceneDetectOpen: boolean
+  setSceneDetectOpen: (open: boolean) => void
 }
 
 const HISTORY_LIMIT = 100
@@ -656,6 +664,31 @@ export const useEditor = create<EditorState>((set) => {
       }
       if (clips === s.project.clips) return {} // nothing was actually cut
       return { ...recordHistory(s), project: { ...s.project, clips, markers } }
+    }),
+
+  splitClipAtTimes: (clipId, atSecs) =>
+    set((s) => {
+      const sorted = [...atSecs].sort((a, b) => a - b)
+      if (sorted.length === 0) return {}
+      const clips = { ...s.project.clips }
+      // Ascending splits: each one only ever lands in the piece created by the
+      // previous split (or the original clip, for the first one) — track that
+      // piece's id forward since splitClipAt hands back a fresh id each time.
+      let currentId = clipId
+      let changed = false
+      for (const atSec of sorted) {
+        const current = clips[currentId]
+        if (!current) break
+        const result = splitClipAt(current, atSec)
+        if (!result) continue // outside this piece (e.g. duplicate/out-of-range time) — skip
+        const rightId = uid('c')
+        clips[currentId] = result.left
+        clips[rightId] = { ...result.right, id: rightId, trackId: current.trackId }
+        currentId = rightId
+        changed = true
+      }
+      if (!changed) return {}
+      return { ...recordHistory(s), project: { ...s.project, clips } }
     }),
 
   crossfadeWithNeighbor: (clipId) =>
@@ -1285,6 +1318,9 @@ export const useEditor = create<EditorState>((set) => {
     }),
 
   autoCutSilenceOpen: false,
-  setAutoCutSilenceOpen: (open) => set({ autoCutSilenceOpen: open })
+  setAutoCutSilenceOpen: (open) => set({ autoCutSilenceOpen: open }),
+
+  sceneDetectOpen: false,
+  setSceneDetectOpen: (open) => set({ sceneDetectOpen: open })
   }
 })
