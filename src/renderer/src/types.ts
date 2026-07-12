@@ -232,6 +232,14 @@ export interface Project {
 // ---------------------------------------------------------------------------
 
 export type TextAlign = 'left' | 'center' | 'right'
+export type KaraokeStyle = 'pop' | 'underline' | 'fill-wipe'
+
+/** A transcribed word's timing, CLIP-relative (0 = the owning clip's own start). */
+export interface WordTiming {
+  text: string
+  startSec: number
+  endSec: number
+}
 
 /** A title or subtitle's content and look. */
 export interface TextProps {
@@ -254,6 +262,11 @@ export interface TextProps {
   boxColor: string
   /** Box alpha 0..1. 0 = no box. */
   boxOpacity: number
+  /** Per-word timing for karaoke-style highlight. Absent for plain/imported subtitles. */
+  words?: WordTiming[]
+  /** Highlight color for the active word (karaoke mode). Defaults to accent if unset. */
+  karaokeColor?: string
+  karaokeStyle?: KaraokeStyle
 }
 
 /** Green/blue-screen key. Removes pixels near `color`. */

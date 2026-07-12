@@ -1,4 +1,4 @@
-import type { Clip, Project } from '../types'
+import type { Clip, Project, WordTiming } from '../types'
 import type { SubtitleCue } from '../state/store'
 import { getOrDecodeBuffer } from './audioCache'
 import { WorkerJob, JobCancelled } from './workerJob'
@@ -59,9 +59,59 @@ function chunksToCues(chunks: WhisperChunk[], clipStartSec: number): SubtitleCue
   return cues
 }
 
+// Word-level (karaoke) caption-card grouping: consecutive words are packed into
+// a card up to MAX_WORDS_PER_CARD or MAX_CARD_DURATION_SEC (whichever comes
+// first), or fewer if a word ends in sentence punctuation.
+const MAX_WORDS_PER_CARD = 6
+const MAX_CARD_DURATION_SEC = 3
+
+/** Group per-word Whisper chunks into subtitle cues, keeping each word's own
+ *  timing (relative to its OWN card's start) for karaoke highlight rendering. */
+export function wordsToCues(chunks: WhisperChunk[], clipStartSec: number): SubtitleCue[] {
+  const cues: SubtitleCue[] = []
+  let group: { text: string; start: number; end: number }[] = []
+
+  const flush = (): void => {
+    if (group.length === 0) return
+    const first = group[0]
+    const last = group[group.length - 1]
+    const cardStart = clipStartSec + first.start
+    const cardEnd = clipStartSec + last.end
+    const words: WordTiming[] = group.map((w) => ({
+      text: w.text,
+      startSec: w.start - first.start,
+      endSec: w.end - first.start
+    }))
+    cues.push({
+      startSec: cardStart,
+      endSec: Math.max(cardStart + 0.2, cardEnd),
+      text: group.map((w) => w.text).join(' ').trim(),
+      words
+    })
+    group = []
+  }
+
+  for (let i = 0; i < chunks.length; i++) {
+    const text = (chunks[i].text ?? '').trim()
+    if (!text) continue
+    const start = chunks[i].timestamp?.[0] ?? 0
+    let end = chunks[i].timestamp?.[1]
+    if (end == null) end = chunks[i + 1]?.timestamp?.[0] ?? start + 0.2
+
+    const wouldSpan = group.length > 0 ? end - group[0].start : 0
+    if (group.length >= MAX_WORDS_PER_CARD || wouldSpan > MAX_CARD_DURATION_SEC) flush()
+
+    group.push({ text, start, end })
+    if (/[.!?]$/.test(text)) flush()
+  }
+  flush()
+  return cues
+}
+
 interface TranscribeIn {
   type: 'transcribe'
   pcm: Float32Array
+  wordLevel?: boolean
 }
 interface TranscribeOut {
   chunks: WhisperChunk[]
@@ -89,7 +139,8 @@ export async function transcribeClip(
   clip: Clip,
   onProgress: (p: TranscribeProgress) => void,
   onCue: (cue: SubtitleCue) => void,
-  shouldCancel: () => boolean = () => false
+  shouldCancel: () => boolean = () => false,
+  wordLevel = false
 ): Promise<SubtitleCue[]> {
   onProgress({ stage: 'extracting' })
   const pcm = await getClipPcm16k(project, clip)
@@ -106,7 +157,7 @@ export async function transcribeClip(
     const chunkStartSec = clip.startSec + start / SAMPLE_RATE
 
     const { chunks } = await job.call(
-      { type: 'transcribe', pcm: chunkPcm },
+      { type: 'transcribe', pcm: chunkPcm, wordLevel },
       {
         onProgress: (p) => onProgress({ stage: 'loading', progress: p.progress, file: p.file }),
         onStatus: (msg) => {
@@ -116,7 +167,8 @@ export async function transcribeClip(
         transfer: [chunkPcm.buffer]
       }
     )
-    for (const cue of chunksToCues(chunks, chunkStartSec)) {
+    const cues = wordLevel ? wordsToCues(chunks, chunkStartSec) : chunksToCues(chunks, chunkStartSec)
+    for (const cue of cues) {
       allCues.push(cue)
       onCue(cue)
     }

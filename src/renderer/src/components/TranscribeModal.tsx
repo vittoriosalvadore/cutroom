@@ -18,6 +18,7 @@ export default function TranscribeModal() {
   const [progress, setProgress] = useState<TranscribeProgress>({ stage: 'extracting' })
   const [error, setError] = useState<string | null>(null)
   const [count, setCount] = useState(0)
+  const [wordLevel, setWordLevel] = useState(false)
   const cancelRef = useRef(false)
 
   if (!open) return null
@@ -57,7 +58,8 @@ export default function TranscribeModal() {
           importSubtitles([cue])
           setCount((c) => c + 1)
         },
-        () => cancelRef.current
+        () => cancelRef.current,
+        wordLevel
       )
       setCount(cues.length)
       setStatus('done')
@@ -97,6 +99,16 @@ export default function TranscribeModal() {
                 recognition (Whisper) — no account or upload. The first run downloads a small model
                 (~75 MB); after that it works offline.
               </p>
+              {status === 'idle' && (
+                <label className="insp-switch">
+                  <input
+                    type="checkbox"
+                    checked={wordLevel}
+                    onChange={(e) => setWordLevel(e.target.checked)}
+                  />
+                  <span>Karaoke-style (word highlight)</span>
+                </label>
+              )}
               {running && (
                 <div className="export-progress">
                   <div className="bar">

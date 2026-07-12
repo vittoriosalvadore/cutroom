@@ -15,7 +15,8 @@ import type {
   TrackGate,
   TrackDuck,
   TrackEQ,
-  TrackComp
+  TrackComp,
+  WordTiming
 } from '../types'
 import {
   clampSpeed,
@@ -36,11 +37,13 @@ import { clampFades } from '../lib/fades'
 import { clampProp, keyIndexAt, KEY_EPS, rebaseTracks, sortKeys, splitTracksAt, withTransformProp } from '../lib/keyframes'
 import { useSettings } from './settings'
 
-/** One imported subtitle cue (used by SRT/VTT import). */
+/** One imported subtitle cue (used by SRT/VTT import, and Whisper transcription). */
 export interface SubtitleCue {
   startSec: number
   endSec: number
   text: string
+  /** Word-level timing (karaoke mode). Clip-relative to this cue's OWN startSec. */
+  words?: WordTiming[]
 }
 
 // ---------------------------------------------------------------------------
@@ -959,6 +962,7 @@ export const useEditor = create<EditorState>((set) => {
       const clips = { ...s.project.clips }
       for (const cue of cues) {
         const id = uid('c')
+        const text = defaultSubtitleText(cue.text)
         clips[id] = {
           id,
           trackId,
@@ -967,7 +971,7 @@ export const useEditor = create<EditorState>((set) => {
           durationSec: Math.max(0.1, cue.endSec - cue.startSec),
           inSec: 0,
           role: 'subtitle',
-          text: defaultSubtitleText(cue.text),
+          text: cue.words && cue.words.length > 0 ? { ...text, words: cue.words } : text,
           effects: defaultEffects()
         }
       }

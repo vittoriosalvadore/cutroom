@@ -42,13 +42,15 @@ async function getTranscriber(): Promise<Transcriber> {
 }
 
 self.onmessage = async (e: MessageEvent): Promise<void> => {
-  const data = e.data as { type: string; id?: number; pcm?: Float32Array }
+  const data = e.data as { type: string; id?: number; pcm?: Float32Array; wordLevel?: boolean }
   if (data.type !== 'transcribe' || !data.pcm) return
   try {
     const t = await getTranscriber()
     self.postMessage({ type: 'status', id: data.id, status: 'transcribing' })
     const output = await t(data.pcm, {
-      return_timestamps: true,
+      // 'word' yields one chunk per word (same [start,end] shape) instead of
+      // one per phrase segment — used for karaoke-style highlight.
+      return_timestamps: data.wordLevel ? 'word' : true,
       chunk_length_s: 30,
       stride_length_s: 5
     })

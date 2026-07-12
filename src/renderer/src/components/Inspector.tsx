@@ -11,7 +11,7 @@ import {
 import { sampleOpacity, sampleTransform, KEY_EPS } from '../lib/keyframes'
 import { useT } from '../lib/i18n'
 import { normalizeGainDb } from '../lib/normalize'
-import type { AnimProp, Marker, TextAlign, Track, TrackGate, TrackDuck, TrackEQ, TrackComp } from '../types'
+import type { AnimProp, KaraokeStyle, Marker, TextAlign, Track, TrackGate, TrackDuck, TrackEQ, TrackComp } from '../types'
 
 /** Labelled range slider that shows its current value. */
 function Slider(props: {
@@ -133,6 +133,11 @@ function KeyableSlider(props: {
 }
 
 const ALIGNS: TextAlign[] = ['left', 'center', 'right']
+const KARAOKE_STYLES: { value: KaraokeStyle; label: string }[] = [
+  { value: 'pop', label: 'Pop' },
+  { value: 'underline', label: 'Underline' },
+  { value: 'fill-wipe', label: 'Fill' }
+]
 
 /** Mixer + dynamics panel for a selected track: volume, pan, gate, ducking. */
 function TrackPanel(props: {
@@ -746,6 +751,30 @@ export default function Inspector() {
               step={0.01}
               onChange={(v) => updateText(id, { boxOpacity: v })}
             />
+            {text.words && text.words.length > 0 && (
+              <div className="insp-row">
+                <label className="insp-color">
+                  Highlight
+                  <input
+                    type="color"
+                    value={text.karaokeColor ?? '#ffd23f'}
+                    onChange={(e) => updateText(id, { karaokeColor: e.target.value })}
+                  />
+                </label>
+                <div className="insp-toggle-group">
+                  {KARAOKE_STYLES.map((s) => (
+                    <button
+                      key={s.value}
+                      className={`btn small ${(text.karaokeStyle ?? 'pop') === s.value ? 'active' : ''}`}
+                      title={`Karaoke style: ${s.label}`}
+                      onClick={() => updateText(id, { karaokeStyle: s.value })}
+                    >
+                      {s.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </section>
         )}
 
