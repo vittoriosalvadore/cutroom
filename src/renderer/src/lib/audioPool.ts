@@ -1,11 +1,37 @@
 import type { Clip, Project, Track } from '../types'
 import { dbToLinear } from '../types'
 import { getAudioContext, resumeAudioContext } from './audioContext'
-import { getAudioEntry } from './audioCache'
+import { getAudioEntry, type AudioEntry } from './audioCache'
+import { getDenoiseEntry, type DenoiseEntry } from './denoiseCache'
 import { computeFadeSchedule, fadeGainAt } from './fades'
 import { setMeterAnalyser } from './audioMeter'
 import { resolveDuck } from '../state/selectors'
 import type { VideoPool } from './videoPool'
+
+/**
+ * Which AudioBuffer (if any) should back a clip's preview playback this
+ * frame: the denoised version when enabled and ready, else the plain decoded
+ * source for audio-track clips. Video-track clips fall back to null (the
+ * caller then uses the <video> element's own audio tap) UNLESS denoise is
+ * ready for them too, in which case they switch to this same buffer path —
+ * a video clip's audio has no other way to be denoised in preview, since the
+ * element's decoded audio can't be filtered in place.
+ * Exported (and covered by audioPool.test.ts) despite this file being mostly
+ * WebAudio glue, because getting this substitution wrong either silences a
+ * clip or double-plays it.
+ */
+export function resolvePreviewBuffer(
+  clip: Clip,
+  track: Track,
+  audioEntry: AudioEntry | undefined,
+  denoiseEntry: DenoiseEntry | undefined
+): AudioBuffer | null {
+  if (clip.denoiseEnabled && denoiseEntry?.status === 'ready' && denoiseEntry.buffer) {
+    return denoiseEntry.buffer
+  }
+  if (track.kind !== 'audio') return null
+  return audioEntry?.status === 'ready' && audioEntry.buffer ? audioEntry.buffer : null
+}
 
 // The per-track gate/duck AudioWorklet processor. Loaded once per context; if it
 // ever fails to load, every track stays on the plain input->panner path so gate
@@ -45,6 +71,7 @@ function ensureDynamicsWorklet(ctx: AudioContext): void {
 interface LiveSource {
   source: AudioBufferSourceNode
   gain: GainNode
+  buffer: AudioBuffer
   startedCtxTime: number
   startedSrcOffset: number
   wanted: boolean
@@ -240,19 +267,15 @@ export class AudioPool {
     }
   }
 
-  private startClip(clip: Clip, track: Track, playhead: number, project: Project): void {
-    if (!clip.mediaId) return
-    const entry = getAudioEntry(clip.mediaId)
-    if (!entry || entry.status !== 'ready' || !entry.buffer) return
-
+  private startClip(clip: Clip, track: Track, playhead: number, project: Project, buffer: AudioBuffer): void {
     const ctx = this.ctx
     const speed = clip.speed ?? 1
     const e0 = Math.max(0, playhead - clip.startSec)
     const srcOffset = clip.inSec + e0 * speed
-    if (srcOffset < 0 || srcOffset >= entry.buffer.duration) return
+    if (srcOffset < 0 || srcOffset >= buffer.duration) return
 
     const source = ctx.createBufferSource()
-    source.buffer = entry.buffer
+    source.buffer = buffer
     const gain = ctx.createGain()
 
     const t0 = ctx.currentTime
@@ -276,7 +299,7 @@ export class AudioPool {
     // playDur is in SOURCE seconds; at playbackRate=speed it covers `remaining`
     // timeline seconds (= remaining*speed of source).
     const remaining = Math.max(0, clip.durationSec - e0)
-    const playDur = Math.min(remaining * speed, Math.max(0, entry.buffer.duration - srcOffset))
+    const playDur = Math.min(remaining * speed, Math.max(0, buffer.duration - srcOffset))
     source.start(t0, srcOffset, playDur)
 
     source.onended = (): void => {
@@ -294,6 +317,7 @@ export class AudioPool {
     this.live.set(clip.id, {
       source,
       gain,
+      buffer,
       startedCtxTime: t0,
       startedSrcOffset: srcOffset,
       wanted: true
@@ -337,21 +361,28 @@ export class AudioPool {
       if (!track) continue
       if (playhead < clip.startSec || playhead >= clip.startSec + clip.durationSec) continue
 
-      if (track.kind === 'audio') {
+      const audioEntry = clip.mediaId ? getAudioEntry(clip.mediaId) : undefined
+      const denoiseEntry = clip.mediaId ? getDenoiseEntry(clip.mediaId) : undefined
+      const buffer = resolvePreviewBuffer(clip, track, audioEntry, denoiseEntry)
+
+      if (buffer) {
         this.trackInput(track, project) // keep mute/gain/pan + gate/duck current
         const existing = this.live.get(clip.id)
         if (existing) {
           const sp = clip.speed ?? 1
           const expected = clip.inSec + (playhead - clip.startSec) * sp
           const actual = existing.startedSrcOffset + (this.ctx.currentTime - existing.startedCtxTime) * sp
-          if (Math.abs(actual - expected) > DRIFT_TOLERANCE) {
+          // A buffer swap (denoise just finished on a live clip) always
+          // restarts too, even with zero drift, so playback hot-switches to
+          // the denoised audio instead of finishing the clip on the original.
+          if (Math.abs(actual - expected) > DRIFT_TOLERANCE || existing.buffer !== buffer) {
             this.stopClip(clip.id)
-            this.startClip(clip, track, playhead, project)
+            this.startClip(clip, track, playhead, project, buffer)
           } else {
             existing.wanted = true
           }
         } else {
-          this.startClip(clip, track, playhead, project)
+          this.startClip(clip, track, playhead, project, buffer)
         }
       } else if (track.kind === 'video' && videoPool && clip.mediaId) {
         const media = project.media[clip.mediaId]

@@ -131,6 +131,9 @@ export interface Clip {
   fadeInSec?: number
   /** Audio: fade-out length in seconds to the clip's end (default 0). */
   fadeOutSec?: number
+  /** AI noise removal (FFmpeg arnndn), applied to the source media once and
+   *  reused for both preview and export. Default false = original audio. */
+  denoiseEnabled?: boolean
   /** Per-clip 2D transform (static values; keyframes override per property). */
   transform?: ClipTransform
   /** Keyframe tracks per animatable property, in clip-relative seconds. */

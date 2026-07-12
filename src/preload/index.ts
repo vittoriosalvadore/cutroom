@@ -18,6 +18,14 @@ export interface ExportResult {
   error?: string
 }
 
+/** Result of an AI noise-removal (denoise) pass on a source file. */
+export interface DenoiseResult {
+  ok: boolean
+  /** Path to the denoised temp WAV, present only when ok. */
+  tempPath?: string
+  error?: string
+}
+
 // NOTE: these gate/duck shapes are hand-duplicated from renderer types.ts
 // (TrackGate/TrackDuck) because preload shares no imports with the renderer.
 // Keep them in sync if the renderer shapes change.
@@ -145,6 +153,10 @@ const api = {
   muxAudio: (opts: MuxAudioOptions): Promise<ExportResult> => ipcRenderer.invoke('export:muxAudio', opts),
   /** Delete a leftover temp silent video after a cancelled/failed export. */
   discardTemp: (path: string): Promise<boolean> => ipcRenderer.invoke('export:discardTemp', path),
+
+  // --- AI noise removal ---
+  /** Run FFmpeg's arnndn filter on a source file; resolves a temp WAV path. */
+  denoiseStart: (sourcePath: string): Promise<DenoiseResult> => ipcRenderer.invoke('denoise:start', sourcePath),
 
   // --- project save / load + recovery ---
   /** Save project JSON to `filePath`, or prompt when null. */
