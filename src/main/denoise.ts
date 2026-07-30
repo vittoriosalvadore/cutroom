@@ -11,10 +11,15 @@ const ffmpegPath: string | null = ffmpegPathRaw && app.isPackaged
   : ffmpegPathRaw
 
 // ---------------------------------------------------------------------------
-// AI noise removal: FFmpeg's arnndn (RNNoise) filter, run ONCE per source media
-// to a temp WAV that both the preview (decoded to an AudioBuffer) and the
-// export mux (fed straight in as a clip's input path) reuse — no separate
-// in-browser model, no drift between what you hear and what exports.
+// Noise removal: FFmpeg's afftdn (FFT denoiser), run ONCE per source media to
+// a temp WAV that both the preview (decoded to an AudioBuffer) and the export
+// mux (fed straight in as a clip's input path) reuse — no drift between what
+// you hear and what exports.
+//
+// The bundled FFmpeg does expose arnndn, but that filter needs an external
+// RNNoise model file. The app does not ship one, so using arnndn makes every
+// denoise request fail during filter initialization. afftdn is deterministic
+// and self-contained, which is the safe default for an offline feature.
 // ---------------------------------------------------------------------------
 
 interface DenoiseResult {
@@ -30,12 +35,12 @@ function tempDenoisePath(): string {
   return join(tmpdir(), `cutroom-${process.pid}-${Date.now()}-${counter}-denoised.wav`)
 }
 
-/** arnndn expects 48kHz; resample first so any source rate works. PCM output
+/** Resample first so any source rate works. PCM output
  *  (not AAC) avoids stacking a second lossy encode on top of export's own. */
 function runDenoise(sourcePath: string): Promise<DenoiseResult> {
   if (!ffmpegPath) return Promise.resolve({ ok: false, error: 'Bundled FFmpeg binary not found for this platform.' })
   const tempPath = tempDenoisePath()
-  const args = ['-y', '-i', sourcePath, '-vn', '-af', 'aresample=48000,arnndn', '-c:a', 'pcm_s16le', tempPath]
+  const args = ['-y', '-i', sourcePath, '-vn', '-af', 'aresample=48000,afftdn', '-c:a', 'pcm_s16le', tempPath]
 
   return new Promise<DenoiseResult>((resolve) => {
     const proc = spawn(ffmpegPath as string, args, { stdio: ['ignore', 'ignore', 'pipe'] })

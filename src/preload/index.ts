@@ -140,7 +140,7 @@ const api = {
   /** Spawn the FFmpeg encoder for a new export. */
   exportStart: (opts: ExportStartOptions): Promise<ExportResult> =>
     ipcRenderer.invoke('export:start', opts),
-  /** Stream one PNG frame (backpressured). */
+  /** Stream one JPEG frame (backpressured). */
   exportFrame: (data: ArrayBuffer): Promise<ExportResult> =>
     ipcRenderer.invoke('export:frame', data),
   /** Close the input stream and wait for FFmpeg to finish muxing. */

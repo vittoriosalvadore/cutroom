@@ -10,7 +10,7 @@ const ffmpegPath: string | null = ffmpegPathRaw && app.isPackaged
 
 // ---------------------------------------------------------------------------
 // Export sink. The renderer composites each frame with the SAME WebGL pipeline
-// used for preview, encodes it to PNG, and streams the PNGs here. We feed them
+// used for preview, encodes it to JPEG, and streams the JPEGs here. We feed them
 // straight into one long-lived FFmpeg process via image2pipe, so there are no
 // temp files and the output matches the preview exactly. Audio is out of scope
 // for this step (silent video).
@@ -26,6 +26,7 @@ interface Session {
   stderr: string
   failed: boolean
   failError: string
+  closed: boolean
   done: Promise<ExportResult>
 }
 
@@ -44,11 +45,25 @@ const X264_PRESETS = new Set([
   'ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'
 ])
 
+function sessionError(s: Session): ExportResult {
+  const detail = s.failError || s.stderr.slice(-700)
+  return {
+    ok: false,
+    error: detail ? `FFmpeg failed: ${detail}` : 'FFmpeg stopped before the export completed.'
+  }
+}
+
 function startSession(opts: StartOptions): ExportResult {
   if (!ffmpegPath) return { ok: false, error: 'Bundled FFmpeg binary not found for this platform.' }
   if (session) return { ok: false, error: 'An export is already in progress.' }
+  if (!opts || typeof opts.outputPath !== 'string' || !opts.outputPath.trim()) {
+    return { ok: false, error: 'A valid output path is required.' }
+  }
+  if (!Number.isFinite(opts.fps) || opts.fps <= 0) {
+    return { ok: false, error: 'The project frame rate must be greater than zero.' }
+  }
 
-  // PNG frames in on stdin -> H.264/yuv420p MP4 out. yuv420p + faststart make
+  // JPEG frames in on stdin -> H.264/yuv420p MP4 out. yuv420p + faststart make
   // the result broadly playable (browsers, QuickTime, mobile). Preset/CRF come
   // from settings; both are validated/clamped so a bad value can't break ffmpeg.
   const preset = opts.preset && X264_PRESETS.has(opts.preset) ? opts.preset : 'medium'
@@ -68,7 +83,14 @@ function startSession(opts: StartOptions): ExportResult {
   ]
 
   const proc = spawn(ffmpegPath, args, { stdio: ['pipe', 'ignore', 'pipe'] })
-  const s: Session = { proc, stderr: '', failed: false, failError: '', done: Promise.resolve({ ok: true }) }
+  const s: Session = {
+    proc,
+    stderr: '',
+    failed: false,
+    failError: '',
+    closed: false,
+    done: Promise.resolve({ ok: true })
+  }
 
   s.done = new Promise<ExportResult>((resolve) => {
     proc.stderr?.on('data', (chunk: Buffer) => {
@@ -78,11 +100,13 @@ function startSession(opts: StartOptions): ExportResult {
     proc.on('error', (err) => {
       s.failed = true
       s.failError = err.message
-      resolve({ ok: false, error: err.message })
+      s.closed = true
+      resolve(sessionError(s))
     })
     proc.on('close', (code) => {
-      if (code === 0) resolve({ ok: true })
-      else resolve({ ok: false, error: `FFmpeg exited with code ${code}.\n${s.stderr.slice(-700)}` })
+      s.closed = true
+      if (code === 0 && !s.failed) resolve({ ok: true })
+      else resolve(sessionError(s))
     })
   })
 
@@ -96,20 +120,50 @@ function startSession(opts: StartOptions): ExportResult {
   return { ok: true }
 }
 
-/** Write one PNG frame, applying stream backpressure so memory stays bounded. */
+/** Write one JPEG frame, applying stream backpressure so memory stays bounded. */
 function writeFrame(data: ArrayBuffer): Promise<ExportResult> {
   const s = session
   if (!s) return Promise.resolve({ ok: false, error: 'No active export session.' })
-  if (s.failed || !s.proc.stdin) {
-    const detail = s.failError || s.stderr.slice(-400)
-    return Promise.resolve({ ok: false, error: detail ? `FFmpeg failed: ${detail}` : 'FFmpeg process is not accepting input.' })
+  if (s.failed || s.closed || !s.proc.stdin || s.proc.stdin.destroyed) {
+    return Promise.resolve(sessionError(s))
   }
+  if (!data || data.byteLength === 0) return Promise.resolve({ ok: false, error: 'Cannot export an empty video frame.' })
 
   const buf = Buffer.from(data)
   return new Promise<ExportResult>((resolve) => {
-    const flushed = s.proc.stdin!.write(buf)
-    if (flushed) resolve({ ok: !s.failed })
-    else s.proc.stdin!.once('drain', () => resolve({ ok: !s.failed }))
+    const stdin = s.proc.stdin!
+    let settled = false
+
+    const cleanup = (): void => {
+      stdin.removeListener('drain', onDrain)
+      stdin.removeListener('error', onInputError)
+      s.proc.removeListener('close', onClose)
+    }
+    const finish = (): void => {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolve(s.failed || s.closed ? sessionError(s) : { ok: true })
+    }
+    const onDrain = (): void => finish()
+    const onInputError = (err: Error): void => {
+      s.failed = true
+      if (!s.failError) s.failError = err.message
+      finish()
+    }
+    const onClose = (): void => finish()
+
+    stdin.once('drain', onDrain)
+    stdin.once('error', onInputError)
+    s.proc.once('close', onClose)
+    try {
+      const flushed = stdin.write(buf)
+      if (flushed || s.failed || s.closed) finish()
+    } catch (e) {
+      s.failed = true
+      if (!s.failError) s.failError = e instanceof Error ? e.message : 'Could not write video frame.'
+      finish()
+    }
   })
 }
 

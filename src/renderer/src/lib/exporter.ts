@@ -8,7 +8,7 @@ import { ensureDenoisedForExport, getDenoiseEntry } from './denoiseCache'
 // ---------------------------------------------------------------------------
 // Export driver (renderer side). Two passes:
 //   1. Render the timeline frame-by-frame with the preview compositor, stream
-//      PNGs to FFmpeg -> a SILENT temp MP4 (WYSIWYG: it is the preview pipeline).
+//      JPEGs to FFmpeg -> a SILENT temp MP4 (WYSIWYG: it is the preview pipeline).
 //   2. Build the audible-clip plan and have the main process mux a mixed
 //      soundtrack into that video, writing the user's chosen file.
 // ---------------------------------------------------------------------------

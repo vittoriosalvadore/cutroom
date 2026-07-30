@@ -542,6 +542,15 @@ export default function Inspector() {
   // Re-render when a denoise job's status changes (processing -> ready/error).
   const [, setDenoiseVersion] = useState(0)
   useEffect(() => subscribeDenoiseCache(() => setDenoiseVersion(denoiseCacheVersion())), [])
+  // Projects can restore a denoise-enabled clip without a live cache entry
+  // (for example after reopening or recovering a project). Start the derived
+  // audio job on selection so the inspector and preview do not stay stuck in
+  // a permanent "processing" state.
+  useEffect(() => {
+    if (clip?.denoiseEnabled && media?.path && !getDenoiseEntry(media.id)) {
+      void ensureDenoised(media.id, media.path)
+    }
+  }, [clip?.id, clip?.denoiseEnabled, media?.id, media?.path])
   // Subscribe to the playhead so keyframe sliders track the value live as you scrub.
   const playhead = useEditor((s) => s.playheadSec)
   const tracks = useEditor((s) => s.project.tracks)
