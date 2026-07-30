@@ -23,7 +23,17 @@ if (env.backends.onnx.wasm) {
   env.backends.onnx.wasm.proxy = false
 }
 
-const MODEL = 'Xenova/whisper-tiny.en'
+// Multilingual (not .en) so non-English clips transcribe correctly instead of
+// forcing English output — Whisper auto-detects the spoken language per clip
+// when none is forced.
+//
+// medium (~3GB): small was still not accurate enough on sung lyrics. This is
+// a much bigger jump than every step before it — noticeably slower WASM/CPU
+// inference (no GPU acceleration here), a 30s chunk can plausibly take on
+// the order of a minute rather than a few seconds. Accepted tradeoff after
+// confirming with the user; large would be a further jump again (~6GB+,
+// likely impractically slow on CPU) and isn't attempted here.
+const MODEL = 'Xenova/whisper-medium'
 
 // transformers.js types are loose; the transcriber is an async-callable.
 type Transcriber = (
