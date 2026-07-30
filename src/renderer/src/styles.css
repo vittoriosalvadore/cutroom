@@ -651,6 +651,35 @@ input[type='color']:hover {
   cursor: crosshair;
 }
 
+/* ---- custom horizontal scrollbar (hand-driven, not native overflow) ---- */
+.timeline-hscroll {
+  flex: none;
+  height: 14px;
+  background: var(--panel-3, #1d1f27);
+  border-top: 1px solid var(--line);
+}
+.timeline-hscroll-track {
+  /* The thumb's percentage left/width resolve against THIS box (which
+     excludes the gutter via its marginLeft), not .timeline-hscroll's full
+     width — it must be the positioned ancestor, not just a plain child. */
+  position: relative;
+  height: 100%;
+  cursor: pointer;
+}
+.timeline-hscroll-thumb {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  min-width: 24px;
+  background: var(--line-strong, #353a47);
+  border-radius: 5px;
+  cursor: grab;
+}
+.timeline-hscroll-thumb:hover,
+.timeline-hscroll-thumb.dragging {
+  background: var(--accent, #4c8dff);
+}
+
 /* ---- inspector ---- */
 .inspector {
   background: var(--panel);

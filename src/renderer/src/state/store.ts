@@ -149,6 +149,8 @@ interface EditorState {
   isPlaying: boolean
   /** Timeline zoom: horizontal pixels per second. */
   pxPerSec: number
+  /** Timeline horizontal scroll position, in seconds from t=0. */
+  scrollSec: number
   /** The PRIMARY selected clip (Inspector target). Always a member of selectedClipIds, null iff empty. */
   selectedClipId: string | null
   /** The full clip selection set (multi-select). */
@@ -261,6 +263,7 @@ interface EditorState {
   setPlayhead: (sec: number) => void
   setPlaying: (playing: boolean) => void
   setZoom: (pxPerSec: number) => void
+  setScroll: (scrollSec: number) => void
 
   // --- history (undo/redo) ---
   past: Project[]
@@ -453,6 +456,7 @@ export const useEditor = create<EditorState>((set) => {
   playheadSec: 0,
   isPlaying: false,
   pxPerSec: 80,
+  scrollSec: 0,
   selectedClipId: null,
   selectedClipIds: new Set<string>(),
   selectedTrackId: null,
@@ -1208,6 +1212,8 @@ export const useEditor = create<EditorState>((set) => {
   setPlayhead: (sec) => set({ playheadSec: Math.max(0, sec) }),
   setPlaying: (playing) => set({ isPlaying: playing }),
   setZoom: (pxPerSec) => set({ pxPerSec: Math.min(600, Math.max(10, pxPerSec)) }),
+  // The timeline component clamps the upper bound once its viewport is known.
+  setScroll: (scrollSec) => set({ scrollSec: Math.max(0, scrollSec) }),
 
   snapshot: () =>
     set((s) => {
@@ -1276,7 +1282,8 @@ export const useEditor = create<EditorState>((set) => {
       selectedMarkerId: null,
       selectedTrackId: null,
       playheadSec: 0,
-      isPlaying: false
+      isPlaying: false,
+      scrollSec: 0
     })
   },
 
@@ -1295,7 +1302,8 @@ export const useEditor = create<EditorState>((set) => {
       selectedMarkerId: null,
       selectedTrackId: null,
       playheadSec: 0,
-      isPlaying: false
+      isPlaying: false,
+      scrollSec: 0
     })
   },
 
