@@ -1062,7 +1062,7 @@ export default function Inspector() {
                       if (enabled) ensureDenoised(media.id, media.path as string)
                     }}
                   />
-                  <span>Denoise (AI)</span>
+                  <span>Denoise</span>
                 </label>
                 {clip.denoiseEnabled &&
                   (() => {
