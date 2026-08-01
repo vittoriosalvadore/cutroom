@@ -124,7 +124,10 @@ export function registerProjectIpc(): void {
   // snapshot so a single bad write can't lose everything.
   ipcMain.handle('project:checkRecovery', async () => {
     try {
-      if (!recoveryDir || !existsSync(recoveryFile)) return { available: false }
+      // Do not require the primary file here: it may be the one file lost or
+      // truncated by a crash while a valid snapshot still exists in the ring.
+      // The fallback below deliberately handles a missing primary.
+      if (!recoveryDir) return { available: false }
       if (!previousCrash && !existsSync(pendingFile)) return { available: false }
 
       const validate = (

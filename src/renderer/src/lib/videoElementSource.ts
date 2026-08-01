@@ -27,11 +27,13 @@ export class VideoElementSource implements VideoSource {
     host?: HTMLElement
   ) {
     this.el = document.createElement('video')
-    this.el.src = mediaUrl(path)
     this.el.muted = true // audible playback goes through the WebAudio graph, not the element
     this.el.playsInline = true
     this.el.preload = 'auto'
     this.el.crossOrigin = 'anonymous'
+    // crossOrigin must be set before src: otherwise Chromium may start the
+    // request without CORS mode and later reject the element as a WebGL source.
+    this.el.src = mediaUrl(path)
     // Attach to the pool's off-screen host: a detached element usually still
     // decodes in Chromium, but attached-off-screen is the battle-tested setup
     // the original pool used, so keep it.

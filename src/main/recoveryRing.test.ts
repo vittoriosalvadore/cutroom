@@ -54,6 +54,18 @@ describe('recoveryRing', () => {
     expect(found).toBe('good')
   })
 
+  it('falls back to .1 when the primary is missing', async () => {
+    await writeRing(TMP, 'good')
+    await writeRing(TMP, 'better')
+    await rm(join(TMP, 'recovery.json'))
+
+    const found = await findNewestValid(TMP, (raw) => {
+      if (!raw || !raw.startsWith('g')) return null
+      return raw
+    })
+    expect(found).toBe('good')
+  })
+
   it('walks the whole ring when primary and .1 are both corrupt', async () => {
     await writeRing(TMP, 'good')
     await writeRing(TMP, 'better')
