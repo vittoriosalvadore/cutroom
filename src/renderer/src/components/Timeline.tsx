@@ -84,6 +84,19 @@ function collectSnapCandidates(project: Project, excludeClipId: string, playhead
   return cands
 }
 
+// Trailing seconds of blank runway past the last clip, so there's somewhere
+// to drop a new clip or drag one rightward at the end of the timeline.
+const SCROLL_PAD_SEC = 30
+
+/** How far right the timeline content reaches — the scroll range is derived
+ *  from this, not from a fixed guess, so it always covers every clip/marker. */
+function contentDurationSec(project: Project): number {
+  let end = 0
+  for (const c of Object.values(project.clips)) end = Math.max(end, c.startSec + c.durationSec)
+  for (const m of project.markers ?? []) end = Math.max(end, m.endSec ?? m.timeSec)
+  return end + SCROLL_PAD_SEC
+}
+
 interface Lane {
   id: string
   top: number
@@ -152,11 +165,20 @@ export default function Timeline() {
   const containerRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const drag = useRef<DragState>(null)
+  // Visible width of the time axis (container width minus the label gutter),
+  // in CSS px — drives the custom scrollbar's thumb size/position below.
+  // Kept in state (not read ad hoc) because the scrollbar is plain JSX, not
+  // canvas, and needs a value to size itself on every render.
+  const [viewportW, setViewportW] = useState(0)
+  const hscrollDrag = useRef<{ startX: number; startScrollSec: number } | null>(null)
+  const [hscrollDragging, setHscrollDragging] = useState(false)
 
   // Subscribe to the slices that affect rendering.
   const project = useEditor((s) => s.project)
   const playhead = useEditor((s) => s.playheadSec)
   const pxPerSec = useEditor((s) => s.pxPerSec)
+  const scrollSec = useEditor((s) => s.scrollSec)
+  const setScroll = useEditor((s) => s.setScroll)
   const selectedClipId = useEditor((s) => s.selectedClipId)
   // A stable signature of the selection set so the cached static layer repaints
   // when the multi-selection changes.
@@ -181,6 +203,7 @@ export default function Timeline() {
   const sigRef = useRef<{
     project: Project
     pxPerSec: number
+    scroll: number
     sel: string
     marker: string | null
     audioVer: number
@@ -197,7 +220,7 @@ export default function Timeline() {
 
     // Draw everything except the playhead into the offscreen `sctx`.
     const drawStatic = (sctx: CanvasRenderingContext2D, w: number, h: number): void => {
-      const timeToX = (t: number): number => GUTTER + t * pxPerSec
+      const timeToX = (t: number): number => GUTTER + (t - scrollSec) * pxPerSec
       const lanes = computeLanes(project.tracks)
 
       sctx.fillStyle = TL_COLORS.bg
@@ -238,9 +261,13 @@ export default function Timeline() {
       sctx.fillRect(0, 0, GUTTER, RULER)
 
       const step = chooseStep(pxPerSec)
-      const maxT = (w - GUTTER) / pxPerSec
+      // Start from the first step at-or-before the visible left edge (not 0)
+      // so ticks appear immediately when scrolled away from the start, and
+      // the loop doesn't walk through thousands of off-screen steps first.
+      const minT = Math.floor(scrollSec / step) * step
+      const maxT = scrollSec + (w - GUTTER) / pxPerSec
       sctx.font = '10px system-ui, sans-serif'
-      for (let t = 0; t <= maxT; t += step) {
+      for (let t = Math.max(0, minT); t <= maxT; t += step) {
         const x = Math.round(timeToX(t)) + 0.5
         if (x < GUTTER) continue
         sctx.strokeStyle = TL_COLORS.rulerTickMaj
@@ -455,6 +482,7 @@ export default function Timeline() {
         canvas.style.width = `${w}px`
         canvas.style.height = `${h}px`
       }
+      setViewportW((prev) => (prev === w - GUTTER ? prev : w - GUTTER))
 
       // Rebuild the cached static layer only when its inputs change.
       let s = staticRef.current
@@ -467,6 +495,7 @@ export default function Timeline() {
         !sig ||
         sig.project !== project ||
         sig.pxPerSec !== pxPerSec ||
+        sig.scroll !== scrollSec ||
         sig.sel !== selKey ||
         sig.marker !== selectedMarkerId ||
         sig.audioVer !== audioVersion ||
@@ -485,6 +514,7 @@ export default function Timeline() {
         sigRef.current = {
           project,
           pxPerSec,
+          scroll: scrollSec,
           sel: selKey,
           marker: selectedMarkerId,
           audioVer: audioVersion,
@@ -503,7 +533,7 @@ export default function Timeline() {
       ctx.drawImage(s, 0, 0)
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
 
-      const px = Math.round(GUTTER + playhead * pxPerSec) + 0.5
+      const px = Math.round(GUTTER + (playhead - scrollSec) * pxPerSec) + 0.5
       if (px >= GUTTER) {
         ctx.strokeStyle = TL_COLORS.playhead
         ctx.lineWidth = 1
@@ -525,7 +555,7 @@ export default function Timeline() {
     const ro = new ResizeObserver(render)
     ro.observe(container)
     return () => ro.disconnect()
-  }, [project, playhead, pxPerSec, selKey, selectedMarkerId, audioVersion, showWaveforms, themeSig])
+  }, [project, playhead, pxPerSec, scrollSec, selKey, selectedMarkerId, audioVersion, showWaveforms, themeSig])
 
   // --- pointer interactions (seek + drag-to-move clips) ---
   const localPoint = (e: React.PointerEvent | React.MouseEvent): { x: number; y: number } => {
@@ -543,7 +573,7 @@ export default function Timeline() {
       const clip = clips[i]
       const lane = lanes.find((l) => l.id === clip.trackId)
       if (!lane) continue
-      const cx = GUTTER + clip.startSec * st.pxPerSec
+      const cx = GUTTER + (clip.startSec - st.scrollSec) * st.pxPerSec
       const cw = Math.max(2, clip.durationSec * st.pxPerSec)
       if (x >= cx && x <= cx + cw && y >= lane.top && y <= lane.bottom) {
         const wide = cw > 3 * EDGE_PX
@@ -579,14 +609,14 @@ export default function Timeline() {
     if (y <= RULER) {
       if (y >= RULER - 10) {
         for (const m of st.project.markers ?? []) {
-          if (Math.abs(x - (GUTTER + m.timeSec * st.pxPerSec)) <= 7) {
+          if (Math.abs(x - (GUTTER + (m.timeSec - st.scrollSec) * st.pxPerSec)) <= 7) {
             st.selectMarker(m.id)
             st.setPlayhead(m.timeSec)
             return
           }
         }
       }
-      st.setPlayhead((x - GUTTER) / st.pxPerSec)
+      st.setPlayhead(st.scrollSec + (x - GUTTER) / st.pxPerSec)
       drag.current = { mode: 'seek' }
       ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
       return
@@ -631,7 +661,7 @@ export default function Timeline() {
     // Otherwise: click in the time area scrubs the playhead.
     if (x > GUTTER) {
       st.selectClip(null)
-      st.setPlayhead((x - GUTTER) / st.pxPerSec)
+      st.setPlayhead(st.scrollSec + (x - GUTTER) / st.pxPerSec)
       drag.current = { mode: 'seek' }
       ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
     }
@@ -659,7 +689,7 @@ export default function Timeline() {
     }
 
     if (d.mode === 'seek') {
-      st.setPlayhead((x - GUTTER) / st.pxPerSec)
+      st.setPlayhead(st.scrollSec + (x - GUTTER) / st.pxPerSec)
       return
     }
 
@@ -727,7 +757,7 @@ export default function Timeline() {
     if (y > RULER || y < RULER - 10 || x < GUTTER) return
     const st = useEditor.getState()
     for (const m of st.project.markers ?? []) {
-      if (Math.abs(x - (GUTTER + m.timeSec * st.pxPerSec)) <= 7) {
+      if (Math.abs(x - (GUTTER + (m.timeSec - st.scrollSec) * st.pxPerSec)) <= 7) {
         e.preventDefault()
         st.removeMarker(m.id)
         return
@@ -735,13 +765,75 @@ export default function Timeline() {
     }
   }
 
+  // Furthest scrollSec can go: content length minus what's already visible.
+  const maxScrollSec = (): number => {
+    const visible = viewportW / pxPerSec
+    return Math.max(0, contentDurationSec(project) - visible)
+  }
+
+  // Keep the view valid when the project shrinks, a document is opened, or
+  // zoom changes while the playhead is scrolled near the old right edge.
+  const maxScroll = maxScrollSec()
+  useEffect(() => {
+    const clamped = Math.min(maxScroll, Math.max(0, scrollSec))
+    if (clamped !== scrollSec) setScroll(clamped)
+  }, [maxScroll, scrollSec, setScroll])
+
+  // Any wheel motion (plain vertical, shift+vertical, or trackpad horizontal)
+  // pans the timeline through time — there's rarely enough vertical content
+  // to want real vertical scrolling, and every NLE treats "scroll over the
+  // timeline" as "pan through time," not "scroll the page."
+  const onWheel = (e: React.WheelEvent): void => {
+    e.preventDefault()
+    const delta = Math.abs(e.deltaY) > Math.abs(e.deltaX) ? e.deltaY : e.deltaX
+    setScroll(Math.min(maxScrollSec(), Math.max(0, scrollSec + delta / pxPerSec)))
+  }
+
+  // --- custom horizontal scrollbar (hand-driven; see .timeline-hscroll-*) ---
+  const onHscrollThumbDown = (e: React.PointerEvent): void => {
+    e.stopPropagation() // don't also trigger the track's jump-to-click below
+    hscrollDrag.current = { startX: e.clientX, startScrollSec: scrollSec }
+    setHscrollDragging(true)
+    ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+  }
+
+  const onHscrollThumbMove = (e: React.PointerEvent): void => {
+    const d = hscrollDrag.current
+    if (!d || viewportW <= 0) return
+    const dxSec = ((e.clientX - d.startX) / viewportW) * contentDurationSec(project)
+    setScroll(Math.min(maxScrollSec(), Math.max(0, d.startScrollSec + dxSec)))
+  }
+
+  const onHscrollThumbUp = (e: React.PointerEvent): void => {
+    hscrollDrag.current = null
+    setHscrollDragging(false)
+    try {
+      ;(e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId)
+    } catch {
+      /* pointer may already be released */
+    }
+  }
+
+  // Clicking the track itself (not the thumb) re-centers the view there.
+  const onHscrollTrackDown = (e: React.PointerEvent): void => {
+    if (e.target !== e.currentTarget || viewportW <= 0) return
+    const rect = e.currentTarget.getBoundingClientRect()
+    const clickFrac = (e.clientX - rect.left) / rect.width
+    const visible = viewportW / pxPerSec
+    setScroll(Math.min(maxScrollSec(), Math.max(0, clickFrac * contentDurationSec(project) - visible / 2)))
+  }
+
+  const totalSec = contentDurationSec(project)
+  const thumbWidthFrac = totalSec > 0 ? Math.min(1, viewportW / pxPerSec / totalSec) : 1
+  const thumbLeftFrac = totalSec > 0 ? Math.min(maxScroll, Math.max(0, scrollSec)) / totalSec : 0
+
   return (
     <section className="timeline">
       <div className="timeline-head">
         <span>Timeline</span>
         <span className="hint">
           drag to move · drag edges to trim · S split · X crossfade · M marker · ,/. jump · shift-click
-          multi-select · Ctrl+A all · Ctrl+C/V copy · Del remove
+          multi-select · Ctrl+A all · Ctrl+C/V copy · Del remove · scroll/shift-scroll to pan
         </span>
         <button
           className="btn small"
@@ -760,8 +852,21 @@ export default function Timeline() {
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
         onContextMenu={onContextMenu}
+        onWheel={onWheel}
       >
         <canvas ref={canvasRef} />
+      </div>
+      <div className="timeline-hscroll">
+        <div className="timeline-hscroll-track" style={{ marginLeft: GUTTER }} onPointerDown={onHscrollTrackDown}>
+          <div
+            className={`timeline-hscroll-thumb${hscrollDragging ? ' dragging' : ''}`}
+            style={{ left: `${thumbLeftFrac * 100}%`, width: `${thumbWidthFrac * 100}%` }}
+            onPointerDown={onHscrollThumbDown}
+            onPointerMove={onHscrollThumbMove}
+            onPointerUp={onHscrollThumbUp}
+            onPointerCancel={onHscrollThumbUp}
+          />
+        </div>
       </div>
     </section>
   )

@@ -23,7 +23,17 @@ if (env.backends.onnx.wasm) {
   env.backends.onnx.wasm.proxy = false
 }
 
-const MODEL = 'Xenova/whisper-tiny.en'
+// Multilingual (not .en) so non-English clips transcribe correctly instead of
+// forcing English output — Whisper auto-detects the spoken language per clip
+// when none is forced.
+//
+// medium (~3GB): small was still not accurate enough on sung lyrics. This is
+// a much bigger jump than every step before it — noticeably slower WASM/CPU
+// inference (no GPU acceleration here), a 30s chunk can plausibly take on
+// the order of a minute rather than a few seconds. Accepted tradeoff after
+// confirming with the user; large would be a further jump again (~6GB+,
+// likely impractically slow on CPU) and isn't attempted here.
+const MODEL = 'Xenova/whisper-medium'
 
 // transformers.js types are loose; the transcriber is an async-callable.
 type Transcriber = (
@@ -42,13 +52,15 @@ async function getTranscriber(): Promise<Transcriber> {
 }
 
 self.onmessage = async (e: MessageEvent): Promise<void> => {
-  const data = e.data as { type: string; id?: number; pcm?: Float32Array }
+  const data = e.data as { type: string; id?: number; pcm?: Float32Array; wordLevel?: boolean }
   if (data.type !== 'transcribe' || !data.pcm) return
   try {
     const t = await getTranscriber()
     self.postMessage({ type: 'status', id: data.id, status: 'transcribing' })
     const output = await t(data.pcm, {
-      return_timestamps: true,
+      // 'word' yields one chunk per word (same [start,end] shape) instead of
+      // one per phrase segment — used for karaoke-style highlight.
+      return_timestamps: data.wordLevel ? 'word' : true,
       chunk_length_s: 30,
       stride_length_s: 5
     })

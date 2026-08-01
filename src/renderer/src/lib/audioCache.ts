@@ -71,6 +71,31 @@ export async function getOrDecodeBuffer(mediaId: string, path: string): Promise<
   return getAudioContext().decodeAudioData(arr)
 }
 
+/** Wait for an ALREADY-STARTED (or future) decode of this media to finish,
+ *  instead of kicking off a redundant parallel one — unlike getOrDecodeBuffer,
+ *  which decodes independently if the cache isn't ready yet. Used right after
+ *  import, when the app's own background decode (ensureAudioDecoded) may
+ *  still be in flight for the same file. */
+export function waitForDecoded(mediaId: string): Promise<AudioBuffer> {
+  const entry = getAudioEntry(mediaId)
+  if (entry?.status === 'ready' && entry.buffer) return Promise.resolve(entry.buffer)
+  if (entry?.status === 'error' || entry?.status === 'skipped') {
+    return Promise.reject(new Error('This audio could not be decoded.'))
+  }
+  return new Promise((resolve, reject) => {
+    const unsub = subscribeAudioCache(() => {
+      const e = getAudioEntry(mediaId)
+      if (e?.status === 'ready' && e.buffer) {
+        unsub()
+        resolve(e.buffer)
+      } else if (e?.status === 'error' || e?.status === 'skipped') {
+        unsub()
+        reject(new Error('This audio could not be decoded.'))
+      }
+    })
+  })
+}
+
 /** Decode a media file's audio once. Safe to call repeatedly (idempotent).
  *  Pass durationSec=0 when the probe failed or returned an unknown duration —
  *  the post-decode buffer.duration check still guards against long files. */

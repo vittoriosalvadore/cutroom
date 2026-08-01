@@ -1,4 +1,4 @@
-import type { Clip, ClipTransform, Effects, MediaItem, Project, TextProps } from '../types'
+import type { Clip, ClipTransform, Effects, MediaItem, Project, TextProps, WordTiming } from '../types'
 import { defaultEffects, isNeutralColor } from '../types'
 import { sampleOpacity, sampleTransform } from './keyframes'
 import { mediaUrl } from './media'
@@ -119,8 +119,100 @@ function hexToCss(hex: string, alpha: number): string {
 }
 
 
-/** Draw a title/subtitle onto a transparent full-frame canvas. */
-function renderTextCanvas(text: TextProps, W: number, H: number): HTMLCanvasElement {
+/** Index of the word active at clip-relative time `tRel` (karaoke highlight),
+ *  or -1 before the first word starts. Sticks on the last word once its own
+ *  window ends (until the cue itself leaves the timeline) rather than
+ *  blanking between words — smoother than flicker-highlighting gaps.
+ *  Assumes `words` is sorted ascending by startSec (true by construction:
+ *  transcribe.ts's wordsToCues() groups them in speech order). Exported (and
+ *  covered by compositor.test.ts) despite this file being otherwise untested
+ *  WebGL glue, because it's pure and easy to get subtly wrong. */
+export function activeWordIndex(words: WordTiming[], tRel: number): number {
+  if (words.length === 0 || tRel < words[0].startSec) return -1
+  let idx = 0
+  for (let i = 1; i < words.length; i++) {
+    if (words[i].startSec <= tRel) idx = i
+    else break
+  }
+  return idx
+}
+
+/** Draw one line word-by-word instead of one fillText/strokeText call, so the
+ *  active word can be recolored/highlighted per `text.karaokeStyle`. Tokens
+ *  are the line's own whitespace-split words (NOT `text.words[].text`) so
+ *  on-screen content always matches the textarea; `wordOffset` is this line's
+ *  starting index into the flat `words[]` array purely for matching against
+ *  `activeWordIdx`. Manual per-token layout is a close approximation of the
+ *  whole-line layout the plain path uses (individual measureText calls can
+ *  drift a hair from measuring the joined string, e.g. no cross-token
+ *  kerning) — imperceptible at caption font sizes. */
+function drawKaraokeLine(
+  ctx: CanvasRenderingContext2D,
+  tokens: string[],
+  wordOffset: number,
+  activeWordIdx: number,
+  ax: number,
+  y: number,
+  text: TextProps,
+  fontPx: number,
+  strokeW: number
+): void {
+  const spaceW = ctx.measureText(' ').width
+  const widths = tokens.map((t) => ctx.measureText(t).width)
+  const lineW = widths.reduce((a, b) => a + b, 0) + spaceW * Math.max(0, tokens.length - 1)
+  const startX = text.align === 'center' ? ax - lineW / 2 : text.align === 'left' ? ax : ax - lineW
+  const karaokeColor = text.karaokeColor || '#ffd23f'
+  const style = text.karaokeStyle ?? 'pop'
+
+  ctx.textAlign = 'left'
+  let x = startX
+  tokens.forEach((tok, ti) => {
+    const w = widths[ti]
+    const active = wordOffset + ti === activeWordIdx
+
+    if (active && style === 'fill-wipe') {
+      const padX = w * 0.12
+      ctx.fillStyle = hexToCss(karaokeColor, 0.85)
+      roundRectPath(ctx, x - padX, y - fontPx * 0.62, w + padX * 2, fontPx * 1.05, fontPx * 0.12)
+      ctx.fill()
+    }
+
+    const paint = (): void => {
+      if (strokeW > 0) {
+        ctx.lineWidth = strokeW
+        ctx.strokeStyle = text.strokeColor
+        ctx.strokeText(tok, x, y)
+      }
+      ctx.fillStyle = active && style !== 'fill-wipe' ? karaokeColor : text.color
+      ctx.fillText(tok, x, y)
+    }
+
+    if (active && style === 'pop') {
+      const midX = x + w / 2
+      ctx.save()
+      ctx.translate(midX, y)
+      ctx.scale(1.16, 1.16)
+      ctx.translate(-midX, -y)
+      paint()
+      ctx.restore()
+    } else {
+      paint()
+    }
+
+    if (active && style === 'underline') {
+      ctx.fillStyle = karaokeColor
+      ctx.fillRect(x, y + fontPx * 0.4, w, Math.max(2, fontPx * 0.06))
+    }
+
+    x += w + spaceW
+  })
+  ctx.textAlign = text.align
+}
+
+/** Draw a title/subtitle onto a transparent full-frame canvas. `activeWordIdx`
+ *  (-1 = none) drives per-word karaoke highlight when `text.words` is set;
+ *  plain titles/subtitles (no words) render exactly as before. */
+function renderTextCanvas(text: TextProps, W: number, H: number, activeWordIdx = -1): HTMLCanvasElement {
   const canvas = document.createElement('canvas')
   canvas.width = W
   canvas.height = H
@@ -155,8 +247,19 @@ function renderTextCanvas(text: TextProps, W: number, H: number): HTMLCanvasElem
   ctx.lineJoin = 'round'
   ctx.miterLimit = 2
 
+  const karaokeOn = !!text.words && text.words.length > 0
+  let wordCursor = 0
+
   lines.forEach((ln, i) => {
     const y = cy - blockH / 2 + lineHeight * (i + 0.5)
+    const tokens = karaokeOn ? ln.split(/\s+/).filter(Boolean) : []
+
+    if (karaokeOn && tokens.length > 0) {
+      drawKaraokeLine(ctx, tokens, wordCursor, activeWordIdx, ax, y, text, fontPx, strokeW)
+      wordCursor += tokens.length
+      return
+    }
+
     if (strokeW > 0) {
       ctx.lineWidth = strokeW
       ctx.strokeStyle = text.strokeColor
@@ -270,14 +373,26 @@ export class Compositor {
   // hasn't changed; otherwise mint a fresh key so cachedCanvas() correctly
   // misses and re-rasterizes. Capped like canvasCache so creating/deleting
   // many title clips over a long session can't grow this map unboundedly.
-  private textKeyCache = new Map<string, { ref: TextProps; w: number; h: number; key: string }>()
+  // `word` is the active-karaoke-word index (-1 when the clip has no words),
+  // so a plain title/subtitle's cache behaves exactly as before (constant
+  // -1 every frame) while a karaoke clip mints one fresh entry per word
+  // transition instead of per frame.
+  private textKeyCache = new Map<string, { ref: TextProps; w: number; h: number; word: number; key: string }>()
   private textKeyCounter = 0
 
-  private textCacheKey(clipId: string, text: TextProps): string {
+  private textCacheKey(clipId: string, text: TextProps, activeWordIdx: number): string {
     const cached = this.textKeyCache.get(clipId)
-    if (cached && cached.ref === text && cached.w === this.W && cached.h === this.H) return cached.key
-    const key = `text:${this.W}x${this.H}:${clipId}:${this.textKeyCounter++}`
-    this.textKeyCache.set(clipId, { ref: text, w: this.W, h: this.H, key })
+    if (
+      cached &&
+      cached.ref === text &&
+      cached.w === this.W &&
+      cached.h === this.H &&
+      cached.word === activeWordIdx
+    ) {
+      return cached.key
+    }
+    const key = `text:${this.W}x${this.H}:${clipId}:${activeWordIdx}:${this.textKeyCounter++}`
+    this.textKeyCache.set(clipId, { ref: text, w: this.W, h: this.H, word: activeWordIdx, key })
     if (this.textKeyCache.size > 64) {
       const oldest = this.textKeyCache.keys().next().value
       if (oldest !== undefined) this.textKeyCache.delete(oldest)
@@ -532,8 +647,10 @@ export class Compositor {
 
     if (clip.role === 'title' || clip.role === 'subtitle') {
       if (!clip.text || !clip.text.content.trim()) return
-      const key = this.textCacheKey(clip.id, clip.text)
-      const tex = this.cachedCanvas(key, () => renderTextCanvas(clip.text as TextProps, this.W, this.H))
+      const words = clip.text.words
+      const activeIdx = words && words.length > 0 ? activeWordIndex(words, tRel) : -1
+      const key = this.textCacheKey(clip.id, clip.text, activeIdx)
+      const tex = this.cachedCanvas(key, () => renderTextCanvas(clip.text as TextProps, this.W, this.H, activeIdx))
       this.drawQuad({ x: 0, y: 0, w: 1, h: 1 }, tex.tex, null, effects, tf, opacity)
       return
     }

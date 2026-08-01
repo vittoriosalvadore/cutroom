@@ -1,6 +1,6 @@
 import type { Clip, Keyframe, Project } from '../types'
-import { mediaUrl } from './media'
 import { WorkerJob, JobCancelled } from './workerJob'
+import { sampleFrames as sampleFramesShared, type SampledFrame } from './frameSampling'
 
 /** Re-exported under this module's name so existing callers (AutoReframeModal)
  *  keep working unchanged — it's the same JobCancelled sentinel every worker
@@ -54,81 +54,6 @@ interface DetectOut {
 const detectJob = new WorkerJob<DetectIn, DetectOut>(
   () => new Worker(new URL('./detect.worker.ts', import.meta.url), { type: 'module' })
 )
-
-/**
- * Seek a video element and resolve once the new frame is ready. Mirrors
- * videoPool.seekTo's defenses: a seek to (essentially) the current time fires no
- * 'seeked' event, so early-resolve when already there; back off 0.05s from the
- * exact end (seeking to duration stalls / yields a black frame); and a timeout
- * fallback so a stuck decoder can never hang the whole analysis.
- */
-function seekTo(video: HTMLVideoElement, t: number): Promise<void> {
-  const dur = video.duration || t
-  const target = Math.max(0, Math.min(t, dur - 0.05))
-  return new Promise((resolve) => {
-    if (Math.abs(video.currentTime - target) < 1e-3 && video.readyState >= 2) {
-      resolve()
-      return
-    }
-    let timer = 0
-    const done = (): void => {
-      window.clearTimeout(timer)
-      video.removeEventListener('seeked', done)
-      resolve()
-    }
-    timer = window.setTimeout(done, 3000)
-    video.addEventListener('seeked', done)
-    video.currentTime = target
-  })
-}
-
-interface Frame {
-  t: number // clip-relative seconds
-  image: ImageData
-}
-
-/** Grab `count` downscaled frames spread across the clip's used span. */
-async function sampleFrames(
-  clip: Clip,
-  path: string,
-  count: number,
-  onProgress: (p: ReframeProgress) => void,
-  shouldCancel: () => boolean
-): Promise<Frame[]> {
-  const video = document.createElement('video')
-  video.muted = true
-  video.preload = 'auto'
-  // Match the video pool: CORS-anonymous so the canvas stays untainted and
-  // getImageData() works (the cutroom:// protocol sends Access-Control-Allow-Origin).
-  video.crossOrigin = 'anonymous'
-  video.src = mediaUrl(path)
-  try {
-    await new Promise<void>((resolve, reject) => {
-      video.onloadedmetadata = () => resolve()
-      video.onerror = () => reject(new Error('Could not load the video for analysis.'))
-    })
-    const W = 320
-    const H = Math.max(1, Math.round((W * video.videoHeight) / Math.max(1, video.videoWidth)))
-    const canvas = document.createElement('canvas')
-    canvas.width = W
-    canvas.height = H
-    const ctx = canvas.getContext('2d', { willReadFrequently: true })
-    if (!ctx) throw new Error('Could not create an analysis canvas.')
-    const frames: Frame[] = []
-    for (let i = 0; i < count; i++) {
-      if (shouldCancel()) throw new JobCancelled()
-      const tRel = count <= 1 ? 0 : (clip.durationSec * i) / (count - 1)
-      await seekTo(video, clip.inSec + tRel)
-      ctx.drawImage(video, 0, 0, W, H)
-      frames.push({ t: tRel, image: ctx.getImageData(0, 0, W, H) })
-      onProgress({ stage: 'sampling', progress: (i + 1) / count })
-    }
-    return frames
-  } finally {
-    video.removeAttribute('src')
-    video.load()
-  }
-}
 
 /** Subject centre (0..1) for a frame, or null when nothing suitable was found. */
 function pickCenter(boxes: Box[], target: ReframeOptions['target']): { cx: number; cy: number } | null {
@@ -188,7 +113,13 @@ export async function autoReframe(
     throw new Error('Auto-reframe needs a video clip.')
   }
   const count = Math.max(2, Math.min(120, Math.round(opts.samples)))
-  const frames = await sampleFrames(clip, media.path, count, onProgress, shouldCancel)
+  const frames: SampledFrame[] = await sampleFramesShared(
+    clip,
+    media.path,
+    count,
+    (fraction) => onProgress({ stage: 'sampling', progress: fraction }),
+    shouldCancel
+  )
 
   const centers: ({ cx: number; cy: number } | null)[] = []
   for (let i = 0; i < frames.length; i++) {

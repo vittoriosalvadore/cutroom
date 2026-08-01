@@ -13,7 +13,7 @@ import { sampleOpacity, sampleTransform, KEY_EPS } from '../lib/keyframes'
 import { useT } from '../lib/i18n'
 import { normalizeGainDb } from '../lib/normalize'
 import { denoiseCacheVersion, ensureDenoised, getDenoiseEntry, subscribeDenoiseCache } from '../lib/denoiseCache'
-import type { AnimProp, Marker, TextAlign, Track, TrackGate, TrackDuck, TrackEQ, TrackComp } from '../types'
+import type { AnimProp, KaraokeStyle, Marker, TextAlign, Track, TrackGate, TrackDuck, TrackEQ, TrackComp } from '../types'
 
 /** Labelled range slider that shows its current value. */
 function Slider(props: {
@@ -135,6 +135,11 @@ function KeyableSlider(props: {
 }
 
 const ALIGNS: TextAlign[] = ['left', 'center', 'right']
+const KARAOKE_STYLES: { value: KaraokeStyle; label: string }[] = [
+  { value: 'pop', label: 'Pop' },
+  { value: 'underline', label: 'Underline' },
+  { value: 'fill-wipe', label: 'Fill' }
+]
 
 /** Mixer + dynamics panel for a selected track: volume, pan, gate, ducking. */
 function TrackPanel(props: {
@@ -537,13 +542,13 @@ export default function Inspector() {
   // Re-render when a denoise job's status changes (processing -> ready/error).
   const [, setDenoiseVersion] = useState(0)
   useEffect(() => subscribeDenoiseCache(() => setDenoiseVersion(denoiseCacheVersion())), [])
-  // If denoise was already enabled on this clip from a previous session (e.g.
-  // a recovered project), start the job here instead of relying solely on the
-  // checkbox's own onChange — otherwise nothing ever kicks it off and the
-  // Inspector is stuck showing "Processing…" forever.
+  // Projects can restore a denoise-enabled clip without a live cache entry
+  // (for example after reopening or recovering a project). Start the derived
+  // audio job on selection so the inspector and preview do not stay stuck in
+  // a permanent "processing" state.
   useEffect(() => {
     if (clip?.denoiseEnabled && media?.path && !getDenoiseEntry(media.id)) {
-      ensureDenoised(media.id, media.path)
+      void ensureDenoised(media.id, media.path)
     }
   }, [clip?.id, clip?.denoiseEnabled, media?.id, media?.path])
   // Subscribe to the playhead so keyframe sliders track the value live as you scrub.
@@ -761,6 +766,30 @@ export default function Inspector() {
               step={0.01}
               onChange={(v) => updateText(id, { boxOpacity: v })}
             />
+            {text.words && text.words.length > 0 && (
+              <div className="insp-row">
+                <label className="insp-color">
+                  Highlight
+                  <input
+                    type="color"
+                    value={text.karaokeColor ?? '#ffd23f'}
+                    onChange={(e) => updateText(id, { karaokeColor: e.target.value })}
+                  />
+                </label>
+                <div className="insp-toggle-group">
+                  {KARAOKE_STYLES.map((s) => (
+                    <button
+                      key={s.value}
+                      className={`btn small ${(text.karaokeStyle ?? 'pop') === s.value ? 'active' : ''}`}
+                      title={`Karaoke style: ${s.label}`}
+                      onClick={() => updateText(id, { karaokeStyle: s.value })}
+                    >
+                      {s.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </section>
         )}
 
@@ -845,6 +874,15 @@ export default function Inspector() {
                   onClick={() => useEditor.getState().setReframeOpen(true)}
                 >
                   🎯 AI Reframe
+                </button>
+              )}
+              {media?.kind === 'video' && (
+                <button
+                  className="btn small"
+                  title="Find hard cuts and split the clip at each one"
+                  onClick={() => useEditor.getState().setSceneDetectOpen(true)}
+                >
+                  🎬 Detect Scenes
                 </button>
               )}
             </div>

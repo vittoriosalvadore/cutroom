@@ -15,7 +15,8 @@ import type {
   TrackGate,
   TrackDuck,
   TrackEQ,
-  TrackComp
+  TrackComp,
+  WordTiming
 } from '../types'
 import {
   clampSpeed,
@@ -36,11 +37,13 @@ import { clampFades } from '../lib/fades'
 import { clampProp, keyIndexAt, KEY_EPS, rebaseTracks, sortKeys, splitTracksAt, withTransformProp } from '../lib/keyframes'
 import { useSettings } from './settings'
 
-/** One imported subtitle cue (used by SRT/VTT import). */
+/** One imported subtitle cue (used by SRT/VTT import, and Whisper transcription). */
 export interface SubtitleCue {
   startSec: number
   endSec: number
   text: string
+  /** Word-level timing (karaoke mode). Clip-relative to this cue's OWN startSec. */
+  words?: WordTiming[]
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +149,8 @@ interface EditorState {
   isPlaying: boolean
   /** Timeline zoom: horizontal pixels per second. */
   pxPerSec: number
+  /** Timeline horizontal scroll position, in seconds from t=0. */
+  scrollSec: number
   /** The PRIMARY selected clip (Inspector target). Always a member of selectedClipIds, null iff empty. */
   selectedClipId: string | null
   /** The full clip selection set (multi-select). */
@@ -176,6 +181,10 @@ interface EditorState {
    *  are given in ORIGINAL (pre-cut) timeline positions; later ranges are
    *  re-targeted internally as earlier cuts ripple-shift the timeline. */
   applySilenceCuts: (clipId: string, ranges: Array<{ startSec: number; endSec: number }>) => void
+  /** Split a clip at every given ABSOLUTE timeline time (e.g. scene-detect
+   *  cuts), content preserved — plain splits, no ripple-delete. One recorded
+   *  history step for the whole batch. */
+  splitClipAtTimes: (clipId: string, atSecs: number[]) => void
   /** Crossfade a clip with its nearest adjacent/overlapping same-track neighbor. */
   crossfadeWithNeighbor: (clipId: string) => void
   selectClip: (clipId: string | null) => void
@@ -254,6 +263,7 @@ interface EditorState {
   setPlayhead: (sec: number) => void
   setPlaying: (playing: boolean) => void
   setZoom: (pxPerSec: number) => void
+  setScroll: (scrollSec: number) => void
 
   // --- history (undo/redo) ---
   past: Project[]
@@ -302,6 +312,10 @@ interface EditorState {
   // --- auto-cut silence ---
   autoCutSilenceOpen: boolean
   setAutoCutSilenceOpen: (open: boolean) => void
+
+  // --- scene detection ---
+  sceneDetectOpen: boolean
+  setSceneDetectOpen: (open: boolean) => void
 }
 
 const HISTORY_LIMIT = 100
@@ -442,6 +456,7 @@ export const useEditor = create<EditorState>((set) => {
   playheadSec: 0,
   isPlaying: false,
   pxPerSec: 80,
+  scrollSec: 0,
   selectedClipId: null,
   selectedClipIds: new Set<string>(),
   selectedTrackId: null,
@@ -657,6 +672,31 @@ export const useEditor = create<EditorState>((set) => {
       }
       if (clips === s.project.clips) return {} // nothing was actually cut
       return { ...recordHistory(s), project: { ...s.project, clips, markers } }
+    }),
+
+  splitClipAtTimes: (clipId, atSecs) =>
+    set((s) => {
+      const sorted = [...atSecs].sort((a, b) => a - b)
+      if (sorted.length === 0) return {}
+      const clips = { ...s.project.clips }
+      // Ascending splits: each one only ever lands in the piece created by the
+      // previous split (or the original clip, for the first one) — track that
+      // piece's id forward since splitClipAt hands back a fresh id each time.
+      let currentId = clipId
+      let changed = false
+      for (const atSec of sorted) {
+        const current = clips[currentId]
+        if (!current) break
+        const result = splitClipAt(current, atSec)
+        if (!result) continue // outside this piece (e.g. duplicate/out-of-range time) — skip
+        const rightId = uid('c')
+        clips[currentId] = result.left
+        clips[rightId] = { ...result.right, id: rightId, trackId: current.trackId }
+        currentId = rightId
+        changed = true
+      }
+      if (!changed) return {}
+      return { ...recordHistory(s), project: { ...s.project, clips } }
     }),
 
   crossfadeWithNeighbor: (clipId) =>
@@ -960,6 +1000,7 @@ export const useEditor = create<EditorState>((set) => {
       const clips = { ...s.project.clips }
       for (const cue of cues) {
         const id = uid('c')
+        const text = defaultSubtitleText(cue.text)
         clips[id] = {
           id,
           trackId,
@@ -968,7 +1009,7 @@ export const useEditor = create<EditorState>((set) => {
           durationSec: Math.max(0.1, cue.endSec - cue.startSec),
           inSec: 0,
           role: 'subtitle',
-          text: defaultSubtitleText(cue.text),
+          text: cue.words && cue.words.length > 0 ? { ...text, words: cue.words } : text,
           effects: defaultEffects()
         }
       }
@@ -1171,6 +1212,8 @@ export const useEditor = create<EditorState>((set) => {
   setPlayhead: (sec) => set({ playheadSec: Math.max(0, sec) }),
   setPlaying: (playing) => set({ isPlaying: playing }),
   setZoom: (pxPerSec) => set({ pxPerSec: Math.min(600, Math.max(10, pxPerSec)) }),
+  // The timeline component clamps the upper bound once its viewport is known.
+  setScroll: (scrollSec) => set({ scrollSec: Math.max(0, scrollSec) }),
 
   snapshot: () =>
     set((s) => {
@@ -1239,7 +1282,8 @@ export const useEditor = create<EditorState>((set) => {
       selectedMarkerId: null,
       selectedTrackId: null,
       playheadSec: 0,
-      isPlaying: false
+      isPlaying: false,
+      scrollSec: 0
     })
   },
 
@@ -1258,7 +1302,8 @@ export const useEditor = create<EditorState>((set) => {
       selectedMarkerId: null,
       selectedTrackId: null,
       playheadSec: 0,
-      isPlaying: false
+      isPlaying: false,
+      scrollSec: 0
     })
   },
 
@@ -1293,6 +1338,9 @@ export const useEditor = create<EditorState>((set) => {
     }),
 
   autoCutSilenceOpen: false,
-  setAutoCutSilenceOpen: (open) => set({ autoCutSilenceOpen: open })
+  setAutoCutSilenceOpen: (open) => set({ autoCutSilenceOpen: open }),
+
+  sceneDetectOpen: false,
+  setSceneDetectOpen: (open) => set({ sceneDetectOpen: open })
   }
 })
