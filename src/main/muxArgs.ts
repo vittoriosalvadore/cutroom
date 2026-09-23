@@ -97,6 +97,12 @@ export interface BuildMuxArgsOptions {
   outputPath: string
   sampleRate: number
   clips: MuxClip[]
+  /**
+   * When set, the filtergraph is passed as `-filter_complex_script <path>`
+   * (the caller writes `buildMuxGraph(...)` there) instead of inline. A long
+   * timeline's graph easily exceeds the Windows 32K command-line limit.
+   */
+  filterScriptPath?: string
 }
 
 function dbToLinear(db: number): number {
@@ -119,20 +125,73 @@ function clampFades(fadeInSec: number, fadeOutSec: number, durationSec: number):
   return [fi, fo]
 }
 
-export function buildMuxArgs(opts: BuildMuxArgsOptions): string[] {
-  const { silentPath, outputPath, sampleRate, clips } = opts
-  const args: string[] = ['-y', '-i', silentPath]
-  for (const c of clips) args.push('-i', c.path)
+/** Clamp to [lo, hi]; non-finite values fall back to `fallback`. */
+function clampNum(v: number, lo: number, hi: number, fallback: number): number {
+  return Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : fallback
+}
 
+// FFmpeg rejects out-of-range filter options and aborts the whole mux, while
+// the Inspector sliders allow e.g. attack = 0 ms. These mirror the option
+// ranges of agate / acompressor / sidechaincompress.
+const MIN_THRESHOLD = 0.000976563
+const attackMs = (v: number, max: number): number => clampNum(v, 0.01, max, 20)
+const releaseMs = (v: number): number => clampNum(v, 0.01, 9000, 250)
+const ratio = (v: number): number => clampNum(v, 1, 20, 2)
+const threshold = (db: number): string => clampNum(dbToLinear(db), MIN_THRESHOLD, 1, 0.125).toFixed(6)
+
+/**
+ * One FFmpeg input per unique source path (inputs 1..N; 0 is the video). A
+ * source used by several clips is opened once and fanned out with asplit, so
+ * a cut-heavy timeline doesn't spawn one decoder (and one `-i`) per clip.
+ * Returns the unique paths, the asplit prelude chains, and each clip's source
+ * pad label. Single-use sources keep the plain `[k:a]` label.
+ */
+function planInputs(clips: MuxClip[]): { paths: string[]; prelude: string[]; labels: string[] } {
+  const paths: string[] = []
+  const users = new Map<string, number[]>()
+  clips.forEach((c, i) => {
+    if (!users.has(c.path)) {
+      users.set(c.path, [])
+      paths.push(c.path)
+    }
+    users.get(c.path)!.push(i)
+  })
+  const labels: string[] = new Array(clips.length)
+  const prelude: string[] = []
+  paths.forEach((p, k) => {
+    const input = k + 1
+    const idx = users.get(p)!
+    if (idx.length === 1) {
+      labels[idx[0]] = `[${input}:a]`
+      return
+    }
+    idx.forEach((i, j) => (labels[i] = `[s${input}_${j}]`))
+    prelude.push(`[${input}:a]asplit=${idx.length}${idx.map((_, j) => `[s${input}_${j}]`).join('')}`)
+  })
+  return { paths, prelude, labels }
+}
+
+/** The full mux filtergraph (see buildMuxArgs). */
+export function buildMuxGraph(clips: MuxClip[], sampleRate: number): string {
+  const { prelude, labels } = planInputs(clips)
   // Projects with NO gate/duck use the original flat per-clip graph (verified,
   // byte-stable). Only when a track enables gate/duck do we switch to per-track
   // submixing, which is what lets a gate act on a track's mix and a ducker key
   // off another track.
   const usesTrackFx = clips.some((c) => c.gate || c.duck || c.eq || c.comp)
-  const graph = usesTrackFx ? buildFxGraph(clips, sampleRate) : buildFlatGraph(clips, sampleRate)
+  const graph = usesTrackFx ? buildFxGraph(clips, labels, sampleRate) : buildFlatGraph(clips, labels, sampleRate)
+  return [...prelude, graph].join(';')
+}
+
+export function buildMuxArgs(opts: BuildMuxArgsOptions): string[] {
+  const { silentPath, outputPath, sampleRate, clips, filterScriptPath } = opts
+  const args: string[] = ['-y', '-i', silentPath]
+  for (const p of planInputs(clips).paths) args.push('-i', p)
+
+  if (filterScriptPath) args.push('-filter_complex_script', filterScriptPath)
+  else args.push('-filter_complex', buildMuxGraph(clips, sampleRate))
 
   args.push(
-    '-filter_complex', graph,
     '-map', '0:v',
     '-map', '[aout]',
     '-c:v', 'copy',
@@ -142,6 +201,8 @@ export function buildMuxArgs(opts: BuildMuxArgsOptions): string[] {
     '-ac', '2',
     '-shortest',
     '-movflags', '+faststart',
+    // Explicit muxer: the caller may write to a `.part` name and rename on success.
+    '-f', 'mp4',
     outputPath
   )
   return args
@@ -153,12 +214,11 @@ export function buildMuxArgs(opts: BuildMuxArgsOptions): string[] {
  * then clips it back to the exact video length. Without apad, audio that ends
  * before the timeline would truncate the whole export.
  */
-function buildFlatGraph(clips: MuxClip[], sampleRate: number): string {
+function buildFlatGraph(clips: MuxClip[], labels: string[], sampleRate: number): string {
   const chains = clips.map((c, i) => {
-    const input = i + 1 // input 0 is the video
     const vol = (c.volume ?? 1) * dbToLinear(c.trackGainDb ?? 0)
     let chain =
-      `[${input}:a]aresample=${sampleRate},` +
+      `${labels[i]}aresample=${sampleRate},` +
       `atrim=start=${c.inSec.toFixed(3)}:end=${(c.inSec + clipSrcSpan(c)).toFixed(3)},` +
       `asetpts=PTS-STARTPTS,` +
       `${speedFilter(c.speed, sampleRate)}` +
@@ -192,16 +252,16 @@ function buildFlatGraph(clips: MuxClip[], sampleRate: number): string {
  * sidechain key is split from its trigger's PRE-duck bus (so even mutual A<->B
  * ducking stays a DAG), padded with apad so a short trigger can't truncate the
  * longer ducked track, and forced to stereo (sidechaincompress needs matching
- * layouts). dB levels -> linear; times stay in ms; ratio clamped to FFmpeg's 20.
+ * layouts). dB levels -> linear; times stay in ms; every option is clamped to
+ * FFmpeg's accepted range.
  */
-function buildFxGraph(clips: MuxClip[], sampleRate: number): string {
+function buildFxGraph(clips: MuxClip[], labels: string[], sampleRate: number): string {
   const G: string[] = []
 
   // 1. per-clip -> [c{i}] (clip volume + fades only; trackGain & pan move to the bus)
   clips.forEach((c, i) => {
-    const input = i + 1
     let chain =
-      `[${input}:a]aresample=${sampleRate},` +
+      `${labels[i]}aresample=${sampleRate},` +
       `atrim=start=${c.inSec.toFixed(3)}:end=${(c.inSec + clipSrcSpan(c)).toFixed(3)},` +
       `asetpts=PTS-STARTPTS,` +
       `${speedFilter(c.speed, sampleRate)}` +
@@ -251,15 +311,17 @@ function buildFxGraph(clips: MuxClip[], sampleRate: number): string {
     }
     if (info.gate) {
       bus +=
-        `,agate=threshold=${dbToLinear(info.gate.thresholdDb).toFixed(6)}` +
-        `:range=${dbToLinear(info.gate.rangeDb).toFixed(6)}` +
-        `:ratio=${info.gate.ratio}:attack=${info.gate.attackMs}:release=${info.gate.releaseMs}:detection=rms`
+        `,agate=threshold=${threshold(info.gate.thresholdDb)}` +
+        `:range=${clampNum(dbToLinear(info.gate.rangeDb), 0, 1, 0.06125).toFixed(6)}` +
+        `:ratio=${ratio(info.gate.ratio)}:attack=${attackMs(info.gate.attackMs, 9000)}` +
+        `:release=${releaseMs(info.gate.releaseMs)}:detection=rms`
     }
     if (info.comp) {
       bus +=
-        `,acompressor=threshold=${dbToLinear(info.comp.thresholdDb).toFixed(6)}` +
-        `:ratio=${info.comp.ratio}:attack=${info.comp.attackMs}:release=${info.comp.releaseMs}` +
-        `:makeup=${dbToLinear(info.comp.makeupDb).toFixed(4)}`
+        `,acompressor=threshold=${threshold(info.comp.thresholdDb)}` +
+        `:ratio=${ratio(info.comp.ratio)}:attack=${attackMs(info.comp.attackMs, 2000)}` +
+        `:release=${releaseMs(info.comp.releaseMs)}` +
+        `:makeup=${clampNum(dbToLinear(info.comp.makeupDb), 1, 64, 1).toFixed(4)}`
     }
     bus += `[bus_${k}]`
     G.push(bus)
@@ -288,13 +350,12 @@ function buildFxGraph(clips: MuxClip[], sampleRate: number): string {
     let term = consumers.has(k) ? `[main_${k}]` : `[bus_${k}]`
     const trigK = info.duck ? trackK.get(info.duck.triggerTrackId) : undefined
     if (info.duck && trigK !== undefined) {
-      const r = Math.min(20, info.duck.ratio)
       G.push(`[key_${trigK}_${k}]aformat=channel_layouts=stereo,apad[kp_${trigK}_${k}]`)
       G.push(`${term}aformat=channel_layouts=stereo[md_${k}]`)
       G.push(
         `[md_${k}][kp_${trigK}_${k}]sidechaincompress=` +
-          `threshold=${dbToLinear(info.duck.thresholdDb).toFixed(6)}:ratio=${r}` +
-          `:attack=${info.duck.attackMs}:release=${info.duck.releaseMs}[dk_${k}]`
+          `threshold=${threshold(info.duck.thresholdDb)}:ratio=${ratio(info.duck.ratio)}` +
+          `:attack=${attackMs(info.duck.attackMs, 2000)}:release=${releaseMs(info.duck.releaseMs)}[dk_${k}]`
       )
       term = `[dk_${k}]`
     }

@@ -1,14 +1,10 @@
-import { ipcMain, app } from 'electron'
+import { ipcMain } from 'electron'
 import { spawn } from 'child_process'
+import { unlink } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
-import ffmpegPathRaw from 'ffmpeg-static'
-
-// ffmpeg-static returns a path inside app.asar, which can't be executed.
-// asarUnpack extracts the binary to app.asar.unpacked — fix the path there.
-const ffmpegPath: string | null = ffmpegPathRaw && app.isPackaged
-  ? ffmpegPathRaw.replace(/app\.asar([/\\])/, 'app.asar.unpacked$1')
-  : ffmpegPathRaw
+import { ffmpegPath, releaseTemp, trackProcess, trackTemp } from './ffmpeg'
+import { isLocalFilePath } from './paths'
 
 // ---------------------------------------------------------------------------
 // Noise removal: FFmpeg's afftdn (FFT denoiser), run ONCE per source media to
@@ -43,7 +39,11 @@ function tempDenoisePath(): string {
 
 function runDenoise(sourcePath: string): Promise<DenoiseResult> {
   if (!ffmpegPath) return Promise.resolve({ ok: false, error: 'Bundled FFmpeg binary not found for this platform.' })
+  if (!isLocalFilePath(sourcePath)) return Promise.resolve({ ok: false, error: 'Invalid source path.' })
   const tempPath = tempDenoisePath()
+  // The WAV lives as long as this app session (preview + export both read it);
+  // it is deleted on quit.
+  trackTemp(tempPath)
   const args = [
     '-y',
     '-i', sourcePath,
@@ -54,16 +54,21 @@ function runDenoise(sourcePath: string): Promise<DenoiseResult> {
   ]
 
   return new Promise<DenoiseResult>((resolve) => {
-    const proc = spawn(ffmpegPath as string, args, { stdio: ['ignore', 'ignore', 'pipe'] })
+    const proc = trackProcess(spawn(ffmpegPath as string, args, { stdio: ['ignore', 'ignore', 'pipe'] }))
     let stderr = ''
     proc.stderr?.on('data', (chunk: Buffer) => {
       stderr += chunk.toString()
       if (stderr.length > 16000) stderr = stderr.slice(-16000)
     })
-    proc.on('error', (err) => resolve({ ok: false, error: err.message }))
+    const fail = (error: string): void => {
+      void unlink(tempPath).catch(() => undefined)
+      releaseTemp(tempPath)
+      resolve({ ok: false, error })
+    }
+    proc.on('error', (err) => fail(err.message))
     proc.on('close', (code) => {
       if (code === 0) resolve({ ok: true, tempPath })
-      else resolve({ ok: false, error: `FFmpeg denoise exited with code ${code}.\n${stderr.slice(-700)}` })
+      else fail(`FFmpeg denoise exited with code ${code}.\n${stderr.slice(-700)}`)
     })
   })
 }

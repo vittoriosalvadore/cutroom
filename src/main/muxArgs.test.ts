@@ -192,3 +192,46 @@ describe('panGains', () => {
     expect(panGains(5).right).toBeCloseTo(1)
   })
 })
+
+describe('buildMuxArgs input planning + safety', () => {
+  it('opens a source once and fans it out with asplit when several clips share it', () => {
+    const args = buildMuxArgs({
+      ...base,
+      clips: [clip({ startSec: 0 }), clip({ startSec: 5 }), clip({ path: '/b.wav', startSec: 10 })]
+    })
+    // silent video + 2 unique sources, not 3
+    expect(args.filter((a) => a === '-i')).toHaveLength(3)
+    const g = graphOf(args)
+    expect(g.startsWith('[1:a]asplit=2[s1_0][s1_1];')).toBe(true)
+    expect(g).toContain('[s1_0]aresample=48000')
+    expect(g).toContain('[s1_1]aresample=48000')
+    expect(g).toContain('[2:a]aresample=48000')
+  })
+
+  it('passes the graph as a script file when asked', () => {
+    const args = buildMuxArgs({ ...base, clips: [clip({})], filterScriptPath: '/tmp/g.txt' })
+    expect(args).not.toContain('-filter_complex')
+    expect(args[args.indexOf('-filter_complex_script') + 1]).toBe('/tmp/g.txt')
+  })
+
+  it('clamps dynamics options into FFmpeg ranges (attack 0 would abort the mux)', () => {
+    const g = graphOf(
+      buildMuxArgs({
+        ...base,
+        clips: [
+          clip({
+            gate: { thresholdDb: -200, rangeDb: 20, ratio: 0, attackMs: 0, releaseMs: 0 },
+            comp: { thresholdDb: -40, ratio: 100, attackMs: 0, releaseMs: 99999, makeupDb: 80 }
+          })
+        ]
+      })
+    )
+    expect(g).toContain('agate=threshold=0.000977:range=1.000000:ratio=1:attack=0.01:release=0.01')
+    expect(g).toContain('acompressor=threshold=0.010000:ratio=20:attack=0.01:release=9000:makeup=64.0000')
+  })
+
+  it('names the muxer explicitly so the output may use a temp extension', () => {
+    const args = buildMuxArgs({ ...base, clips: [clip({})] })
+    expect(args.slice(-3)).toEqual(['-f', 'mp4', '/tmp/out.mp4'])
+  })
+})
