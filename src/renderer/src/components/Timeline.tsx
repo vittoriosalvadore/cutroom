@@ -4,7 +4,10 @@ import { useSettings } from '../state/settings'
 import { audioCacheVersion, getAudioEntry, PEAKS_PER_SEC, subscribeAudioCache } from '../lib/audioCache'
 import { computeTrim, snapMove, snapTime } from '../lib/editing'
 import { roundRectPath } from '../lib/canvas'
-import type { Project, Track, TrackKind } from '../types'
+import { clipSpeed } from '../lib/clipTime'
+import { timelineDuration } from '../lib/exporter'
+import { clampScrollSec, clampScrollY, followPlayhead, zoomAnchoredScroll } from '../lib/timelineScroll'
+import type { Clip, Project, Track, TrackKind } from '../types'
 
 // Layout constants (in CSS pixels).
 const GUTTER = 78 // left label column width
@@ -94,10 +97,11 @@ interface Lane {
   muted: boolean
 }
 
-/** Vertical layout of track lanes, derived from track order/heights. */
-function computeLanes(tracks: Track[]): Lane[] {
+/** Vertical layout of track lanes, derived from track order/heights and the
+ *  vertical scroll `scrollY` (px). Lanes scrolled above RULER sit under it. */
+function computeLanes(tracks: Track[], scrollY: number): Lane[] {
   const lanes: Lane[] = []
-  let y = RULER
+  let y = RULER - scrollY
   for (const t of tracks) {
     lanes.push({
       id: t.id,
@@ -111,6 +115,23 @@ function computeLanes(tracks: Track[]): Lane[] {
     y += t.height
   }
   return lanes
+}
+
+/** Total height of all lanes (px), for vertical scroll clamping. */
+function lanesHeight(tracks: Track[]): number {
+  return tracks.reduce((sum, t) => sum + t.height, 0)
+}
+
+/** Seconds of timeline visible in the lane area of a `w`-px-wide canvas. */
+function visibleSecFor(w: number, pxPerSec: number): number {
+  return Math.max(0, (w - GUTTER) / pxPerSec)
+}
+
+/** Normalise a wheel delta to CSS pixels (line/page modes -> px). */
+function wheelPx(delta: number, mode: number, pagePx: number): number {
+  if (mode === 1) return delta * 16 // DOM_DELTA_LINE
+  if (mode === 2) return delta * pagePx // DOM_DELTA_PAGE
+  return delta
 }
 
 /** The clickable mute badge rectangle inside a lane's gutter. */
@@ -134,24 +155,58 @@ function formatTick(t: number): string {
   return `${m}:${s.toString().padStart(2, '0')}`
 }
 
+// Drag anchors (`startT`) are TIMELINE times, not pixels, so a drag stays glued
+// to the cursor even if the view scrolls mid-drag (wheel / playhead follow).
 type DragState =
-  | { mode: 'clip'; clipId: string; startX: number; origStart: number; histPushed: boolean }
+  | { mode: 'clip'; clipId: string; startT: number; origStart: number; histPushed: boolean }
   | {
       mode: 'trim'
       edge: 'left' | 'right'
       clipId: string
-      startX: number
+      startT: number
       orig: { startSec: number; durationSec: number; inSec: number }
+      /** The clip as it was at drag start (lets the store rebase from it, not
+       *  from the previous drag step). */
+      origin: Clip
       histPushed: boolean
     }
-  | { mode: 'group'; anchorClipId: string; startX: number; minOrigStart: number; applied: number; histPushed: boolean }
+  | { mode: 'group'; anchorClipId: string; startT: number; minOrigStart: number; applied: number; histPushed: boolean }
   | { mode: 'seek' }
   | null
+
+/** Scroll position: `x` = time (s) at the lane area's left edge, `y` = lane px. */
+interface View {
+  x: number
+  y: number
+}
 
 export default function Timeline() {
   const containerRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const drag = useRef<DragState>(null)
+
+  // Scroll state. Mirrored in a ref so native listeners / handlers always read
+  // the latest value without re-binding.
+  const [view, setViewState] = useState<View>({ x: 0, y: 0 })
+  const viewRef = useRef<View>(view)
+  /** Clamp `next` to the current content/viewport and commit it. */
+  const applyView = (next: View): void => {
+    const container = containerRef.current
+    const st = useEditor.getState()
+    const w = container?.clientWidth ?? 0
+    const h = container?.clientHeight ?? 0
+    const contentEnd = Math.max(timelineDuration(st.project), st.playheadSec)
+    const v = {
+      x: clampScrollSec(next.x, contentEnd, visibleSecFor(w, st.pxPerSec)),
+      y: clampScrollY(next.y, lanesHeight(st.project.tracks), h - RULER)
+    }
+    const cur = viewRef.current
+    if (v.x === cur.x && v.y === cur.y) return
+    viewRef.current = v
+    setViewState(v)
+  }
+  const applyViewRef = useRef(applyView)
+  applyViewRef.current = applyView
 
   // Subscribe to the slices that affect rendering.
   const project = useEditor((s) => s.project)
@@ -166,6 +221,7 @@ export default function Timeline() {
   const showWaveforms = useSettings((s) => s.showWaveforms)
   const snapping = useSettings((s) => s.snapping)
   const themeSig = useSettings((s) => `${s.theme}|${s.accent}`)
+  const isPlaying = useEditor((s) => s.isPlaying)
 
   // Redraw when audio decode finishes so waveforms appear.
   const [audioVersion, setAudioVersion] = useState(0)
@@ -188,7 +244,69 @@ export default function Timeline() {
     theme: string
     bw: number
     bh: number
+    sx: number
+    sy: number
   } | null>(null)
+
+  // Re-clamp the scroll when content, zoom or track layout changes (e.g. the
+  // tail was deleted, or zooming out made everything fit). Not mid-drag, so a
+  // shrinking timeline can't yank the view out from under the cursor.
+  useEffect(() => {
+    if (!drag.current) applyViewRef.current(viewRef.current)
+  }, [project, pxPerSec])
+
+  // Keep the playhead on screen while it moves on its own (playback, marker
+  // jumps, Home). Skipped during pointer drags: a seek-drag near the edge would
+  // otherwise page the view under the cursor and run away.
+  useEffect(() => {
+    if (drag.current) return
+    const w = containerRef.current?.clientWidth ?? 0
+    const v = viewRef.current
+    const nx = followPlayhead(v.x, playhead, visibleSecFor(w, pxPerSec))
+    if (nx !== v.x) applyViewRef.current({ x: nx, y: v.y })
+    // Not keyed on zoom: Ctrl+wheel zoom anchors on the cursor and must not be
+    // overridden by a jump back to an off-screen playhead.
+  }, [playhead, isPlaying])
+
+  // Wheel: plain / Shift = horizontal scroll, Ctrl/Cmd = zoom around the cursor,
+  // Alt or wheel over the track-label gutter = vertical lane scroll (when lanes
+  // overflow). Native listener because React's wheel handler is passive and
+  // can't preventDefault the page scroll / pinch-zoom.
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const onWheel = (e: WheelEvent): void => {
+      e.preventDefault()
+      const st = useEditor.getState()
+      const rect = el.getBoundingClientRect()
+      const x = e.clientX - rect.left
+      const dx = wheelPx(e.deltaX, e.deltaMode, rect.width)
+      const dy = wheelPx(e.deltaY, e.deltaMode, rect.height)
+      const v = viewRef.current
+
+      if (e.ctrlKey || e.metaKey) {
+        const oldPx = st.pxPerSec
+        st.setZoom(oldPx * Math.exp(-dy * 0.002))
+        const newPx = useEditor.getState().pxPerSec // store clamps the range
+        if (newPx === oldPx) return
+        const anchor = Math.max(0, x - GUTTER)
+        applyViewRef.current({ x: zoomAnchoredScroll(v.x, anchor, oldPx, newPx), y: v.y })
+        return
+      }
+
+      const overflowY = lanesHeight(st.project.tracks) > rect.height - RULER
+      if (overflowY && !e.shiftKey && (e.altKey || x < GUTTER)) {
+        applyViewRef.current({ x: v.x, y: v.y + (dy || dx) })
+        return
+      }
+
+      // Shift+wheel: many platforms already swap into deltaX; accept either.
+      const px = e.shiftKey ? dy || dx : Math.abs(dx) > Math.abs(dy) ? dx : dy
+      if (px) applyViewRef.current({ x: v.x + px / st.pxPerSec, y: v.y })
+    }
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
+  }, [])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -196,13 +314,21 @@ export default function Timeline() {
     if (!canvas || !container) return
 
     // Draw everything except the playhead into the offscreen `sctx`.
+    const sx = view.x
+    const sy = view.y
     const drawStatic = (sctx: CanvasRenderingContext2D, w: number, h: number): void => {
-      const timeToX = (t: number): number => GUTTER + t * pxPerSec
-      const lanes = computeLanes(project.tracks)
+      const timeToX = (t: number): number => GUTTER + (t - sx) * pxPerSec
+      const lanes = computeLanes(project.tracks, sy)
 
       sctx.fillStyle = TL_COLORS.bg
       sctx.fillRect(0, 0, w, h)
 
+      // Lanes (and later clips) are clipped below the ruler so vertically
+      // scrolled lanes slide under it instead of over it.
+      sctx.save()
+      sctx.beginPath()
+      sctx.rect(0, RULER, w, h - RULER)
+      sctx.clip()
       lanes.forEach((lane, i) => {
         sctx.fillStyle = i % 2 === 0 ? TL_COLORS.laneEven : TL_COLORS.laneOdd
         sctx.fillRect(GUTTER, lane.top, w - GUTTER, lane.height)
@@ -231,6 +357,7 @@ export default function Timeline() {
         sctx.fillText('M', mr.x + mr.w / 2, mr.y + mr.h / 2 + 0.5)
         sctx.textAlign = 'left'
       })
+      sctx.restore()
 
       sctx.fillStyle = TL_COLORS.rulerBg
       sctx.fillRect(0, 0, w, RULER)
@@ -238,9 +365,11 @@ export default function Timeline() {
       sctx.fillRect(0, 0, GUTTER, RULER)
 
       const step = chooseStep(pxPerSec)
-      const maxT = (w - GUTTER) / pxPerSec
+      const maxT = sx + visibleSecFor(w, pxPerSec)
       sctx.font = '10px system-ui, sans-serif'
-      for (let t = 0; t <= maxT; t += step) {
+      // Integer tick index (not t += step) so labels don't accumulate drift.
+      for (let i = Math.ceil(sx / step); i * step <= maxT; i++) {
+        const t = i * step
         const x = Math.round(timeToX(t)) + 0.5
         if (x < GUTTER) continue
         sctx.strokeStyle = TL_COLORS.rulerTickMaj
@@ -259,11 +388,18 @@ export default function Timeline() {
       }
 
       const selectedSet = useEditor.getState().selectedClipIds
+      // Clips live in the lane area only: clip away the gutter and ruler so a
+      // horizontally scrolled clip never paints over the track labels.
+      sctx.save()
+      sctx.beginPath()
+      sctx.rect(GUTTER, RULER, w - GUTTER, h - RULER)
+      sctx.clip()
       for (const clip of Object.values(project.clips)) {
         const lane = lanes.find((l) => l.id === clip.trackId)
         if (!lane) continue
         const x = timeToX(clip.startSec)
         const cw = Math.max(2, clip.durationSec * pxPerSec)
+        if (x + cw < GUTTER || x > w || lane.bottom < RULER || lane.top > h) continue // off-screen
         const pad = 5
         const cy = lane.top + pad
         const ch = lane.height - pad * 2
@@ -326,8 +462,12 @@ export default function Timeline() {
             sctx.strokeStyle = TL_COLORS.waveform
             sctx.lineWidth = 1
             sctx.beginPath()
-            for (let wx = 0; wx <= cw; wx += 1) {
-              const srcT = clip.inSec + wx / pxPerSec
+            // Only the visible columns; source time advances `speed` s per
+            // timeline second (same mapping as the compositor/audio).
+            const speed = clipSpeed(clip)
+            const wxEnd = Math.min(cw, w - x)
+            for (let wx = Math.max(0, Math.floor(GUTTER - x)); wx <= wxEnd; wx += 1) {
+              const srcT = clip.inSec + (wx / pxPerSec) * speed
               const amp = (peaks[Math.floor(srcT * PEAKS_PER_SEC)] ?? 0) * half
               sctx.moveTo(x + wx, midY - amp)
               sctx.lineTo(x + wx, midY + amp)
@@ -372,7 +512,8 @@ export default function Timeline() {
           : media
             ? media.name
             : 'clip'
-        sctx.fillText(label, x + 7, cy + 6)
+        // Pin the label to the visible left edge when the clip starts off-screen.
+        sctx.fillText(label, Math.max(x, GUTTER) + 7, cy + 6)
         sctx.restore()
 
         // Keyframe diamonds for the selected clip: a small marker at each unique
@@ -403,20 +544,26 @@ export default function Timeline() {
           }
         }
       }
+      sctx.restore()
 
       // Markers / regions: a flag in the ruler band + a faint full-height guide.
       for (const m of project.markers ?? []) {
         const mx = timeToX(m.timeSec)
-        if (mx < GUTTER || mx > w) continue
         const isSel = m.id === selectedMarkerId
-        const col = isSel ? TL_COLORS.markerSel : m.color || TL_COLORS.marker
+        // A region stays visible while any part of it is on screen, even when
+        // its start has scrolled off the left.
         if (m.endSec !== undefined) {
+          const rx = Math.max(GUTTER, mx)
           const ex = Math.min(w, timeToX(m.endSec))
-          sctx.globalAlpha = 0.12
-          sctx.fillStyle = m.color || TL_COLORS.marker
-          sctx.fillRect(mx, RULER, Math.max(1, ex - mx), h - RULER)
-          sctx.globalAlpha = 1
+          if (ex > rx) {
+            sctx.globalAlpha = 0.12
+            sctx.fillStyle = m.color || TL_COLORS.marker
+            sctx.fillRect(rx, RULER, Math.max(1, ex - rx), h - RULER)
+            sctx.globalAlpha = 1
+          }
         }
+        if (mx < GUTTER || mx > w) continue
+        const col = isSel ? TL_COLORS.markerSel : m.color || TL_COLORS.marker
         sctx.globalAlpha = isSel ? 0.6 : 0.3
         sctx.strokeStyle = col
         sctx.lineWidth = 1
@@ -473,7 +620,9 @@ export default function Timeline() {
         sig.wf !== showWaveforms ||
         sig.theme !== themeSig ||
         sig.bw !== bw ||
-        sig.bh !== bh
+        sig.bh !== bh ||
+        sig.sx !== sx ||
+        sig.sy !== sy
       ) {
         s.width = bw
         s.height = bh
@@ -491,7 +640,9 @@ export default function Timeline() {
           wf: showWaveforms,
           theme: themeSig,
           bw,
-          bh
+          bh,
+          sx,
+          sy
         }
       }
 
@@ -503,8 +654,8 @@ export default function Timeline() {
       ctx.drawImage(s, 0, 0)
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
 
-      const px = Math.round(GUTTER + playhead * pxPerSec) + 0.5
-      if (px >= GUTTER) {
+      const px = Math.round(GUTTER + (playhead - sx) * pxPerSec) + 0.5
+      if (px >= GUTTER && px <= w) {
         ctx.strokeStyle = TL_COLORS.playhead
         ctx.lineWidth = 1
         ctx.beginPath()
@@ -522,28 +673,37 @@ export default function Timeline() {
     }
 
     render()
-    const ro = new ResizeObserver(render)
+    const ro = new ResizeObserver(() => {
+      // A resize changes how much fits, so re-clamp the scroll (which re-runs
+      // this effect with the new view) before painting.
+      applyViewRef.current(viewRef.current)
+      render()
+    })
     ro.observe(container)
     return () => ro.disconnect()
-  }, [project, playhead, pxPerSec, selKey, selectedMarkerId, audioVersion, showWaveforms, themeSig])
+  }, [project, playhead, pxPerSec, selKey, selectedMarkerId, audioVersion, showWaveforms, themeSig, view])
 
   // --- pointer interactions (seek + drag-to-move clips) ---
   const localPoint = (e: React.PointerEvent | React.MouseEvent): { x: number; y: number } => {
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
     return { x: e.clientX - rect.left, y: e.clientY - rect.top }
   }
+  // px <-> time through the current zoom and horizontal scroll.
+  const xToTime = (x: number): number => viewRef.current.x + (x - GUTTER) / useEditor.getState().pxPerSec
+  const timeToXNow = (t: number): number => GUTTER + (t - viewRef.current.x) * useEditor.getState().pxPerSec
 
   // Hit-test a point against clips, distinguishing the edge (trim) zones from
   // the body (move) zone. Later-drawn clips sit on top, so iterate in reverse.
   const hitTest = (x: number, y: number): { clipId: string; zone: 'left' | 'right' | 'body' } | null => {
+    if (x < GUTTER || y <= RULER) return null // gutter / ruler cover any scrolled clip
     const st = useEditor.getState()
-    const lanes = computeLanes(st.project.tracks)
+    const lanes = computeLanes(st.project.tracks, viewRef.current.y)
     const clips = Object.values(st.project.clips)
     for (let i = clips.length - 1; i >= 0; i--) {
       const clip = clips[i]
       const lane = lanes.find((l) => l.id === clip.trackId)
       if (!lane) continue
-      const cx = GUTTER + clip.startSec * st.pxPerSec
+      const cx = timeToXNow(clip.startSec)
       const cw = Math.max(2, clip.durationSec * st.pxPerSec)
       if (x >= cx && x <= cx + cw && y >= lane.top && y <= lane.bottom) {
         const wide = cw > 3 * EDGE_PX
@@ -561,7 +721,8 @@ export default function Timeline() {
 
     // Gutter: the M badge toggles mute; clicking elsewhere selects the track.
     if (x < GUTTER) {
-      const lanes = computeLanes(st.project.tracks)
+      if (y <= RULER) return // ruler corner (lanes may be scrolled under it)
+      const lanes = computeLanes(st.project.tracks, viewRef.current.y)
       for (const lane of lanes) {
         const mr = muteRect(lane)
         if (x >= mr.x && x <= mr.x + mr.w && y >= mr.y && y <= mr.y + mr.h) {
@@ -579,14 +740,14 @@ export default function Timeline() {
     if (y <= RULER) {
       if (y >= RULER - 10) {
         for (const m of st.project.markers ?? []) {
-          if (Math.abs(x - (GUTTER + m.timeSec * st.pxPerSec)) <= 7) {
+          if (Math.abs(x - timeToXNow(m.timeSec)) <= 7) {
             st.selectMarker(m.id)
             st.setPlayhead(m.timeSec)
             return
           }
         }
       }
-      st.setPlayhead((x - GUTTER) / st.pxPerSec)
+      st.setPlayhead(xToTime(x))
       drag.current = { mode: 'seek' }
       ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
       return
@@ -607,20 +768,28 @@ export default function Timeline() {
           const c = st.project.clips[id]
           if (c) minStart = Math.min(minStart, c.startSec)
         }
-        drag.current = { mode: 'group', anchorClipId: hit.clipId, startX: x, minOrigStart: minStart, applied: 0, histPushed: false }
+        drag.current = {
+          mode: 'group',
+          anchorClipId: hit.clipId,
+          startT: xToTime(x),
+          minOrigStart: minStart,
+          applied: 0,
+          histPushed: false
+        }
         ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
         return
       }
       st.selectClip(hit.clipId)
       if (hit.zone === 'body') {
-        drag.current = { mode: 'clip', clipId: hit.clipId, startX: x, origStart: clip.startSec, histPushed: false }
+        drag.current = { mode: 'clip', clipId: hit.clipId, startT: xToTime(x), origStart: clip.startSec, histPushed: false }
       } else {
         drag.current = {
           mode: 'trim',
           edge: hit.zone,
           clipId: hit.clipId,
-          startX: x,
+          startT: xToTime(x),
           orig: { startSec: clip.startSec, durationSec: clip.durationSec, inSec: clip.inSec },
+          origin: clip,
           histPushed: false
         }
       }
@@ -631,7 +800,7 @@ export default function Timeline() {
     // Otherwise: click in the time area scrubs the playhead.
     if (x > GUTTER) {
       st.selectClip(null)
-      st.setPlayhead((x - GUTTER) / st.pxPerSec)
+      st.setPlayhead(xToTime(x))
       drag.current = { mode: 'seek' }
       ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
     }
@@ -659,7 +828,7 @@ export default function Timeline() {
     }
 
     if (d.mode === 'seek') {
-      st.setPlayhead((x - GUTTER) / st.pxPerSec)
+      st.setPlayhead(xToTime(x))
       return
     }
 
@@ -671,7 +840,7 @@ export default function Timeline() {
 
     // Group move: shift every selected clip by the same (clamped) delta.
     if (d.mode === 'group') {
-      const groupDelta = Math.max((x - d.startX) / st.pxPerSec, -d.minOrigStart)
+      const groupDelta = Math.max(xToTime(x) - d.startT, -d.minOrigStart)
       st.moveSelectedBy(groupDelta - d.applied)
       d.applied = groupDelta
       return
@@ -682,10 +851,10 @@ export default function Timeline() {
     const cands = collectSnapCandidates(st.project, d.clipId, st.playheadSec)
 
     if (d.mode === 'clip') {
-      const raw = d.origStart + (x - d.startX) / st.pxPerSec
+      const raw = d.origStart + (xToTime(x) - d.startT)
       const snapped = Math.max(0, snapping ? snapMove(raw, clip.durationSec, cands, st.pxPerSec) : raw)
-      const lanes = computeLanes(st.project.tracks)
-      const over = lanes.find((l) => y >= l.top && y <= l.bottom)
+      const lanes = computeLanes(st.project.tracks, viewRef.current.y)
+      const over = y > RULER ? lanes.find((l) => y >= l.top && y <= l.bottom) : undefined
       const clipKind = st.project.tracks.find((t) => t.id === clip.trackId)?.kind
       const targetTrack = over && over.kind === clipKind ? over.id : undefined
       st.moveClip(d.clipId, snapped, targetTrack)
@@ -695,7 +864,7 @@ export default function Timeline() {
     // Trim: move the grabbed edge, snapping it, then clamp to valid bounds.
     const media = clip.mediaId ? st.project.media[clip.mediaId] : undefined
     const srcDuration = media && media.durationSec > 0 ? media.durationSec : null
-    const dxSec = (x - d.startX) / st.pxPerSec
+    const dxSec = xToTime(x) - d.startT
     const rawEdge =
       d.edge === 'left' ? d.orig.startSec + dxSec : d.orig.startSec + d.orig.durationSec + dxSec
     const snappedEdge = snapping ? snapTime(rawEdge, cands, st.pxPerSec) : rawEdge
@@ -706,7 +875,7 @@ export default function Timeline() {
       srcDuration,
       speed: clip.speed ?? 1
     })
-    st.applyTrim(d.clipId, bounds)
+    st.applyTrim(d.clipId, bounds, d.origin)
   }
 
   const endDrag = (e: React.PointerEvent): void => {
@@ -727,7 +896,7 @@ export default function Timeline() {
     if (y > RULER || y < RULER - 10 || x < GUTTER) return
     const st = useEditor.getState()
     for (const m of st.project.markers ?? []) {
-      if (Math.abs(x - (GUTTER + m.timeSec * st.pxPerSec)) <= 7) {
+      if (Math.abs(x - timeToXNow(m.timeSec)) <= 7) {
         e.preventDefault()
         st.removeMarker(m.id)
         return
@@ -741,7 +910,7 @@ export default function Timeline() {
         <span>Timeline</span>
         <span className="hint">
           drag to move · drag edges to trim · S split · X crossfade · M marker · ,/. jump · shift-click
-          multi-select · Ctrl+A all · Ctrl+C/V copy · Del remove
+          multi-select · Ctrl+A all · Ctrl+C/V copy · Del remove · wheel scroll · Ctrl+wheel zoom
         </span>
         <button
           className="btn small"

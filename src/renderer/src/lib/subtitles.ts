@@ -17,11 +17,14 @@ function parseTimestamp(raw: string): number | null {
 
 /** Seconds -> "HH:MM:SS,mmm" for SRT output. */
 function formatSrtTimestamp(sec: number): string {
-  const t = Math.max(0, sec)
-  const h = Math.floor(t / 3600)
-  const m = Math.floor((t % 3600) / 60)
-  const s = Math.floor(t % 60)
-  const ms = Math.round((t - Math.floor(t)) * 1000)
+  // Round to whole milliseconds FIRST and derive every field with integer math;
+  // rounding only the fractional part can carry to 1000 (1.9996 -> "01,1000").
+  const total = Math.max(0, Math.round(sec * 1000))
+  const ms = total % 1000
+  const totalSec = Math.floor(total / 1000)
+  const s = totalSec % 60
+  const m = Math.floor(totalSec / 60) % 60
+  const h = Math.floor(totalSec / 3600)
   const p = (n: number, len = 2): string => n.toString().padStart(len, '0')
   return `${p(h)}:${p(m)}:${p(s)},${p(ms, 3)}`
 }

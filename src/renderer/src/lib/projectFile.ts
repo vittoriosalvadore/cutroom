@@ -1,10 +1,11 @@
-import type { Marker, Project } from '../types'
+import type { AnimProp, Clip, Easing, Keyframe, MediaItem, Marker, Project, Track } from '../types'
 
 // ---------------------------------------------------------------------------
 // Pure project (de)serialization. Defensive on the way IN so a corrupt or
 // hand-edited file can never crash the app: structurally-invalid data is
-// rejected, and missing scalar settings are filled with sane defaults. Pure, so
-// it is unit-tested directly.
+// rejected, individually-bad clips/media entries are dropped, and missing
+// scalar settings are filled with sane defaults. Pure, so it is unit-tested
+// directly.
 // ---------------------------------------------------------------------------
 
 export const FILE_VERSION = 1
@@ -46,13 +47,108 @@ function sanitizeMarkers(raw: unknown): Marker[] {
   return out
 }
 
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === 'object' && !Array.isArray(v)
+}
+
+const TRACK_KINDS = new Set(['video', 'audio'])
+const MEDIA_KINDS = new Set(['video', 'audio', 'image'])
+const EASINGS = new Set<Easing>(['linear', 'hold', 'smooth'])
+
+/** Tracks are structural: a malformed one fails the whole file (its clips would
+ *  be orphaned). Cosmetic fields get defaults. Returns an error string on failure. */
+function sanitizeTracks(raw: unknown[]): Track[] | string {
+  const out: Track[] = []
+  const seen = new Set<string>()
+  for (const t of raw) {
+    if (!isRecord(t)) return 'Project has a malformed track.'
+    if (typeof t.id !== 'string' || !t.id) return 'Project has a track without an id.'
+    if (typeof t.kind !== 'string' || !TRACK_KINDS.has(t.kind)) return `Track "${t.id}" has an unknown kind.`
+    if (seen.has(t.id)) return `Project has two tracks with the id "${t.id}".`
+    seen.add(t.id)
+    out.push({
+      ...(t as unknown as Track),
+      name: typeof t.name === 'string' ? t.name : t.id,
+      height: num(t.height, t.kind === 'audio' ? 52 : 68),
+      muted: t.muted === true,
+      hidden: t.hidden === true
+    })
+  }
+  return out
+}
+
+/** Drop media entries that aren't usable objects; a missing/garbage duration
+ *  becomes 0 ("not yet probed") so the app re-probes it. */
+function sanitizeMedia(raw: Record<string, unknown>): Project['media'] {
+  const out: Project['media'] = {}
+  for (const [id, m] of Object.entries(raw)) {
+    if (!isRecord(m)) continue
+    if (typeof m.kind !== 'string' || !MEDIA_KINDS.has(m.kind)) continue
+    const dur = Number(m.durationSec)
+    out[id] = {
+      ...(m as unknown as MediaItem),
+      id,
+      name: typeof m.name === 'string' ? m.name : id,
+      path: typeof m.path === 'string' ? m.path : '',
+      durationSec: Number.isFinite(dur) && dur >= 0 ? dur : 0
+    }
+  }
+  return out
+}
+
+/** Keep only well-formed keys, sorted by time (the evaluator assumes sorted). */
+function sanitizeKeyframes(raw: unknown): Clip['keyframes'] | undefined {
+  if (!isRecord(raw)) return undefined
+  const out: Partial<Record<AnimProp, Keyframe[]>> = {}
+  for (const [prop, track] of Object.entries(raw)) {
+    if (!Array.isArray(track)) continue
+    const keys: Keyframe[] = []
+    for (const k of track) {
+      if (!isRecord(k) || !Number.isFinite(k.t) || !Number.isFinite(k.v)) continue
+      const ease = EASINGS.has(k.ease as Easing) ? (k.ease as Easing) : 'smooth'
+      keys.push({ ...(k as unknown as Keyframe), ease })
+    }
+    if (keys.length > 0) out[prop as AnimProp] = keys.sort((a, b) => a.t - b.t)
+  }
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
+/** A clip survives only if it can be placed and rendered: finite timing, a
+ *  positive length, a real track, and a media reference that is null or
+ *  resolvable. Anything else is dropped (not the whole file). */
+function sanitizeClips(raw: Record<string, unknown>, trackIds: Set<string>, media: Project['media']): Project['clips'] {
+  const out: Project['clips'] = {}
+  for (const [id, c] of Object.entries(raw)) {
+    if (!isRecord(c)) continue
+    const { startSec, durationSec, inSec } = c
+    if (!Number.isFinite(startSec) || !Number.isFinite(durationSec) || !Number.isFinite(inSec)) continue
+    if ((durationSec as number) <= 0) continue
+    if (typeof c.trackId !== 'string' || !trackIds.has(c.trackId)) continue
+    if (c.mediaId !== null && (typeof c.mediaId !== 'string' || !media[c.mediaId])) continue
+    const clip: Clip = { ...(c as unknown as Clip), id, startSec: Math.max(0, startSec as number) }
+    if (c.speed !== undefined && !Number.isFinite(c.speed)) delete clip.speed
+    if (c.keyframes !== undefined) {
+      const kf = sanitizeKeyframes(c.keyframes)
+      if (kf) clip.keyframes = kf
+      else delete clip.keyframes
+    }
+    out[id] = clip
+  }
+  return out
+}
+
 /** Validate + normalize an untrusted object into a Project. */
 function validateProject(p: unknown): DeserializeResult {
   if (!p || typeof p !== 'object') return { ok: false, error: 'No project data found.' }
   const o = p as Record<string, unknown>
   if (!Array.isArray(o.tracks)) return { ok: false, error: 'Project is missing its track list.' }
-  if (!o.clips || typeof o.clips !== 'object') return { ok: false, error: 'Project is missing its clips.' }
-  if (!o.media || typeof o.media !== 'object') return { ok: false, error: 'Project is missing its media list.' }
+  if (!isRecord(o.clips)) return { ok: false, error: 'Project is missing its clips.' }
+  if (!isRecord(o.media)) return { ok: false, error: 'Project is missing its media list.' }
+
+  const tracks = sanitizeTracks(o.tracks)
+  if (typeof tracks === 'string') return { ok: false, error: tracks }
+  const media = sanitizeMedia(o.media)
+  const clips = sanitizeClips(o.clips, new Set(tracks.map((t) => t.id)), media)
 
   const project: Project = {
     id: typeof o.id === 'string' ? o.id : 'proj',
@@ -61,9 +157,9 @@ function validateProject(p: unknown): DeserializeResult {
     width: num(o.width, 1920),
     height: num(o.height, 1080),
     sampleRate: num(o.sampleRate, 48000),
-    media: o.media as Project['media'],
-    tracks: o.tracks as Project['tracks'],
-    clips: o.clips as Project['clips'],
+    media,
+    tracks,
+    clips,
     markers: sanitizeMarkers(o.markers)
   }
   return { ok: true, project }
@@ -77,9 +173,18 @@ export function deserializeProject(json: string): DeserializeResult {
   } catch {
     return { ok: false, error: 'File is not valid JSON.' }
   }
-  const raw =
-    data && typeof data === 'object' && 'project' in (data as Record<string, unknown>)
-      ? (data as Record<string, unknown>).project
-      : data
+  const wrapped = isRecord(data) && 'project' in data
+  if (wrapped) {
+    // A newer app may have changed the format in ways this build can't read;
+    // refuse rather than silently dropping (and later overwriting) its data.
+    const version = Number((data as Record<string, unknown>).version)
+    if (Number.isFinite(version) && version > FILE_VERSION) {
+      return {
+        ok: false,
+        error: `This project was saved by a newer version of Cutroom (file format ${version}; this version reads up to ${FILE_VERSION}). Please update Cutroom to open it.`
+      }
+    }
+  }
+  const raw = wrapped ? (data as Record<string, unknown>).project : data
   return validateProject(raw)
 }

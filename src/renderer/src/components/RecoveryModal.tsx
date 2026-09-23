@@ -42,9 +42,12 @@ export default function RecoveryModal() {
 
   const recover = (): void => {
     const parsed = deserializeProject(info.json)
-    if (parsed.ok) loadProject(parsed.project, info.savedPath)
-    else window.alert('The recovered file was unreadable.')
+    // Clear first so the autosave that follows the load re-seeds recovery with
+    // the restored project rather than racing the clear.
     void window.cutroom?.clearRecovery()
+    // Recovered work was never saved: keep it dirty so closing still prompts.
+    if (parsed.ok) loadProject(parsed.project, info.savedPath, { dirty: true })
+    else window.alert('The recovered file was unreadable.')
     setInfo(null)
   }
 

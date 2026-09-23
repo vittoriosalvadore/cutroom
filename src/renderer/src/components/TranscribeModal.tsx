@@ -49,12 +49,16 @@ export default function TranscribeModal() {
       // Each cue is committed to the project the moment its 30s window resolves
       // (not batched until the whole clip finishes) — a crash mid-transcription
       // only loses the window in flight, not everything already transcribed.
+      // Only the first cue records an undo step; the rest join it, so the whole
+      // transcription undoes at once and a long one can't flush the history.
+      let first = true
       const cues = await transcribeClip(
         useEditor.getState().project,
         clip,
         setProgress,
         (cue) => {
-          importSubtitles([cue])
+          importSubtitles([cue], { recordHistory: first })
+          first = false
           setCount((c) => c + 1)
         },
         () => cancelRef.current

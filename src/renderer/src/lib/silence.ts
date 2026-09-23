@@ -31,25 +31,36 @@ function dbToLinear(db: number): number {
 }
 
 /**
- * Detect silent ranges in `buffer` (channel 0, matching computePeaks' single-
- * channel convention) using windowed RMS against `thresholdDb`. Returns ranges
- * sorted by startSec, each satisfying minSilenceSec, with adjacent silences
- * closer than minClipSec merged together.
+ * Detect silent ranges in `buffer` using windowed RMS against `thresholdDb`.
+ * Each window's level is the LOUDEST channel's RMS, so speech panned hard to
+ * one side isn't mistaken for silence. Returns ranges sorted by startSec, each
+ * satisfying minSilenceSec, with adjacent silences closer than minClipSec
+ * merged together.
  */
 export function findSilences(buffer: AudioBuffer, opts: FindSilencesOptions): SilenceRange[] {
-  const data = buffer.getChannelData(0)
-  const total = Math.max(1, Math.ceil(buffer.duration * ANALYSIS_WINDOWS_PER_SEC))
-  const per = Math.max(1, Math.floor(buffer.length / total))
+  const channels: Float32Array[] = []
+  const nch = Math.max(1, buffer.numberOfChannels || 1)
+  for (let ch = 0; ch < nch; ch++) channels.push(buffer.getChannelData(ch))
+  // Fixed-length windows of exactly 1/50 s (fractional sample boundaries are
+  // floored per window), so window i always starts at i/50 s. Deriving the
+  // window size as floor(length/total) instead drifts on long files — the
+  // truncation accumulates and reported times land later than the audio.
+  const win = buffer.sampleRate / ANALYSIS_WINDOWS_PER_SEC
+  const total = Math.max(1, Math.ceil(buffer.length / win))
   const thresholdLinear = dbToLinear(opts.thresholdDb)
 
   const silentWindow: boolean[] = new Array(total)
   for (let i = 0; i < total; i++) {
-    const start = i * per
-    const end = Math.min(buffer.length, start + per)
-    let sumSq = 0
-    for (let j = start; j < end; j++) sumSq += data[j] * data[j]
-    const rms = Math.sqrt(sumSq / Math.max(1, end - start))
-    silentWindow[i] = rms < thresholdLinear
+    const start = Math.floor(i * win)
+    const end = Math.min(buffer.length, Math.floor((i + 1) * win))
+    const n = Math.max(1, end - start)
+    let maxMeanSq = 0
+    for (const data of channels) {
+      let sumSq = 0
+      for (let j = start; j < end; j++) sumSq += data[j] * data[j]
+      maxMeanSq = Math.max(maxMeanSq, sumSq / n)
+    }
+    silentWindow[i] = Math.sqrt(maxMeanSq) < thresholdLinear
   }
 
   const secPerWindow = 1 / ANALYSIS_WINDOWS_PER_SEC
@@ -60,7 +71,8 @@ export function findSilences(buffer: AudioBuffer, opts: FindSilencesOptions): Si
     if (silent && runStart < 0) runStart = i
     else if (!silent && runStart >= 0) {
       const startSec = runStart * secPerWindow
-      const endSec = i * secPerWindow
+      // The last window may be partial; never report past the end of the audio.
+      const endSec = Math.min(i * secPerWindow, buffer.length / buffer.sampleRate)
       if (endSec - startSec >= opts.minSilenceSec) ranges.push({ startSec, endSec })
       runStart = -1
     }

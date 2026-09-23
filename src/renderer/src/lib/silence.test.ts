@@ -80,4 +80,27 @@ describe('findSilences', () => {
     const buf = makeBuffer(concat(tone(1, 0.5, SR), tone(0.5, 0.001, SR), tone(1, 0.5, SR)), SR)
     expect(findSilences(buf, OPTS).length).toBe(1)
   })
+
+  it('does not drift on long files whose length is not a whole number of windows', () => {
+    // 600 s + 1 sample at 1 kHz: a floor(length/total) window would be 19 samples
+    // instead of 20, drifting ~25 s by the 500 s mark.
+    const buf = makeBuffer(concat(tone(500, 0.5, SR), tone(2, 0, SR), tone(98, 0.5, SR), tone(0.001, 0.5, SR)), SR)
+    const ranges = findSilences(buf, OPTS)
+    expect(ranges.length).toBe(1)
+    expect(ranges[0].startSec).toBeCloseTo(500, 2)
+    expect(ranges[0].endSec).toBeCloseTo(502, 2)
+  })
+
+  it('uses the loudest channel, so speech on channel 1 only is not silence', () => {
+    const left = concat(tone(1, 0.5, SR), tone(1, 0, SR), tone(1, 0.5, SR))
+    const right = tone(3, 0.5, SR)
+    const buf = {
+      getChannelData: (ch: number) => (ch === 0 ? left : right),
+      duration: 3,
+      length: left.length,
+      sampleRate: SR,
+      numberOfChannels: 2
+    } as unknown as AudioBuffer
+    expect(findSilences(buf, OPTS)).toEqual([])
+  })
 })

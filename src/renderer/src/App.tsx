@@ -4,6 +4,7 @@ import { useSettings } from './state/settings'
 import { probeAudio, probeImage, probeVideo } from './lib/probe'
 import { ensureAudioDecoded } from './lib/audioCache'
 import { serializeProject } from './lib/projectFile'
+import { timelineDuration } from './lib/exporter'
 import { createNewProject, openProject, saveProject } from './lib/projectIO'
 import { useT } from './lib/i18n'
 import MediaBin from './components/MediaBin'
@@ -21,6 +22,8 @@ import AutoCutSilenceModal from './components/AutoCutSilenceModal'
 /**
  * Drives the playhead while playing. Uses requestAnimationFrame and reads the
  * latest playhead via getState() each tick to avoid stale-closure drift.
+ * Playback stops at the end of the timeline; pressing play while parked at (or
+ * past) the end restarts from 0.
  */
 function usePlaybackClock(): void {
   const isPlaying = useEditor((s) => s.isPlaying)
@@ -29,12 +32,27 @@ function usePlaybackClock(): void {
 
   useEffect(() => {
     if (!isPlaying) return
+    const start = useEditor.getState()
+    const startEnd = timelineDuration(start.project)
+    if (startEnd <= 0) {
+      start.setPlaying(false) // nothing to play
+      return
+    }
+    if (start.playheadSec >= startEnd - 1e-3) start.setPlayhead(0)
     last.current = performance.now()
     const tick = (now: number): void => {
       const dt = (now - last.current) / 1000
       last.current = now
       const st = useEditor.getState()
-      st.setPlayhead(st.playheadSec + dt)
+      // Re-read the end each tick: edits during playback can move it.
+      const end = timelineDuration(st.project)
+      const next = st.playheadSec + dt
+      if (next >= end) {
+        st.setPlayhead(Math.max(0, end))
+        st.setPlaying(false)
+        return
+      }
+      st.setPlayhead(next)
       raf.current = requestAnimationFrame(tick)
     }
     raf.current = requestAnimationFrame(tick)
@@ -167,11 +185,65 @@ function useDocumentTitle(): void {
   }, [name, dirty])
 }
 
-/** Global keyboard shortcuts. Ignored while typing in an input. */
+/**
+ * Prompt before the window closes/reloads with unsaved changes. The renderer
+ * only vetoes the unload; the main process turns that veto into a native
+ * confirm dialog via 'will-prevent-unload'. (A dev HMR full reload of a dirty
+ * project prompts too, which is harmless.)
+ */
+function useUnsavedGuard(): void {
+  useEffect(() => {
+    const onBeforeUnload = (e: BeforeUnloadEvent): void => {
+      const st = useEditor.getState()
+      if (st.project === st.savedProject) return
+      e.preventDefault()
+      e.returnValue = '' // legacy requirement for Chromium to honour the veto
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [])
+}
+
+// <input> types that take typed text — shortcuts must not steal their keys.
+// Range/checkbox/color/radio/button inputs are deliberately NOT here: after
+// dragging a slider focus stays on it, and Space/Ctrl+Z should still work.
+const TEXT_INPUT_TYPES = new Set([
+  'text',
+  'number',
+  'search',
+  'email',
+  'password',
+  'url',
+  'tel',
+  'date',
+  'datetime-local',
+  'month',
+  'time',
+  'week'
+])
+
+/** True when keystrokes on `el` belong to a text-editing control. */
+function isTextEditingTarget(el: EventTarget | null): boolean {
+  if (!(el instanceof HTMLElement)) return false
+  if (el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) return true
+  if (el instanceof HTMLInputElement) return TEXT_INPUT_TYPES.has(el.type)
+  return el.isContentEditable
+}
+
+/** True while any modal dialog is up (store-driven or self-managed). */
+function isModalOpen(): boolean {
+  const st = useEditor.getState()
+  if (st.exportOpen || st.transcribeOpen || st.settingsOpen || st.reframeOpen || st.autoCutSilenceOpen) return true
+  // Self-managed modals (e.g. RecoveryModal) keep their open state locally;
+  // every modal renders a .modal-backdrop, so the DOM is the catch-all.
+  return document.querySelector('.modal-backdrop') !== null
+}
+
+/** Global keyboard shortcuts. Ignored while typing in a text control or while a modal is open. */
 function useShortcuts(): void {
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
+      if (isTextEditingTarget(e.target) || isModalOpen()) return
       const st = useEditor.getState()
       const meta = e.ctrlKey || e.metaKey
 
@@ -271,6 +343,7 @@ export default function App() {
   useAutosave()
   useDocumentTitle()
   useLastResortCrashNet()
+  useUnsavedGuard()
   const dirty = useEditor((s) => s.project !== s.savedProject)
   const setSettingsOpen = useEditor((s) => s.setSettingsOpen)
   const importMedia = useEditor((s) => s.importMedia)
@@ -293,8 +366,11 @@ export default function App() {
   const onDrop = (e: React.DragEvent<HTMLDivElement>): void => {
     e.preventDefault()
     setDraggingOver(false)
+    // File.path was removed in Electron 32; resolve paths through the preload.
+    const getPath = window.cutroom?.getPathForFile
+    if (!getPath) return
     const paths = Array.from(e.dataTransfer.files)
-      .map((f) => (f as File & { path: string }).path)
+      .map((f) => getPath(f))
       .filter((p) => p && MEDIA_EXT.test(p))
     if (paths.length) importMedia(paths)
   }

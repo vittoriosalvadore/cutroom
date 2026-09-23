@@ -16,6 +16,26 @@ import { denoiseCacheVersion, ensureDenoised, getDenoiseEntry, subscribeDenoiseC
 import type { AnimProp, Marker, TextAlign, Track, TrackGate, TrackDuck, TrackEQ, TrackComp } from '../types'
 
 /** Labelled range slider that shows its current value. */
+/**
+ * Pre-edit undo snapshot for a pointerdown inside an Inspector panel, taken
+ * only when it lands on an enabled form control (or a <label> that drives one,
+ * e.g. an On/Off switch). Snapshotting on ANY pointerdown pushed a no-op undo
+ * step — and wiped redo — for clicks on blank space or headings. Controls whose
+ * action records its own history (or doesn't edit) opt out via data-no-snapshot.
+ */
+function snapshotOnControl(e: { target: EventTarget | null }): void {
+  const target = e.target
+  if (!(target instanceof Element)) return
+  let control: Element | null = target.closest('input, select, textarea, button')
+  if (!control) {
+    // A label click toggles/opens its control — except a slider's, which only focuses.
+    const viaLabel = target.closest('label')?.control ?? null
+    if (viaLabel && !(viaLabel instanceof HTMLInputElement && viaLabel.type === 'range')) control = viaLabel
+  }
+  if (!control || control.matches(':disabled') || control.closest('[data-no-snapshot]')) return
+  useEditor.getState().snapshot()
+}
+
 function Slider(props: {
   label: string
   value: number
@@ -160,7 +180,7 @@ function TrackPanel(props: {
       <div className="panel-head">Inspector</div>
       <div
         className="insp-body"
-        onPointerDownCapture={() => useEditor.getState().snapshot()}
+        onPointerDownCapture={snapshotOnControl}
         onKeyDownCapture={(e) => {
           // Keyboard nudges on a slider also need a pre-edit snapshot for undo.
           if ((e.target as HTMLInputElement).type === 'range') useEditor.getState().snapshot()
@@ -490,7 +510,7 @@ function MarkerPanel(props: { marker: Marker }) {
   return (
     <aside className="inspector">
       <div className="panel-head">Inspector</div>
-      <div className="insp-body" onPointerDownCapture={() => useEditor.getState().snapshot()}>
+      <div className="insp-body" onPointerDownCapture={snapshotOnControl}>
         <div className="insp-clipname">Marker</div>
         <div className="insp-clipmeta">at {marker.timeSec.toFixed(2)}s</div>
         <section className="insp-section">
@@ -510,7 +530,8 @@ function MarkerPanel(props: { marker: Marker }) {
                 onChange={(e) => updateMarker(marker.id, { color: e.target.value })}
               />
             </label>
-            <button className="btn small" onClick={() => removeMarker(marker.id)}>
+            {/* removeMarker records its own undo step; a snapshot here would duplicate it. */}
+            <button className="btn small" data-no-snapshot onClick={() => removeMarker(marker.id)}>
               Delete
             </button>
           </div>
@@ -626,7 +647,7 @@ export default function Inspector() {
           or button click is a single undo step. */}
       <div
         className="insp-body"
-        onPointerDownCapture={() => useEditor.getState().snapshot()}
+        onPointerDownCapture={snapshotOnControl}
         onKeyDownCapture={(e) => {
           // Keyboard nudges on a slider also need a pre-edit snapshot for undo.
           if ((e.target as HTMLInputElement).type === 'range') useEditor.getState().snapshot()
@@ -842,6 +863,7 @@ export default function Inspector() {
                 <button
                   className="btn small"
                   title="Track the subject with AI and add follow keyframes"
+                  data-no-snapshot // only opens the modal; applyReframe records its own step
                   onClick={() => useEditor.getState().setReframeOpen(true)}
                 >
                   🎯 AI Reframe

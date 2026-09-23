@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useEditor } from '../state/store'
 import { detectSilenceRanges, totalRemovedSec, type SilenceCutRange } from '../lib/autoCutSilence'
 
@@ -18,16 +18,33 @@ export default function AutoCutSilenceModal() {
   const [minSilenceSec, setMinSilenceSec] = useState(0.4)
   const [paddingSec, setPaddingSec] = useState(0.12)
   const [status, setStatus] = useState<Status>('idle')
-  const [ranges, setRanges] = useState<SilenceCutRange[]>([])
+  // Detected ranges are tied to the clip they were computed for, so Apply cuts
+  // THAT clip even if the selection changed since.
+  const [result, setResult] = useState<{ clipId: string; ranges: SilenceCutRange[] } | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // Bumped whenever a run is superseded (close / back / new run); a detection
+  // that resolves with a stale token is dropped instead of landing in the UI.
+  const runToken = useRef(0)
+
+  // Opening or closing (from anywhere) invalidates any in-flight detection and
+  // starts from a clean slate, so a reopen never shows another clip's ranges.
+  useEffect(() => {
+    runToken.current++
+    setStatus('idle')
+    setResult(null)
+    setError(null)
+  }, [open])
 
   if (!open) return null
+  const ranges = result?.ranges ?? []
 
   const analyzable = !!clip && !!media && (media.kind === 'audio' || media.kind === 'video')
   const detecting = status === 'detecting'
 
   const detect = async (): Promise<void> => {
     if (!clip) return
+    const token = ++runToken.current
+    const clipId = clip.id
     setStatus('detecting')
     setError(null)
     try {
@@ -36,31 +53,36 @@ export default function AutoCutSilenceModal() {
         minSilenceSec,
         paddingSec
       })
-      setRanges(found)
+      if (token !== runToken.current) return // cancelled / superseded
+      setResult({ clipId, ranges: found })
       setStatus('preview')
     } catch (e) {
+      if (token !== runToken.current) return
       setError(e instanceof Error ? e.message : 'Silence detection failed.')
       setStatus('error')
     }
   }
 
   const apply = (): void => {
-    if (!clip) return
-    applySilenceCuts(clip.id, ranges)
+    if (!result) return
+    applySilenceCuts(result.clipId, result.ranges)
+    runToken.current++
     setStatus('idle')
-    setRanges([])
+    setResult(null)
     setOpen(false)
   }
 
   const back = (): void => {
+    runToken.current++
     setStatus('idle')
-    setRanges([])
+    setResult(null)
     setError(null)
   }
 
   const close = (): void => {
+    runToken.current++
     setStatus('idle')
-    setRanges([])
+    setResult(null)
     setError(null)
     setOpen(false)
   }

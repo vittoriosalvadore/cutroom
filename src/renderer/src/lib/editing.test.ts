@@ -3,7 +3,9 @@ import {
   computeCrossfade,
   computeTrim,
   rippleShift,
+  mergeRemovedRanges,
   rippleShiftMarkers,
+  shiftTimeForRanges,
   snapMove,
   snapTime,
   splitClipAt,
@@ -35,6 +37,10 @@ describe('snapMove', () => {
   })
   it('returns raw start when nothing is close', () => {
     expect(snapMove(2.5, 2, [5], PX)).toBe(2.5)
+  })
+  it('prefers a real start snap over float noise on the (unsnapped) end edge', () => {
+    // 0.1 + 0.2 - 0.2 !== 0.1 in floating point; that must not count as an end snap.
+    expect(snapMove(0.1, 0.2, [0.12], PX)).toBe(0.12)
   })
 })
 
@@ -147,20 +153,48 @@ describe('rippleShift', () => {
 })
 
 describe('rippleShiftMarkers', () => {
-  it('shifts point markers at/after the removed start', () => {
-    const markers = [{ timeSec: 2 }, { timeSec: 5 }, { timeSec: 10 }]
+  it('shifts point markers at/after the removed end; one at the start stays put', () => {
+    const markers = [{ timeSec: 2 }, { timeSec: 5 }, { timeSec: 8 }, { timeSec: 10 }]
     const r = rippleShiftMarkers(markers, 5, 3)
-    expect(r.map((m) => m.timeSec)).toEqual([2, 2, 7])
+    expect(r.map((m) => m.timeSec)).toEqual([2, 5, 5, 7])
+  })
+  it('collapses a marker inside the removed range onto the range start (not before it)', () => {
+    const r = rippleShiftMarkers([{ timeSec: 6.5 }], 5, 3)
+    expect(r[0].timeSec).toBe(5)
   })
   it('shifts both endpoints of a region marker', () => {
     const markers = [{ timeSec: 6, endSec: 9 }]
     const r = rippleShiftMarkers(markers, 5, 3)
-    expect(r[0]).toEqual({ timeSec: 3, endSec: 6 })
+    expect(r[0]).toEqual({ timeSec: 5, endSec: 6 })
   })
   it('leaves markers strictly before the removed range untouched', () => {
     const markers = [{ timeSec: 1, endSec: 4 }]
     const r = rippleShiftMarkers(markers, 5, 3)
     expect(r[0]).toEqual({ timeSec: 1, endSec: 4 })
+  })
+})
+
+describe('mergeRemovedRanges / shiftTimeForRanges', () => {
+  it('unions overlapping and touching ranges into sorted spans', () => {
+    const merged = mergeRemovedRanges([
+      { startSec: 10, durationSec: 2 },
+      { startSec: 0, durationSec: 5 },
+      { startSec: 3, durationSec: 4 }, // overlaps the first
+      { startSec: 12, durationSec: 1 } // touches [10,12)
+    ])
+    expect(merged).toEqual([
+      { startSec: 0, durationSec: 7 },
+      { startSec: 10, durationSec: 3 }
+    ])
+  })
+  it('removes parallel (cross-track) deletions from the timeline only once', () => {
+    const merged = mergeRemovedRanges([
+      { startSec: 5, durationSec: 5 },
+      { startSec: 5, durationSec: 5 }
+    ])
+    expect(shiftTimeForRanges(12, merged)).toBe(7)
+    expect(shiftTimeForRanges(7, merged)).toBe(5)
+    expect(shiftTimeForRanges(3, merged)).toBe(3)
   })
 })
 

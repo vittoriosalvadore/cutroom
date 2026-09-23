@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { serializeProject, deserializeProject } from './projectFile'
+import { serializeProject, deserializeProject, FILE_VERSION } from './projectFile'
 import type { Project } from '../types'
 
 function sample(): Project {
@@ -72,6 +72,71 @@ describe('project (de)serialize', () => {
       expect(r.project.width).toBe(1920)
       expect(r.project.sampleRate).toBe(48000)
       expect(r.project.name).toBe('Untitled Project')
+    }
+  })
+
+  it('rejects a file from a newer format version with a clear error', () => {
+    const json = JSON.stringify({ app: 'cutroom', version: FILE_VERSION + 1, project: sample() })
+    const r = deserializeProject(json)
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error).toMatch(/newer version/)
+  })
+
+  it('rejects arrays in place of the clips/media maps', () => {
+    expect(deserializeProject(JSON.stringify({ project: { ...sample(), clips: [] } })).ok).toBe(false)
+    expect(deserializeProject(JSON.stringify({ project: { ...sample(), media: [] } })).ok).toBe(false)
+  })
+
+  it('rejects malformed tracks (non-object, missing id, unknown kind)', () => {
+    const bad = (tracks: unknown[]): boolean => deserializeProject(JSON.stringify({ project: { ...sample(), tracks } })).ok
+    expect(bad([null])).toBe(false)
+    expect(bad([{ kind: 'video' }])).toBe(false)
+    expect(bad([{ id: 'v1', kind: 'subtitle' }])).toBe(false)
+  })
+
+  it('drops invalid clips but keeps the rest of the file', () => {
+    const p = sample()
+    const raw = {
+      ...p,
+      clips: {
+        ...p.clips,
+        nan: { ...p.clips.c1, id: 'nan', startSec: 'x' },
+        zero: { ...p.clips.c1, id: 'zero', durationSec: 0 },
+        orphan: { ...p.clips.c1, id: 'orphan', trackId: 'gone' },
+        noMedia: { ...p.clips.c1, id: 'noMedia', mediaId: 'm_missing' },
+        title: { ...p.clips.c1, id: 'title', mediaId: null },
+        junk: 42
+      }
+    }
+    const r = deserializeProject(JSON.stringify({ project: raw }))
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(Object.keys(r.project.clips).sort()).toEqual(['c1', 'title'])
+  })
+
+  it('sorts keyframes and drops malformed keys', () => {
+    const p = sample()
+    const raw = {
+      ...p,
+      clips: {
+        c1: {
+          ...p.clips.c1,
+          keyframes: {
+            scale: [
+              { t: 3, v: 2, ease: 'linear' },
+              { t: 'bad', v: 1, ease: 'linear' },
+              { t: 1, v: 1, ease: 'hold' }
+            ]
+          }
+        }
+      }
+    }
+    const r = deserializeProject(JSON.stringify({ project: raw }))
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.project.clips.c1.keyframes?.scale).toEqual([
+        { t: 1, v: 1, ease: 'hold' },
+        { t: 3, v: 2, ease: 'linear' }
+      ])
     }
   })
 })

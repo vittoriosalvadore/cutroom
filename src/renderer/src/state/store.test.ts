@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { useEditor } from './store'
 import { resolveDuck } from './selectors'
 import { defaultTrackGate } from '../types'
@@ -402,5 +402,154 @@ describe('markers', () => {
     expect(useEditor.getState().project.markers!.length).toBe(0)
     useEditor.getState().undo()
     expect(useEditor.getState().project.markers!.length).toBe(1)
+  })
+})
+
+describe('head-trim drag (applyTrim with origin)', () => {
+  it('derives keyframes/fades from the drag-start clip, so trimming in and back out is lossless', () => {
+    const st = useEditor.getState()
+    st.setKeyframe('c1', 'scale', 0, 1)
+    st.setKeyframe('c1', 'scale', 4, 5)
+    st.updateAudio('c1', { fadeInSec: 2, fadeOutSec: 2 })
+    const origin = useEditor.getState().project.clips.c1
+    // Simulated pointer moves: drag the head in to 4s (length 1s), then back to 0.
+    st.applyTrim('c1', { startSec: 2, durationSec: 3, inSec: 2 }, origin)
+    st.applyTrim('c1', { startSec: 4, durationSec: 1, inSec: 4 }, origin)
+    st.applyTrim('c1', { startSec: 0, durationSec: 5, inSec: 0 }, origin)
+    const c1 = useEditor.getState().project.clips.c1
+    expect(c1.keyframes!.scale!.map((k) => [k.t, k.v])).toEqual([
+      [0, 1],
+      [4, 5]
+    ])
+    expect(c1.fadeInSec).toBe(2)
+    expect(c1.fadeOutSec).toBe(2)
+  })
+
+  it('without origin still rebases off the current clip (2-arg behaviour)', () => {
+    const st = useEditor.getState()
+    st.setKeyframe('c1', 'scale', 4, 5)
+    st.applyTrim('c1', { startSec: 1, durationSec: 4, inSec: 1 })
+    expect(useEditor.getState().project.clips.c1.keyframes!.scale!.at(-1)!.t).toBe(3)
+  })
+})
+
+describe('dirty tracking', () => {
+  it('loadProject marks a normal open clean and a recovered project dirty', () => {
+    const st = useEditor.getState()
+    st.loadProject(makeProject(), '/x.cutroom')
+    expect(useEditor.getState().project).toBe(useEditor.getState().savedProject)
+    st.loadProject(makeProject(), '/x.cutroom', { dirty: true })
+    expect(useEditor.getState().project).not.toBe(useEditor.getState().savedProject)
+  })
+
+  it('undo back to the saved state reads clean again', () => {
+    const st = useEditor.getState()
+    st.loadProject(makeProject(), null)
+    st.removeClip('c2')
+    expect(useEditor.getState().project).not.toBe(useEditor.getState().savedProject)
+    st.undo()
+    expect(useEditor.getState().project).toBe(useEditor.getState().savedProject)
+    st.redo()
+    st.undo()
+    expect(useEditor.getState().project).toBe(useEditor.getState().savedProject)
+  })
+
+  it('setMediaInfo with already-known values leaves the project untouched', () => {
+    const st = useEditor.getState()
+    st.loadProject(makeProject(), null)
+    st.setMediaInfo('m1', { durationSec: 100 })
+    st.setMediaInfo('m1', { durationSec: 100, width: undefined })
+    expect(useEditor.getState().project).toBe(useEditor.getState().savedProject)
+    st.setMediaInfo('m1', { width: 1280 })
+    expect(useEditor.getState().project.media.m1.width).toBe(1280)
+  })
+
+  it('markSaved marks the captured (written) project, not later edits', () => {
+    const clearRecoveryRing = vi.fn()
+    vi.stubGlobal('window', { cutroom: { clearRecoveryRing } })
+    try {
+      const written = useEditor.getState().project
+      useEditor.getState().removeClip('c3') // edit lands while the save is in flight
+      useEditor.getState().markSaved('/x.cutroom', written)
+      const s = useEditor.getState()
+      expect(s.savedProject).toBe(written)
+      expect(s.project).not.toBe(s.savedProject) // the later edit is still unsaved
+      expect(clearRecoveryRing).not.toHaveBeenCalled()
+      useEditor.getState().markSaved('/x.cutroom')
+      expect(useEditor.getState().savedProject).toBe(useEditor.getState().project)
+      expect(clearRecoveryRing).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe('setMediaInfo placeholder extension', () => {
+  it('extends a 5s pre-probe clip to the real duration but stops at the next clip', () => {
+    const p = makeProject()
+    p.media.m2 = { id: 'm2', name: 'b.wav', path: '/b.wav', kind: 'audio', durationSec: 0 }
+    p.tracks.push({ id: 'a1', kind: 'audio', name: 'A1', height: 52, muted: false, hidden: false })
+    p.clips = {
+      a: { id: 'a', trackId: 'a1', mediaId: 'm2', startSec: 0, durationSec: 5, inSec: 0 },
+      b: { id: 'b', trackId: 'a1', mediaId: 'm2', startSec: 8, durationSec: 5, inSec: 0 },
+      other: { id: 'other', trackId: 'v1', mediaId: 'm1', startSec: 6, durationSec: 1, inSec: 0 }
+    }
+    useEditor.setState({ project: p })
+    useEditor.getState().setMediaInfo('m2', { durationSec: 30 })
+    const clips = useEditor.getState().project.clips
+    expect(clips.a.durationSec).toBe(8) // capped at b's start (other lanes don't count)
+    expect(clips.b.durationSec).toBe(30) // nothing after it on the lane
+  })
+})
+
+describe('ripple markers across tracks', () => {
+  it('rippleDeleteSelected removes parallel cross-track time once and collapses inner markers', () => {
+    const p = makeProject()
+    p.tracks.push({ id: 'a1', kind: 'audio', name: 'A1', height: 52, muted: false, hidden: false })
+    p.clips.a = { id: 'a', trackId: 'a1', mediaId: 'm1', startSec: 5, durationSec: 5, inSec: 0 }
+    p.markers = [
+      { id: 'in', timeSec: 7 },
+      { id: 'after', timeSec: 12 }
+    ]
+    useEditor.setState({ project: p })
+    const st = useEditor.getState()
+    st.setClipSelection(['c2', 'a']) // [5,10) on both V1 and A1
+    st.rippleDeleteSelected()
+    const m = Object.fromEntries(useEditor.getState().project.markers!.map((x) => [x.id, x.timeSec]))
+    expect(m.after).toBe(7) // 12 - 5, not 12 - 10
+    expect(m.in).toBe(5) // inside the removed span -> its start
+  })
+})
+
+describe('auto-cut selection', () => {
+  it('prunes a selection that pointed at a clip the cut deleted', () => {
+    const st = useEditor.getState()
+    st.selectClip('c2')
+    // A range starting exactly at c2's head deletes the c2 id itself.
+    st.applySilenceCuts('c2', [{ startSec: 5, endSec: 6 }])
+    const s = useEditor.getState()
+    expect(s.project.clips.c2).toBeUndefined()
+    expect(s.selectedClipId).toBeNull()
+    expect(s.selectedClipIds.size).toBe(0)
+  })
+
+  it('cutSilenceRange also prunes the selection', () => {
+    const st = useEditor.getState()
+    st.setClipSelection(['c1', 'c2'])
+    st.cutSilenceRange('c2', { startSec: 5, endSec: 6 })
+    const s = useEditor.getState()
+    expect([...s.selectedClipIds]).toEqual(['c1'])
+    expect(s.selectedClipId).toBe('c1')
+  })
+})
+
+describe('streamed subtitle import', () => {
+  it('records one undo step for the first batch and none for follow-ups', () => {
+    const st = useEditor.getState()
+    st.importSubtitles([{ startSec: 0, endSec: 1, text: 'a' }], { recordHistory: true })
+    for (let i = 1; i < 150; i++) st.importSubtitles([{ startSec: i, endSec: i + 1, text: `c${i}` }], { recordHistory: false })
+    expect(useEditor.getState().past.length).toBe(1)
+    useEditor.getState().undo()
+    expect(Object.values(useEditor.getState().project.clips).some((c) => c.role === 'subtitle')).toBe(false)
   })
 })

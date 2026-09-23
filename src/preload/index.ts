@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 
 /** Settings for a video export. */
 export interface ExportStartOptions {
@@ -126,6 +126,9 @@ export interface RecoveryResult {
 // and no Node globals leak into the page.
 const api = {
   ping: (): Promise<string> => ipcRenderer.invoke('app:ping'),
+  /** Absolute filesystem path of a dropped/picked File (replaces the removed
+   *  File.path, gone since Electron 32). Empty string when it has none. */
+  getPathForFile: (f: File): string => webUtils.getPathForFile(f),
   /** Opens the native file picker and resolves to selected absolute paths. */
   openMedia: (): Promise<string[]> => ipcRenderer.invoke('dialog:openMedia'),
   /** Opens a subtitle file and resolves to its raw text, or null if cancelled. */
