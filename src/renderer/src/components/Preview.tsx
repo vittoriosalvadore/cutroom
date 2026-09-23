@@ -73,6 +73,8 @@ export default function Preview() {
     // instead of black-screening. The overlay tells the user what's happening.
     let stableTimer = 0
     const onLost = (e: Event): void => {
+      // A restore that didn't survive its stable window isn't stable.
+      window.clearTimeout(stableTimer)
       comp.handleContextLoss(e)
       setGpuStatus('reconnecting')
     }
@@ -82,6 +84,11 @@ export default function Preview() {
       // Mark stable after a short delay so a flapping context is caught.
       window.clearTimeout(stableTimer)
       stableTimer = window.setTimeout(() => comp.markStable(), 1000)
+      // Nothing else redraws a paused preview: paint the rebuilt context now.
+      if (!comp.restoring) {
+        const l = latest.current
+        safeFrame(comp, audioRef.current, l.project, l.playhead, l.isPlaying)
+      }
     }
     canvas.addEventListener('webglcontextlost', onLost)
     canvas.addEventListener('webglcontextrestored', onRestored)

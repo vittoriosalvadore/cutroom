@@ -236,6 +236,10 @@ export class Compositor {
   private videoTextures = new Map<string, WebGLTexture>()
   private playing = false
   private hidePlaceholders = false
+  /** Re-entrancy guard: a source signalling "frame ready" synchronously from
+   *  inside render() must not start a nested render (layers drawn twice). */
+  private rendering = false
+  private renderRequested = false
 
   // render()/renderExact() re-group clips by trackId on every call (every
   // animation frame during playback). project.clips is replaced wholesale on
@@ -314,7 +318,12 @@ export class Compositor {
     if (!gl) throw new Error('WebGL is not available in this renderer')
     this.gl = gl
     this.needsRender = needsRender
-    this.videos = new VideoPool(needsRender)
+    // An idle-evicted video's texture goes with it.
+    this.videos = new VideoPool(needsRender, (mediaId) => {
+      const tex = this.videoTextures.get(mediaId)
+      if (tex) this.gl.deleteTexture(tex)
+      this.videoTextures.delete(mediaId)
+    })
 
     this.buildGLResources()
 
@@ -588,6 +597,29 @@ export class Compositor {
     // While a lost context is being recovered, drawing would hit a dead GL
     // context. Skip silently — the overlay tells the user what's happening.
     if (this.restore.state === 'reconnecting') return
+    if (this.rendering) {
+      // Nested call (a frame-ready signal fired mid-render): redo it after.
+      this.renderRequested = true
+      return
+    }
+    this.rendering = true
+    try {
+      this.renderPass(project, playheadSec, playing, opts)
+    } finally {
+      this.rendering = false
+    }
+    if (this.renderRequested) {
+      this.renderRequested = false
+      queueMicrotask(() => this.needsRender())
+    }
+  }
+
+  private renderPass(
+    project: Project,
+    playheadSec: number,
+    playing: boolean,
+    opts: { hidePlaceholders?: boolean }
+  ): void {
     this.setSize(project.width, project.height)
     this.playing = playing
     this.hidePlaceholders = opts.hidePlaceholders ?? false

@@ -118,8 +118,10 @@ function canvasToJpeg(canvas: HTMLCanvasElement): Promise<ArrayBuffer> {
 
 /**
  * Returns a cheap integer hash of the rendered canvas content by drawing it
- * to a 32×18 thumbnail and sampling all pixels. Used to detect identical
- * frames and skip re-encoding (huge win for static-image timelines).
+ * to a 32×18 thumbnail and sampling all pixels. A PRE-FILTER only: different
+ * hashes prove the frames differ, but equal hashes do not prove they match (a
+ * moving cursor or a changed caption can vanish in the downscale), so a hash
+ * hit is confirmed by framesIdentical() before a JPEG is reused.
  */
 function frameHash(src: HTMLCanvasElement, thumb: HTMLCanvasElement): number {
   const ctx = thumb.getContext('2d')!
@@ -128,6 +130,17 @@ function frameHash(src: HTMLCanvasElement, thumb: HTMLCanvasElement): number {
   let h = 0
   for (let i = 0; i < d.length; i++) h = (h * 31 + d[i]) & 0x7fffffff
   return h
+}
+
+/** Full-resolution pixel equality of two same-size 2D canvases. */
+function framesIdentical(a: HTMLCanvasElement, b: HTMLCanvasElement): boolean {
+  const w = a.width
+  const h = a.height
+  const da = new Uint32Array(a.getContext('2d')!.getImageData(0, 0, w, h).data.buffer)
+  const db = new Uint32Array(b.getContext('2d')!.getImageData(0, 0, w, h).data.buffer)
+  if (da.length !== db.length) return false
+  for (let i = 0; i < da.length; i++) if (da[i] !== db[i]) return false
+  return true
 }
 
 /**
@@ -198,6 +211,16 @@ export async function exportTimeline(
     const thumb = document.createElement('canvas')
     thumb.width = 32
     thumb.height = 18
+    // Full-res copies of the previous and current frame (GPU-side drawImage,
+    // cheap); pixels are only read back when the thumbnail hash matches.
+    const makeFull = (): HTMLCanvasElement => {
+      const c = document.createElement('canvas')
+      c.width = project.width
+      c.height = project.height
+      return c
+    }
+    let prevFull = makeFull()
+    let curFull = makeFull()
     let lastHash = -1
     let lastJpeg: ArrayBuffer | null = null
 
@@ -209,17 +232,25 @@ export async function exportTimeline(
       }
       await comp.renderExact(project, i / fps)
 
-      // Skip re-encoding if the rendered output is identical to the previous frame.
-      // This gives a massive speedup for static-image timelines (all frames equal).
+      // Skip re-encoding only if the rendered output is PROVABLY identical to
+      // the previous frame (hash pre-filter, then a full-resolution compare).
+      // Still a big speedup for static-image timelines (all frames equal).
       const hash = frameHash(canvas, thumb)
+      const curCtx = curFull.getContext('2d')!
+      curCtx.clearRect(0, 0, curFull.width, curFull.height)
+      curCtx.drawImage(canvas, 0, 0)
       let jpeg: ArrayBuffer
-      if (hash === lastHash && lastJpeg !== null) {
+      if (hash === lastHash && lastJpeg !== null && framesIdentical(curFull, prevFull)) {
         jpeg = lastJpeg
       } else {
         jpeg = await canvasToJpeg(canvas)
         lastHash = hash
         lastJpeg = jpeg
       }
+      // The current frame becomes the comparison baseline for the next one.
+      const baseline = curFull
+      curFull = prevFull
+      prevFull = baseline
 
       const wrote = await window.cutroom.exportFrame(jpeg)
       if (!wrote.ok) {

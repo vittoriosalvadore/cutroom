@@ -44,10 +44,13 @@ export class RestoreMachine {
     return true
   }
 
-  /** Call once a restored context has survived a stable render cycle. */
+  /** Call once a restored context has survived a stable render cycle. Only
+   *  meaningful while 'idle': if the context was lost again in the meantime
+   *  ('reconnecting') it must NOT flip to idle — the next onRestored() would
+   *  then see no loss, skip the rebuild and leave the preview black. */
   markStable(): void {
+    if (this.state !== 'idle') return
     this.retries = 0
-    if (this.state !== 'failed') this.state = 'idle'
   }
 
   /** Reset to initial (e.g. on a deliberate compositor recreate). */

@@ -56,6 +56,26 @@ function ensureDynamicsWorklet(ctx: AudioContext): void {
     })
 }
 
+/**
+ * Node options for the per-track dynamics worklet. channelCount 2 +
+ * 'explicit' makes WebAudio down-mix any source (5.1 → stereo) BEFORE the
+ * processor: its per-channel filter state is stereo-sized, and a 6-channel
+ * input would turn the biquads to NaN and silence the track for good.
+ * Exported so the test can pin this down.
+ */
+export const DYNAMICS_NODE_OPTIONS: AudioWorkletNodeOptions = {
+  numberOfInputs: 2,
+  numberOfOutputs: 1,
+  outputChannelCount: [2],
+  channelCount: 2,
+  channelCountMode: 'explicit',
+  channelInterpretation: 'speakers'
+}
+
+/** Message that makes the dynamics processor return false from process(),
+ *  so the audio thread can release it once the node is disconnected. */
+export const DYNAMICS_DISPOSE_MESSAGE = 'dispose'
+
 // ---------------------------------------------------------------------------
 // Realtime preview audio. The rAF playhead is the sole clock; this engine is a
 // one-way follower. sync() is the audio analogue of compositor.render.
@@ -78,6 +98,9 @@ interface LiveSource {
 }
 
 interface VideoAudio {
+  /** The element this tap was made from; the video pool may dispose and
+   *  recreate a media id's element (idle eviction), making the tap stale. */
+  el: HTMLVideoElement
   source: MediaElementAudioSourceNode
   gain: GainNode
   wanted: boolean
@@ -120,7 +143,17 @@ export class AudioPool {
   /** Lazily route a <video> element's audio through WebAudio. Returns its gain. */
   private ensureVideoAudio(mediaId: string, el: HTMLVideoElement): VideoAudio | null {
     const existing = this.videoAudio.get(mediaId)
-    if (existing) return existing
+    if (existing && existing.el === el) return existing
+    if (existing) {
+      // The pool replaced the element: drop the dead tap and tap the new one.
+      try {
+        existing.source.disconnect()
+        existing.gain.disconnect()
+      } catch {
+        /* already gone */
+      }
+      this.videoAudio.delete(mediaId)
+    }
     try {
       const source = this.ctx.createMediaElementSource(el)
       const gain = this.ctx.createGain()
@@ -128,7 +161,7 @@ export class AudioPool {
       source.connect(gain)
       gain.connect(this.master)
       el.muted = false // audio now flows through WebAudio; controlled by `gain`
-      const entry: VideoAudio = { source, gain, wanted: true }
+      const entry: VideoAudio = { el, source, gain, wanted: true }
       this.videoAudio.set(mediaId, entry)
       return entry
     } catch {
@@ -171,11 +204,7 @@ export class AudioPool {
       !!track.gate?.enabled || !!track.eq?.enabled || !!track.comp?.enabled || resolved != null
     if (needsFx && !chain.dynamics && workletReady && !workletFailed) {
       try {
-        const node = new AudioWorkletNode(this.ctx, 'cutroom-dynamics', {
-          numberOfInputs: 2,
-          numberOfOutputs: 1,
-          outputChannelCount: [2]
-        })
+        const node = new AudioWorkletNode(this.ctx, 'cutroom-dynamics', DYNAMICS_NODE_OPTIONS)
         // The worklet starts passthrough (gain 1), so swapping it in is
         // sample-continuous. Disconnect ONLY the input->panner edge so any
         // sidechain taps from this input (it may be a duck trigger) survive.
@@ -429,6 +458,7 @@ export class AudioPool {
     for (const chain of this.trackChains.values()) {
       try {
         chain.input.disconnect()
+        chain.dynamics?.port.postMessage(DYNAMICS_DISPOSE_MESSAGE)
         chain.dynamics?.disconnect()
         chain.panner.disconnect()
       } catch {

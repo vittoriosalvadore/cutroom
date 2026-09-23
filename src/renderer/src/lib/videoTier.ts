@@ -38,3 +38,20 @@ export async function resolveTier(
     return 'video-element'
   }
 }
+
+/**
+ * True when an MP4 track's display matrix (tkhd, 3x3 with 16.16 fixed-point
+ * a/b/c/d) rotates or mirrors the picture — e.g. portrait phone footage stored
+ * landscape with a 90° matrix. The <video> element applies it; decoded
+ * VideoFrames do NOT, so the WebCodecs tier must decline such tracks (report
+ * unsupported) and leave them on the element tier. Scale/translation alone is
+ * ignored, like Chromium does. A missing matrix counts as identity.
+ */
+export function hasDisplayRotation(matrix: ArrayLike<number> | null | undefined): boolean {
+  if (!matrix || matrix.length < 5) return false
+  const a = matrix[0]
+  const b = matrix[1]
+  const c = matrix[3]
+  const d = matrix[4]
+  return b !== 0 || c !== 0 || a < 0 || d < 0
+}
