@@ -490,7 +490,7 @@ export default function Timeline() {
             sctx.save()
             roundRectPath(sctx, x, cy, cw, ch, 6)
             sctx.clip()
-            const statusLabel = entry.status === 'error' ? '! decode error' : 'loading...'
+            const statusLabel = entry.status === 'error' ? t('! decode error') : t('loading...')
             sctx.font = '10px system-ui, sans-serif'
             sctx.textBaseline = 'middle'
             sctx.fillStyle =
@@ -555,10 +555,10 @@ export default function Timeline() {
         sctx.font = '11px system-ui, sans-serif'
         sctx.textBaseline = 'top'
         const label = clip.text
-          ? clip.text.content.split('\n')[0] || (isSubtitle ? 'Subtitle' : 'Title')
+          ? clip.text.content.split('\n')[0] || (isSubtitle ? t('Subtitle') : t('Title'))
           : media
             ? media.name
-            : 'clip'
+            : t('clip')
         // Pin the label to the visible left edge when the clip starts off-screen.
         sctx.fillText(label, Math.max(x, GUTTER) + 7, cy + 6)
         sctx.restore()
@@ -1073,11 +1073,11 @@ export default function Timeline() {
   return (
     <section className="timeline">
       <div className="timeline-head">
-        <span>Timeline</span>
+        <span>{t('Timeline')}</span>
         <span className="hint">
-          drag to move · drag edges to trim · S split · X crossfade · M marker · ,/. jump · shift-click
-          multi-select · drag empty area to box-select · Ctrl+A all · Ctrl+C/V copy · Del remove · wheel
-          scroll · Ctrl+wheel zoom · track header: drag to reorder, bottom edge to resize, right-click for menu
+          {t(
+            'drag to move · drag edges to trim · S split · X crossfade · M marker · ,/. jump · J/K/L shuttle · ←/→ frame step · shift-click multi-select · drag empty area to box-select · Ctrl+A all · Ctrl+C/V copy · Del remove · wheel scroll · Ctrl+wheel zoom · track header: drag to reorder, bottom edge to resize, right-click for menu'
+          )}
         </span>
         <button
           className="btn small"

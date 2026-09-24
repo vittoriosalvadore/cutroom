@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react'
 import { useEditor } from '../state/store'
 import { autoReframe, type ReframeProgress } from '../lib/autoReframe'
+import { useT } from '../lib/i18n'
 
 type Status = 'idle' | 'running' | 'error'
 
@@ -17,6 +18,7 @@ export default function AutoReframeModal() {
   const [progress, setProgress] = useState<ReframeProgress>({ stage: 'sampling' })
   const [error, setError] = useState<string | null>(null)
   const cancelRef = useRef(false)
+  const t = useT()
 
   if (!open) return null
 
@@ -25,12 +27,12 @@ export default function AutoReframeModal() {
   const pct = Math.round((progress.progress ?? 0) * 100)
   const phase =
     progress.stage === 'loading'
-      ? `Loading AI model… ${pct}%`
+      ? `${t('Loading AI model…')} ${pct}%`
       : progress.stage === 'sampling'
-        ? `Sampling frames… ${pct}%`
+        ? `${t('Sampling frames…')} ${pct}%`
         : progress.stage === 'detecting'
-          ? `Tracking subject… ${pct}%`
-          : 'Done'
+          ? `${t('Tracking subject…')} ${pct}%`
+          : t('Done')
 
   const run = async (): Promise<void> => {
     if (!clip) return
@@ -53,7 +55,7 @@ export default function AutoReframeModal() {
       if (e instanceof Error && e.message === 'cancelled') {
         setStatus('idle') // user stopped it; stay on the options screen
       } else {
-        setError(e instanceof Error ? e.message : 'Auto-reframe failed.')
+        setError(e instanceof Error ? e.message : t('Auto-reframe failed.'))
         setStatus('error')
       }
     }
@@ -72,10 +74,10 @@ export default function AutoReframeModal() {
   return (
     <div className="modal-backdrop" onClick={close}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <div className="modal-head">AI Auto-Reframe</div>
+        <div className="modal-head">{t('AI Auto-Reframe')}</div>
         <div className="modal-body">
           {!ok ? (
-            <p className="modal-error">Select a video clip first.</p>
+            <p className="modal-error">{t('Select a video clip first.')}</p>
           ) : status === 'running' ? (
             <div className="export-progress">
               <div className="bar">
@@ -86,25 +88,27 @@ export default function AutoReframeModal() {
           ) : (
             <>
               <p className="modal-note">
-                Tracks the subject across the clip and adds position keyframes that keep it framed. Runs
-                entirely on your machine — the first run downloads a small detection model.
+                {t(
+                  'Tracks the subject across the clip and adds position keyframes that keep it framed. Runs entirely on your machine — the first run downloads a small detection model.'
+                )}
               </p>
               <div className="set-row">
                 <div className="set-text">
-                  <div className="set-label">Follow</div>
+                  <div className="set-label">{t('Follow')}</div>
                 </div>
                 <div className="set-seg">
                   <button className={target === 'person' ? 'active' : ''} onClick={() => setTarget('person')}>
-                    Person
+                    {t('Person')}
                   </button>
                   <button className={target === 'auto' ? 'active' : ''} onClick={() => setTarget('auto')}>
-                    Main subject
+                    {t('Main subject')}
                   </button>
                 </div>
               </div>
               <label className="insp-field">
                 <span className="insp-label">
-                  Zoom<em>{Math.round(zoom * 100)}%</em>
+                  {t('Zoom')}
+                  <em>{Math.round(zoom * 100)}%</em>
                 </span>
                 <input
                   type="range"
@@ -121,11 +125,11 @@ export default function AutoReframeModal() {
         </div>
         <div className="modal-foot">
           <button className="btn" onClick={close}>
-            {status === 'running' ? 'Stop' : 'Cancel'}
+            {status === 'running' ? t('Stop') : t('Cancel')}
           </button>
           {ok && status !== 'running' && (
             <button className="btn primary" onClick={run}>
-              {status === 'error' ? 'Retry' : 'Analyze & apply'}
+              {status === 'error' ? t('Retry') : t('Analyze & apply')}
             </button>
           )}
         </div>

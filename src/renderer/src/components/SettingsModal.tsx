@@ -113,14 +113,14 @@ export default function SettingsModal() {
             {tab === 'Performance' && (
               <>
                 <Toggle
-                  label="Hardware acceleration"
-                  desc="Use the GPU for decoding & compositing. Requires a restart to take effect."
+                  label={t('Hardware acceleration')}
+                  desc={t('Use the GPU for decoding & compositing. Requires a restart to take effect.')}
                   checked={s.hardwareAcceleration}
                   onChange={(v) => s.set({ hardwareAcceleration: v })}
                 />
                 <Toggle
-                  label="Show placeholders in preview"
-                  desc="Display a card for clips that can't be decoded yet (e.g. while a video buffers)."
+                  label={t('Show placeholders in preview')}
+                  desc={t("Display a card for clips that can't be decoded yet (e.g. while a video buffers).")}
                   checked={s.showPlaceholders}
                   onChange={(v) => s.set({ showPlaceholders: v })}
                 />
@@ -141,20 +141,20 @@ export default function SettingsModal() {
             {tab === 'Editing' && (
               <>
                 <Toggle
-                  label="Snapping"
-                  desc="Snap clip edges to other clips and the playhead while dragging."
+                  label={t('Snapping')}
+                  desc={t('Snap clip edges to other clips and the playhead while dragging.')}
                   checked={s.snapping}
                   onChange={(v) => s.set({ snapping: v })}
                 />
                 <Toggle
-                  label="Show waveforms"
-                  desc="Draw audio waveforms on timeline clips."
+                  label={t('Show waveforms')}
+                  desc={t('Draw audio waveforms on timeline clips.')}
                   checked={s.showWaveforms}
                   onChange={(v) => s.set({ showWaveforms: v })}
                 />
                 <RangeRow
-                  label="Default fade length"
-                  desc="Used for the X crossfade and new fades."
+                  label={t('Default fade length')}
+                  desc={t('Used for the X crossfade and new fades.')}
                   value={s.defaultFadeSec}
                   min={0.1}
                   max={2}
@@ -168,19 +168,19 @@ export default function SettingsModal() {
             {tab === 'Export' && (
               <>
                 <Segmented
-                  label="Encoder speed"
-                  desc="Faster encodes are larger; slower encodes are smaller at the same quality."
+                  label={t('Encoder speed')}
+                  desc={t('Faster encodes are larger; slower encodes are smaller at the same quality.')}
                   value={s.exportPreset}
                   options={[
-                    { value: 'veryfast', label: 'Faster' },
-                    { value: 'medium', label: 'Balanced' },
-                    { value: 'slow', label: 'Best' }
+                    { value: 'veryfast', label: t('Faster') },
+                    { value: 'medium', label: t('Balanced') },
+                    { value: 'slow', label: t('Best') }
                   ]}
                   onChange={(v) => s.set({ exportPreset: v })}
                 />
                 <RangeRow
-                  label="Quality"
-                  desc="Lower CRF = higher quality & bigger file. 20 is a good default."
+                  label={t('Quality')}
+                  desc={t('Lower CRF = higher quality & bigger file. 20 is a good default.')}
                   value={s.exportCrf}
                   min={14}
                   max={28}
@@ -197,17 +197,17 @@ export default function SettingsModal() {
                   label={t('Theme')}
                   value={s.theme}
                   options={[
-                    { value: 'graphite', label: 'Graphite' },
-                    { value: 'midnight', label: 'Midnight' },
-                    { value: 'slate', label: 'Slate' },
-                    { value: 'contrast', label: 'Contrast' }
+                    { value: 'graphite', label: t('Graphite') },
+                    { value: 'midnight', label: t('Midnight') },
+                    { value: 'slate', label: t('Slate') },
+                    { value: 'contrast', label: t('Contrast') }
                   ]}
                   onChange={(v) => s.set({ theme: v })}
                 />
                 <div className="set-row">
                   <div className="set-text">
-                    <div className="set-label">Accent colour</div>
-                    <div className="set-desc">Drives primary buttons and selection.</div>
+                    <div className="set-label">{t('Accent colour')}</div>
+                    <div className="set-desc">{t('Drives primary buttons and selection.')}</div>
                   </div>
                   <div className="set-accents">
                     {ACCENTS.map((c) => (
@@ -219,7 +219,7 @@ export default function SettingsModal() {
                         onClick={() => s.set({ accent: c })}
                       />
                     ))}
-                    <label className="set-swatch set-swatch-custom" title="Custom colour">
+                    <label className="set-swatch set-swatch-custom" title={t('Custom colour')}>
                       <input type="color" value={s.accent} onChange={(e) => s.set({ accent: e.target.value })} />
                     </label>
                   </div>
@@ -228,14 +228,14 @@ export default function SettingsModal() {
                   label={t('Density')}
                   value={s.density}
                   options={[
-                    { value: 'comfortable', label: 'Comfortable' },
-                    { value: 'compact', label: 'Compact' }
+                    { value: 'comfortable', label: t('Comfortable') },
+                    { value: 'compact', label: t('Compact') }
                   ]}
                   onChange={(v) => s.set({ density: v })}
                 />
                 <Toggle
                   label={t('Reduce motion')}
-                  desc="Disable UI transitions and animations."
+                  desc={t('Disable UI transitions and animations.')}
                   checked={s.reduceMotion}
                   onChange={(v) => s.set({ reduceMotion: v })}
                 />
@@ -253,7 +253,7 @@ export default function SettingsModal() {
           <button
             className="btn"
             onClick={() => {
-              if (confirm('Reset all options to their defaults?')) s.reset()
+              if (confirm(t('Reset all options to their defaults?'))) s.reset()
             }}
           >
             {t('Reset to defaults')}

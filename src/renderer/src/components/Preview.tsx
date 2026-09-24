@@ -5,6 +5,7 @@ import { Compositor } from '../lib/compositor'
 import { AudioPool } from '../lib/audioPool'
 import { resumeAudioContext } from '../lib/audioContext'
 import { previewScale } from '../lib/previewScale'
+import { hasVideoAt, isRealtimeRate, stepShuttleHold, type ShuttleHold } from '../lib/transport'
 import { useT } from '../lib/i18n'
 import type { Project } from '../types'
 
@@ -51,15 +52,21 @@ export default function Preview() {
 
   const project = useEditor((s) => s.project)
   const playhead = useEditor((s) => s.playheadSec)
-  const isPlaying = useEditor((s) => s.isPlaying)
+  // Only 1× forward is real playback. J/K/L shuttle rates (reverse, 2×, 4×) ride
+  // the paused/scrub path with audio silent, paced by `hold` so each seeked
+  // frame gets to land before the next one is requested (lib/transport).
+  const isPlaying = useEditor((s) => s.isPlaying && isRealtimeRate(s.shuttleRate))
+  const shuttling = useEditor((s) => s.isPlaying && !isRealtimeRate(s.shuttleRate))
+  const hold = useRef<ShuttleHold>({ time: 0, at: 0, landed: true })
   const showPlaceholders = useSettings((s) => s.showPlaceholders)
   const previewQuality = useSettings((s) => s.previewQuality)
   const t = useT()
 
   // Keep the newest state reachable from async redraws (e.g. an image finishing
   // loading or a video seek completing) without re-creating the compositor.
+  // While shuttling, async redraws show the HELD time (the frame in flight).
   const latest = useRef({ project, playhead, isPlaying })
-  latest.current = { project, playhead, isPlaying }
+  latest.current = { project, playhead: shuttling ? hold.current.time : playhead, isPlaying }
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -67,6 +74,7 @@ export default function Preview() {
     let comp: Compositor
     try {
       comp = new Compositor(canvas, () => {
+        hold.current.landed = true // a decoded frame / finished seek arrived
         const l = latest.current
         safeFrame(compRef.current, audioRef.current, l.project, l.playhead, l.isPlaying)
       })
@@ -130,15 +138,31 @@ export default function Preview() {
   }, [])
 
   useEffect(() => {
-    safeFrame(compRef.current, audioRef.current, project, playhead, isPlaying)
-  }, [project, playhead, isPlaying, showPlaceholders, previewQuality])
+    let time = playhead
+    if (shuttling) {
+      const step = stepShuttleHold(
+        hold.current,
+        playhead,
+        performance.now(),
+        hasVideoAt(project, hold.current.time),
+        2 / (project.fps || 30)
+      )
+      hold.current = step.hold
+      if (!step.render) return // let the in-flight frame land first
+      time = step.hold.time
+      latest.current.playhead = time
+    } else {
+      hold.current = { time: playhead, at: 0, landed: true }
+    }
+    safeFrame(compRef.current, audioRef.current, project, time, isPlaying)
+  }, [project, playhead, isPlaying, shuttling, showPlaceholders, previewQuality])
 
   return (
     <section className="preview">
       <div className="monitor-inner">
         {error ? (
           <div className="ph-frame">
-            <div className="note">Preview unavailable: {error}</div>
+            <div className="note">{t('Preview unavailable: {error}', { error })}</div>
           </div>
         ) : (
           <canvas ref={canvasRef} className="preview-canvas" />
@@ -148,13 +172,13 @@ export default function Preview() {
           {previewQuality !== 'full' && ` · ${t('Preview')} ${previewQuality === 'half' ? '½' : '¼'}`}
         </div>
         {gpuStatus === 'reconnecting' && (
-          <div className="monitor-overlay warn">Reconnecting GPU…</div>
+          <div className="monitor-overlay warn">{t('Reconnecting GPU…')}</div>
         )}
         {gpuStatus === 'failed' && (
           <div className="monitor-overlay warn">
-            GPU context lost.{' '}
+            {t('GPU context lost.')}{' '}
             <button className="btn small" onClick={() => window.location.reload()}>
-              Reload
+              {t('Reload')}
             </button>
           </div>
         )}

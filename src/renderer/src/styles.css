@@ -411,6 +411,13 @@ input[type='color']:hover {
   color: var(--accent-2);
   letter-spacing: 0.5px;
 }
+/* J/K/L shuttle speed badge next to Play (only shown off 1×). */
+.shuttle-rate {
+  font-family: var(--font-mono);
+  font-size: var(--fs-12);
+  color: var(--accent-2);
+  white-space: nowrap;
+}
 .zoom {
   display: flex;
   align-items: center;

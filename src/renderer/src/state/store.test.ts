@@ -651,3 +651,18 @@ describe('track management', () => {
     expect(useEditor.getState().selectedTrackId).toBeNull()
   })
 })
+
+describe('shuttle transport', () => {
+  it('setShuttle plays at the rate; setPlaying (Space / K) resets it to 1×', () => {
+    const st = useEditor.getState()
+    st.setShuttle(-2)
+    expect(useEditor.getState().isPlaying).toBe(true)
+    expect(useEditor.getState().shuttleRate).toBe(-2)
+    st.setPlaying(false)
+    expect(useEditor.getState().isPlaying).toBe(false)
+    expect(useEditor.getState().shuttleRate).toBe(1)
+    st.setShuttle(4)
+    st.setPlaying(true)
+    expect(useEditor.getState().shuttleRate).toBe(1)
+  })
+})

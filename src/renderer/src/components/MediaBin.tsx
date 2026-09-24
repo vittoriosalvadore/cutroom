@@ -1,6 +1,9 @@
 import { useEditor } from '../state/store'
+import { useT } from '../lib/i18n'
 
 const ICON: Record<string, string> = { video: '🎬', audio: '♪', image: '🖼' }
+// English labels (i18n keys) for the media kind shown under each name.
+const KIND_LABEL: Record<string, string> = { video: 'Video', audio: 'Audio', image: 'Image' }
 
 export default function MediaBin() {
   // Only `media` drives the rendered list. Tracks + playhead are read lazily in
@@ -8,6 +11,7 @@ export default function MediaBin() {
   // only the playhead changes).
   const media = useEditor((s) => s.project.media)
   const importMedia = useEditor((s) => s.importMedia)
+  const t = useT()
 
   const onImport = async (): Promise<void> => {
     const paths = await window.cutroom.openMedia()
@@ -27,27 +31,31 @@ export default function MediaBin() {
   return (
     <aside className="bin">
       <div className="panel-head">
-        <span>Media Bin</span>
+        <span>{t('Media Bin')}</span>
         <button className="btn small" onClick={onImport}>
-          + Import
+          + {t('Import')}
         </button>
       </div>
       <div className="bin-list">
         {items.length === 0 && (
-          <div className="empty">No media yet.{'\n'}Click Import or drop files here.</div>
+          <div className="empty">
+            {t('No media yet.')}
+            {'\n'}
+            {t('Click Import or drop files here.')}
+          </div>
         )}
         {items.map((m) => (
           <div
             key={m.id}
             className="bin-item"
-            title="Double-click to add at the playhead"
+            title={t('Double-click to add at the playhead')}
             onDoubleClick={() => onAdd(m.id, m.kind)}
           >
             <div className={`thumb ${m.kind}`}>{ICON[m.kind] ?? '🎬'}</div>
             <div className="meta">
               <div className="name">{m.name}</div>
               <div className="sub">
-                {m.kind}
+                {t(KIND_LABEL[m.kind] ?? m.kind)}
                 {m.durationSec ? ` · ${m.durationSec.toFixed(1)}s` : ''}
               </div>
             </div>

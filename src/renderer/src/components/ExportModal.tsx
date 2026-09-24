@@ -138,7 +138,7 @@ export default function ExportModal() {
     } else if (result.error === 'Export cancelled.') {
       setStatus('idle')
     } else {
-      setError(result.error ?? 'Export failed.')
+      setError(result.error ?? t('Export failed.'))
       setStatus('error')
     }
   }

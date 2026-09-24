@@ -45,11 +45,10 @@ candidate features. Ordered roughly by how much they came up. Update as we go.
 
 ## Candidate features (Vegas-style, not yet built — rough priority)
 
-1. **i18n full coverage** — framework + switcher + chrome shipped; sweep the remaining
-   Inspector/Transport/MediaBin strings into the dictionary (incremental).
-2. **Proxy / optimized media** for heavy footage.
-3. **Transport niceties** — J/K/L shuttle, frame-step, audio scrubbing.
-4. **Color curves / scopes** — beyond primary grade: RGB curves, histogram/vectorscope.
+1. **Proxy / optimized media** for heavy footage.
+2. **Audio scrubbing** — audible audio while dragging the playhead or shuttling off 1×
+   (J/K/L shuttle + frame step shipped; off-1× shuttle is silent).
+3. **Color curves / scopes** — beyond primary grade: RGB curves, histogram/vectorscope.
 
 ## Done
 
@@ -105,3 +104,8 @@ candidate features. Ordered roughly by how much they came up. Update as we go.
   4–40 Mbps, plus named presets (YouTube, Reels/TikTok, master, small 720p); remembered.
 - **Hardware export encoder** — NVENC / QSV / AMF / VideoToolbox probed once in main (listed +
   tiny test encode); Encoder = Auto / Software / detected; a failed hw encode retries in software.
+- **Transport niceties** — J/K/L shuttle (L/J forward/reverse, repeat for 2×/4×, K pauses; off-1×
+  rates scrub the preview frame-paced with audio silent; rate badge in the transport), ←/→ frame
+  step and Shift+←/→ one second. Stops at the timeline end / at 0.
+- **i18n full coverage** — every Inspector/Transport/MediaBin/Timeline/modal string goes through
+  `t()` with ES/FR/DE translations and `{name}` interpolation; a test fails on any untranslated key.

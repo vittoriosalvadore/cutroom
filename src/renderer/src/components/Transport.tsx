@@ -1,5 +1,7 @@
 import { useEditor } from '../state/store'
 import { parseSubtitles, projectToCues, toSrt } from '../lib/subtitles'
+import { useT } from '../lib/i18n'
+import { formatShuttleRate } from '../lib/transport'
 import Meter from './Meter'
 
 /** SMPTE-ish timecode HH:MM:SS:FF (frames assume the project fps). */
@@ -12,6 +14,7 @@ function timecode(sec: number, fps: number): string {
 
 export default function Transport() {
   const isPlaying = useEditor((s) => s.isPlaying)
+  const shuttleRate = useEditor((s) => s.shuttleRate)
   const playhead = useEditor((s) => s.playheadSec)
   const fps = useEditor((s) => s.project.fps)
   const pxPerSec = useEditor((s) => s.pxPerSec)
@@ -28,6 +31,8 @@ export default function Transport() {
   const redo = useEditor((s) => s.redo)
   const canUndo = useEditor((s) => s.past.length > 0)
   const canRedo = useEditor((s) => s.future.length > 0)
+  const t = useT()
+  const shuttleLabel = isPlaying ? formatShuttleRate(shuttleRate) : ''
 
   const onImportSrt = async (): Promise<void> => {
     const content = await window.cutroom.openSubtitle()
@@ -44,57 +49,62 @@ export default function Transport() {
 
   return (
     <div className="transport">
-      <button className="btn" title="Go to start (Home)" onClick={() => setPlayhead(0)}>
+      <button className="btn" title={t('Go to start (Home)')} onClick={() => setPlayhead(0)}>
         ⏮
       </button>
       <button
         className="btn primary"
-        title="Play / Pause (Space)"
+        title={t('Play / Pause (Space) · Shuttle J/K/L · Frame step ←/→ (Shift = 1 s)')}
         onClick={() => setPlaying(!isPlaying)}
       >
-        {isPlaying ? '⏸ Pause' : '▶ Play'}
+        {isPlaying ? `⏸ ${t('Pause')}` : `▶ ${t('Play')}`}
       </button>
-      <button className="btn" title="Split clips at playhead (S)" onClick={() => splitAtPlayhead()}>
-        ✂ Split
+      {shuttleLabel && (
+        <span className="shuttle-rate" title={t('Shuttle speed (J/K/L)')}>
+          {shuttleLabel}
+        </span>
+      )}
+      <button className="btn" title={t('Split clips at playhead (S)')} onClick={() => splitAtPlayhead()}>
+        ✂ {t('Split')}
       </button>
-      <button className="btn" title="Undo (Ctrl+Z)" disabled={!canUndo} onClick={() => undo()}>
+      <button className="btn" title={`${t('Undo')} (Ctrl+Z)`} disabled={!canUndo} onClick={() => undo()}>
         ⟲
       </button>
-      <button className="btn" title="Redo (Ctrl+Shift+Z)" disabled={!canRedo} onClick={() => redo()}>
+      <button className="btn" title={`${t('Redo')} (Ctrl+Shift+Z)`} disabled={!canRedo} onClick={() => redo()}>
         ⟳
       </button>
       <span className="tdivider" />
-      <button className="btn" title="Add a title at the playhead" onClick={() => addTitle(playhead)}>
-        T Title
+      <button className="btn" title={t('Add a title at the playhead')} onClick={() => addTitle(playhead)}>
+        T {t('Title')}
       </button>
-      <button className="btn" title="Import subtitles (.srt / .vtt)" onClick={onImportSrt}>
+      <button className="btn" title={t('Import subtitles (.srt / .vtt)')} onClick={onImportSrt}>
         ⬇ SRT
       </button>
-      <button className="btn" title="Export subtitles to .srt" onClick={onExportSrt}>
+      <button className="btn" title={t('Export subtitles to .srt')} onClick={onExportSrt}>
         ⬆ SRT
       </button>
       <button
         className="btn"
-        title="Auto-generate subtitles from the selected clip's audio (on-device Whisper)"
+        title={t("Auto-generate subtitles from the selected clip's audio (on-device Whisper)")}
         onClick={() => setTranscribeOpen(true)}
       >
-        ✨ AI Subs
+        ✨ {t('AI Subs')}
       </button>
       <button
         className="btn"
-        title="Detect and ripple-delete quiet ranges in the selected clip's audio"
+        title={t("Detect and ripple-delete quiet ranges in the selected clip's audio")}
         onClick={() => setAutoCutSilenceOpen(true)}
       >
-        🔇 Cut Silence
+        🔇 {t('Cut Silence')}
       </button>
       <div className="timecode">{timecode(playhead, fps)}</div>
       <div className="spacer" />
       <Meter />
-      <button className="btn primary" title="Export the timeline to a video file" onClick={() => setExportOpen(true)}>
-        ⤓ Export
+      <button className="btn primary" title={t('Export the timeline to a video file')} onClick={() => setExportOpen(true)}>
+        ⤓ {t('Export')}
       </button>
       <label className="zoom">
-        Zoom
+        {t('Zoom')}
         <input
           type="range"
           min={10}

@@ -13,9 +13,7 @@ export function removeTrackWithConfirm(trackId: string): boolean {
   if (!track || !canRemoveTrack(st.project.tracks, trackId)) return false
   const count = Object.values(st.project.clips).filter((c) => c.trackId === trackId).length
   if (count > 0) {
-    const msg = t('Delete track "{name}" and its {n} clip(s)?')
-      .replace('{name}', track.name)
-      .replace('{n}', String(count))
+    const msg = t('Delete track "{name}" and its {n} clip(s)?', { name: track.name, n: count })
     if (!window.confirm(msg)) return false
   }
   st.removeTrack(trackId)

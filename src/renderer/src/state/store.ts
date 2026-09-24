@@ -155,6 +155,8 @@ interface EditorState {
   project: Project
   playheadSec: number
   isPlaying: boolean
+  /** Signed J/K/L shuttle rate while playing: 1 = normal, ±2/±4 fast, <0 reverse (see lib/transport). */
+  shuttleRate: number
   /** Timeline zoom: horizontal pixels per second. */
   pxPerSec: number
   /** The PRIMARY selected clip (Inspector target). Always a member of selectedClipIds, null iff empty. */
@@ -284,7 +286,10 @@ interface EditorState {
 
   // --- transport / view ---
   setPlayhead: (sec: number) => void
+  /** Play/pause at normal speed (resets any shuttle rate). */
   setPlaying: (playing: boolean) => void
+  /** Play at a signed shuttle rate (J/K/L); see lib/transport. */
+  setShuttle: (rate: number) => void
   setZoom: (pxPerSec: number) => void
 
   // --- history (undo/redo) ---
@@ -494,6 +499,7 @@ export const useEditor = create<EditorState>((set) => {
   projectFilePath: null,
   playheadSec: 0,
   isPlaying: false,
+  shuttleRate: 1,
   pxPerSec: 80,
   selectedClipId: null,
   selectedClipIds: new Set<string>(),
@@ -1311,7 +1317,8 @@ export const useEditor = create<EditorState>((set) => {
     }),
 
   setPlayhead: (sec) => set({ playheadSec: Math.max(0, sec) }),
-  setPlaying: (playing) => set({ isPlaying: playing }),
+  setPlaying: (playing) => set({ isPlaying: playing, shuttleRate: 1 }),
+  setShuttle: (rate) => set({ isPlaying: true, shuttleRate: rate }),
   setZoom: (pxPerSec) => set({ pxPerSec: Math.min(600, Math.max(10, pxPerSec)) }),
 
   snapshot: () =>
@@ -1385,7 +1392,8 @@ export const useEditor = create<EditorState>((set) => {
       selectedMarkerId: null,
       selectedTrackId: null,
       playheadSec: 0,
-      isPlaying: false
+      isPlaying: false,
+      shuttleRate: 1
     })
   },
 
@@ -1404,7 +1412,8 @@ export const useEditor = create<EditorState>((set) => {
       selectedMarkerId: null,
       selectedTrackId: null,
       playheadSec: 0,
-      isPlaying: false
+      isPlaying: false,
+      shuttleRate: 1
     })
   },
 

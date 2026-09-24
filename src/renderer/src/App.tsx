@@ -7,6 +7,7 @@ import { serializeProject } from './lib/projectFile'
 import { timelineDuration } from './lib/exporter'
 import { createNewProject, openProject, saveProject } from './lib/projectIO'
 import { useT } from './lib/i18n'
+import { advancePlayhead, nextShuttleRate, playStartSec, stepFrames } from './lib/transport'
 import MediaBin from './components/MediaBin'
 import Preview from './components/Preview'
 import Timeline from './components/Timeline'
@@ -21,9 +22,10 @@ import AutoCutSilenceModal from './components/AutoCutSilenceModal'
 
 /**
  * Drives the playhead while playing. Uses requestAnimationFrame and reads the
- * latest playhead via getState() each tick to avoid stale-closure drift.
- * Playback stops at the end of the timeline; pressing play while parked at (or
- * past) the end restarts from 0.
+ * latest playhead + shuttle rate via getState() each tick to avoid stale-closure
+ * drift (a J/K/L rate change mid-play doesn't restart the loop). Forward play
+ * stops at the timeline end, reverse at 0; pressing play while parked at (or
+ * past) the end restarts from 0 (lib/transport).
  */
 function usePlaybackClock(): void {
   const isPlaying = useEditor((s) => s.isPlaying)
@@ -32,27 +34,24 @@ function usePlaybackClock(): void {
 
   useEffect(() => {
     if (!isPlaying) return
-    const start = useEditor.getState()
-    const startEnd = timelineDuration(start.project)
-    if (startEnd <= 0) {
-      start.setPlaying(false) // nothing to play
+    const st0 = useEditor.getState()
+    const start = playStartSec(st0.playheadSec, st0.shuttleRate, timelineDuration(st0.project))
+    if (start === null) {
+      st0.setPlaying(false) // nothing to play
       return
     }
-    if (start.playheadSec >= startEnd - 1e-3) start.setPlayhead(0)
+    if (start !== st0.playheadSec) st0.setPlayhead(start)
     last.current = performance.now()
     const tick = (now: number): void => {
       const dt = (now - last.current) / 1000
       last.current = now
       const st = useEditor.getState()
-      // Re-read the end each tick: edits during playback can move it.
-      const end = timelineDuration(st.project)
-      const next = st.playheadSec + dt
-      if (next >= end) {
-        st.setPlayhead(Math.max(0, end))
+      const next = advancePlayhead(st.playheadSec, dt, st.shuttleRate, timelineDuration(st.project))
+      st.setPlayhead(next.sec)
+      if (next.stop) {
         st.setPlaying(false)
         return
       }
-      st.setPlayhead(next)
       raf.current = requestAnimationFrame(tick)
     }
     raf.current = requestAnimationFrame(tick)
@@ -301,6 +300,21 @@ function useShortcuts(): void {
       if (e.code === 'Space') {
         e.preventDefault()
         st.setPlaying(!st.isPlaying)
+      } else if (e.key === 'l' || e.key === 'L') {
+        // L / J: shuttle forward / reverse; repeat presses double up to 4×.
+        st.setShuttle(nextShuttleRate(st.shuttleRate, st.isPlaying, 1))
+      } else if (e.key === 'j' || e.key === 'J') {
+        st.setShuttle(nextShuttleRate(st.shuttleRate, st.isPlaying, -1))
+      } else if (e.key === 'k' || e.key === 'K') {
+        st.setPlaying(false)
+      } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        // Frame step (Shift = one second), always from a paused playhead.
+        e.preventDefault()
+        const dir = e.key === 'ArrowRight' ? 1 : -1
+        const fps = st.project.fps
+        const frames = e.shiftKey ? Math.max(1, Math.round(fps)) : 1
+        if (st.isPlaying) st.setPlaying(false)
+        st.setPlayhead(stepFrames(useEditor.getState().playheadSec, fps, dir * frames))
       } else if (e.key === 's' || e.key === 'S') {
         st.splitAtPlayhead()
       } else if (e.key === 'm' || e.key === 'M') {
@@ -400,15 +414,15 @@ export default function App() {
           Cutroom<span className="badge">MVP</span>
         </div>
         <div className="filebar">
-          <button className="btn small" title="New project (Ctrl+N)" onClick={() => createNewProject()}>
+          <button className="btn small" title={`${t('New project')} (Ctrl+N)`} onClick={() => createNewProject()}>
             {t('New')}
           </button>
-          <button className="btn small" title="Open project (Ctrl+O)" onClick={() => void openProject()}>
+          <button className="btn small" title={`${t('Open project')} (Ctrl+O)`} onClick={() => void openProject()}>
             {t('Open')}
           </button>
           <button
             className={`btn small ${dirty ? 'active' : ''}`}
-            title="Save (Ctrl+S) · Save As (Ctrl+Shift+S)"
+            title={`${t('Save')} (Ctrl+S) · ${t('Save As')} (Ctrl+Shift+S)`}
             onClick={() => void saveProject()}
           >
             {dirty ? `${t('Save')} •` : t('Save')}
