@@ -76,6 +76,12 @@ describe('resolveEncoder', () => {
     expect(resolveEncoder('webm-vp9', 'nvenc', HW_ENCODERS).encoder).toBe('libvpx-vp9')
   })
 
+  it('an unavailable family behaves like auto (matches what the Export modal shows)', () => {
+    expect(resolveEncoder('mp4-h264', 'qsv', ['h264_nvenc'])).toEqual({ encoder: 'h264_nvenc', hardware: true })
+    // the chosen family still wins when it works
+    expect(resolveEncoder('mp4-h264', 'amf', ['h264_nvenc', 'h264_amf']).encoder).toBe('h264_amf')
+  })
+
   it('lists families with at least one working encoder', () => {
     expect(availableFamilies([])).toEqual([])
     expect(availableFamilies(['hevc_amf', 'h264_nvenc'])).toEqual(['nvenc', 'amf'])

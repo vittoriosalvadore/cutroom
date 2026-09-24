@@ -131,3 +131,16 @@ export function hasVideoAt(project: Project, t: number): boolean {
   }
   return false
 }
+
+/** Keys a focused range input (slider) handles itself — global shortcuts and
+ *  the Inspector's undo snapshot both key off this list. */
+export const SLIDER_KEYS: ReadonlySet<string> = new Set([
+  'ArrowLeft',
+  'ArrowRight',
+  'ArrowUp',
+  'ArrowDown',
+  'PageUp',
+  'PageDown',
+  'Home',
+  'End'
+])

@@ -1,4 +1,6 @@
 import type { AnimProp, Clip, Easing, Keyframe, MediaItem, Marker, Project, Track } from '../types'
+import { defaultTrackComp, defaultTrackDuck, defaultTrackEQ, defaultTrackGate } from '../types'
+import { clampReverb } from '../../../shared/reverb'
 import { clampTrackHeight } from './tracks'
 
 // ---------------------------------------------------------------------------
@@ -56,6 +58,48 @@ const TRACK_KINDS = new Set(['video', 'audio'])
 const MEDIA_KINDS = new Set(['video', 'audio', 'image'])
 const EASINGS = new Set<Easing>(['linear', 'hold', 'smooth'])
 
+/**
+ * Overlay a stored effect block onto its defaults, keeping only well-typed
+ * fields: `enabled` must be a boolean, numbers must be finite. A garbage block
+ * (a hand-edited file) degrades to the defaults instead of crashing the
+ * Inspector's number formatting later. Absent stays absent (= effect off).
+ */
+function sanitizeFx<T extends { enabled: boolean }>(raw: unknown, defaults: T): T | undefined {
+  if (raw === undefined) return undefined
+  if (!isRecord(raw)) return undefined
+  const out = { ...defaults }
+  for (const k of Object.keys(defaults) as (keyof T)[]) {
+    const v = raw[k as string]
+    const d = defaults[k]
+    if (typeof d === 'number' && Number.isFinite(v)) out[k] = v as T[keyof T]
+    else if (typeof d === 'boolean' && typeof v === 'boolean') out[k] = v as T[keyof T]
+  }
+  return out
+}
+
+/** Per-track mixer/effect fields, validated (see sanitizeFx). */
+function sanitizeTrackAudio(t: Record<string, unknown>): Partial<Track> {
+  const out: Partial<Track> = {
+    audioGain: Number.isFinite(t.audioGain) ? (t.audioGain as number) : undefined,
+    pan: Number.isFinite(t.pan) ? Math.max(-1, Math.min(1, t.pan as number)) : undefined,
+    gate: sanitizeFx(t.gate, defaultTrackGate()),
+    eq: sanitizeFx(t.eq, defaultTrackEQ()),
+    comp: sanitizeFx(t.comp, defaultTrackComp())
+  }
+  const duck = sanitizeFx(t.duck, defaultTrackDuck())
+  if (duck) {
+    const trig = isRecord(t.duck) ? t.duck.triggerTrackId : null
+    duck.triggerTrackId = typeof trig === 'string' ? trig : null
+  }
+  out.duck = duck
+  if (isRecord(t.reverb)) {
+    out.reverb = { enabled: t.reverb.enabled === true, ...clampReverb(t.reverb) }
+  } else {
+    out.reverb = undefined
+  }
+  return out
+}
+
 /** Tracks are structural: a malformed one fails the whole file (its clips would
  *  be orphaned). Cosmetic fields get defaults. Returns an error string on failure. */
 function sanitizeTracks(raw: unknown[]): Track[] | string {
@@ -70,6 +114,7 @@ function sanitizeTracks(raw: unknown[]): Track[] | string {
     out.push({
       ...(t as unknown as Track),
       name: typeof t.name === 'string' ? t.name : t.id,
+      ...sanitizeTrackAudio(t),
       height: clampTrackHeight(num(t.height, t.kind === 'audio' ? 52 : 68)),
       muted: t.muted === true,
       hidden: t.hidden === true

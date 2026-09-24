@@ -1,7 +1,8 @@
-import { ipcMain, dialog } from 'electron'
+import { BrowserWindow, ipcMain, dialog } from 'electron'
 import { spawn, type ChildProcess } from 'child_process'
 import { tmpdir } from 'os'
-import { extname } from 'path'
+import { basename, extname } from 'path'
+import { existsSync } from 'fs'
 import { ffmpegPath, trackProcess, trackTemp } from './ffmpeg'
 import { isOwnTempFile } from './paths'
 import { buildEncodeArgs, resolveEncodeConfig, type RawStartOptions } from './encodeArgs'
@@ -191,7 +192,25 @@ export function registerExportIpc(): void {
     })
     if (result.canceled || !result.filePath) return null
     // Not every platform enforces the filter's extension — append it if missing.
-    return extname(result.filePath).toLowerCase() === `.${ext}` ? result.filePath : `${result.filePath}.${ext}`
+    if (extname(result.filePath).toLowerCase() === `.${ext}`) return result.filePath
+    const withExt = `${result.filePath}.${ext}`
+    // The dialog only checked the name as typed, so it never asked about
+    // replacing the file we are about to write — ask now.
+    if (existsSync(withExt)) {
+      const win = BrowserWindow.fromWebContents(_event.sender)
+      const opts = {
+        type: 'warning' as const,
+        buttons: ['Replace', 'Cancel'],
+        defaultId: 1,
+        cancelId: 1,
+        title: 'Replace file?',
+        message: `"${basename(withExt)}" already exists.`,
+        detail: 'Do you want to replace it?'
+      }
+      const { response } = win ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts)
+      if (response !== 0) return null
+    }
+    return withExt
   })
 
   // Working hardware encoders (probed once, cached). [] = software only.

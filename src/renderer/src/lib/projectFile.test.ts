@@ -139,4 +139,37 @@ describe('project (de)serialize', () => {
       ])
     }
   })
+
+  it('validates track effect blocks instead of passing garbage through', () => {
+    const p = sample()
+    const audio = { id: 'a1', kind: 'audio', name: 'A1', height: 52, muted: false, hidden: false }
+    const raw = {
+      ...p,
+      tracks: [...p.tracks, audio].map((t) =>
+        t.id === audio.id
+          ? {
+              ...t,
+              pan: 7,
+              reverb: { enabled: true, decaySec: '2', mix: 5 },
+              gate: { enabled: 'yes', thresholdDb: -30, attackMs: null },
+              duck: { enabled: true, triggerTrackId: 42 },
+              eq: 'loud'
+            }
+          : t
+      )
+    }
+    const r = deserializeProject(JSON.stringify({ project: raw }))
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    const t = r.project.tracks.find((x) => x.id === audio.id)!
+    expect(t.pan).toBe(1)
+    expect(t.reverb?.enabled).toBe(true)
+    expect(typeof t.reverb?.decaySec).toBe('number') // "2" -> default, never a string
+    expect(t.reverb?.mix).toBeLessThanOrEqual(1)
+    expect(t.gate?.enabled).toBe(false) // non-boolean -> default
+    expect(t.gate?.thresholdDb).toBe(-30)
+    expect(Number.isFinite(t.gate?.attackMs)).toBe(true)
+    expect(t.duck?.triggerTrackId).toBeNull()
+    expect(t.eq).toBeUndefined()
+  })
 })

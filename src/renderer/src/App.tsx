@@ -7,7 +7,7 @@ import { serializeProject } from './lib/projectFile'
 import { timelineDuration } from './lib/exporter'
 import { createNewProject, openProject, saveProject } from './lib/projectIO'
 import { useT } from './lib/i18n'
-import { advancePlayhead, nextShuttleRate, playStartSec, stepFrames } from './lib/transport'
+import { advancePlayhead, nextShuttleRate, playStartSec, SLIDER_KEYS, stepFrames } from './lib/transport'
 import MediaBin from './components/MediaBin'
 import Preview from './components/Preview'
 import Timeline from './components/Timeline'
@@ -243,6 +243,9 @@ function useShortcuts(): void {
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
       if (isTextEditingTarget(e.target) || isModalOpen()) return
+      // A focused slider owns its navigation keys (←/→ nudge it, Home/End jump);
+      // other shortcuts (Space, Ctrl+Z, S…) still apply after touching one.
+      if (e.target instanceof HTMLInputElement && e.target.type === 'range' && SLIDER_KEYS.has(e.key)) return
       const st = useEditor.getState()
       const meta = e.ctrlKey || e.metaKey
 

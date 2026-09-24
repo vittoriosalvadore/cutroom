@@ -108,8 +108,10 @@ interface VideoAudio {
 }
 
 const DRIFT_TOLERANCE = 0.05
-/** Min gap between IR rebuilds while a reverb slider is being dragged. */
-const REVERB_REBUILD_MS = 150
+/** A changed reverb shape must hold this long before its IR is rebuilt:
+ *  generating the IR (+ the convolver's own preprocessing) costs tens of ms
+ *  on the main thread, so rebuilding mid-drag would stutter playback. */
+const REVERB_SETTLE_MS = 250
 /** Let the wet gain fade out before the convolver is unhooked (saves CPU). */
 const REVERB_UNHOOK_MS = 200
 
@@ -139,7 +141,9 @@ interface ReverbSend {
   panner: StereoPannerNode
   /** reverbShapeKey of the loaded IR. */
   key: string
-  builtAt: number
+  /** Latest requested shape key and when it was first seen (settle timer). */
+  pendingKey: string
+  pendingSince: number
   /** Whether tap -> convolver is connected. */
   hooked: boolean
   unhookTimer: number
@@ -345,7 +349,7 @@ export class AudioPool {
       const panner = this.ctx.createStereoPanner()
       wetGain.connect(panner)
       panner.connect(this.master)
-      send = { convolver: null, wet: wetGain, panner, key: '', builtAt: 0, hooked: false, unhookTimer: 0 }
+      send = { convolver: null, wet: wetGain, panner, key: '', pendingKey: '', pendingSince: 0, hooked: false, unhookTimer: 0 }
       chain.reverb = send
     }
     if (send.unhookTimer) {
@@ -354,7 +358,11 @@ export class AudioPool {
     }
     const key = reverbShapeKey(rv, this.ctx.sampleRate)
     const wall = performance.now()
-    if (send.key !== key && (!send.convolver || wall - send.builtAt >= REVERB_REBUILD_MS)) {
+    if (send.key !== key && send.pendingKey !== key) {
+      send.pendingKey = key
+      send.pendingSince = wall
+    }
+    if (send.key !== key && (!send.convolver || wall - send.pendingSince >= REVERB_SETTLE_MS)) {
       try {
         const conv = this.ctx.createConvolver()
         conv.normalize = false // must be set before the buffer to take effect
@@ -367,7 +375,6 @@ export class AudioPool {
         send.convolver = conv
         send.hooked = false
         send.key = key
-        send.builtAt = wall
       } catch (e) {
         console.warn('[cutroom] could not build reverb', e)
       }
@@ -502,6 +509,7 @@ export class AudioPool {
   /** Reconcile playing sources to the playhead. Call after each render. */
   sync(project: Project, playhead: number, playing: boolean, videoPool?: VideoPool): void {
     const now = this.ctx.currentTime
+    this.pruneTrackChains(project)
     if (!playing) {
       for (const id of [...this.live.keys()]) this.stopClip(id)
       for (const v of this.videoAudio.values()) v.gain.gain.setTargetAtTime(0, now, 0.01)
@@ -575,28 +583,52 @@ export class AudioPool {
     }
   }
 
+  /** Disconnect a track chain and release its worklet processor. */
+  private disposeChain(chain: TrackChain): void {
+    try {
+      chain.input.disconnect()
+      chain.dynamics?.port.postMessage(DYNAMICS_DISPOSE_MESSAGE)
+      chain.dynamics?.disconnect()
+      chain.tap.disconnect()
+      chain.dry.disconnect()
+      chain.panner.disconnect()
+      if (chain.reverb) {
+        window.clearTimeout(chain.reverb.unhookTimer)
+        chain.reverb.convolver?.disconnect()
+        chain.reverb.wet.disconnect()
+        chain.reverb.panner.disconnect()
+      }
+    } catch {
+      /* already gone */
+    }
+  }
+
+  /**
+   * Tear down chains of tracks that no longer exist (deleted, or undone past
+   * their creation) so their nodes and dynamics worklet don't run forever.
+   * An undo that brings the track back simply rebuilds it via trackInput.
+   */
+  private pruneTrackChains(project: Project): void {
+    if (this.trackChains.size === 0) return
+    const ids = new Set(project.tracks.map((t) => t.id))
+    for (const [id, chain] of [...this.trackChains.entries()]) {
+      if (ids.has(id)) continue
+      this.disposeChain(chain)
+      this.trackChains.delete(id)
+      this.trackMuted.delete(id)
+      this.duckEdges.delete(id)
+      // Its input fed other tracks' sidechains; disconnect() above cut those edges.
+      for (const [ducked, trigger] of [...this.duckEdges.entries()]) {
+        if (trigger === id) this.duckEdges.delete(ducked)
+      }
+    }
+  }
+
   dispose(): void {
     for (const id of [...this.live.keys()]) this.stopClip(id)
     for (const [id, v] of [...this.videoAudio.entries()]) this.dropVideoAudio(id, v)
     this.duckEdges.clear()
-    for (const chain of this.trackChains.values()) {
-      try {
-        chain.input.disconnect()
-        chain.dynamics?.port.postMessage(DYNAMICS_DISPOSE_MESSAGE)
-        chain.dynamics?.disconnect()
-        chain.tap.disconnect()
-        chain.dry.disconnect()
-        chain.panner.disconnect()
-        if (chain.reverb) {
-          window.clearTimeout(chain.reverb.unhookTimer)
-          chain.reverb.convolver?.disconnect()
-          chain.reverb.wet.disconnect()
-          chain.reverb.panner.disconnect()
-        }
-      } catch {
-        /* already gone */
-      }
-    }
+    for (const chain of this.trackChains.values()) this.disposeChain(chain)
     setMeterAnalyser(null)
     try {
       this.analyser.disconnect()

@@ -13,6 +13,7 @@ import {
 import { REVERB_LIMITS } from '../../../shared/reverb'
 import { sampleOpacity, sampleTransform, KEY_EPS } from '../lib/keyframes'
 import { useT } from '../lib/i18n'
+import { SLIDER_KEYS } from '../lib/transport'
 import { normalizeGainDb } from '../lib/normalize'
 import { canRemoveTrack, MAX_TRACK_HEIGHT, MIN_TRACK_HEIGHT } from '../lib/tracks'
 import { removeTrackWithConfirm } from '../lib/trackActions'
@@ -248,7 +249,7 @@ function TrackPanel(props: {
         onPointerDownCapture={snapshotOnControl}
         onKeyDownCapture={(e) => {
           // Keyboard nudges on a slider also need a pre-edit snapshot for undo.
-          if ((e.target as HTMLInputElement).type === 'range') useEditor.getState().snapshot()
+          if ((e.target as HTMLInputElement).type === 'range' && SLIDER_KEYS.has(e.key)) useEditor.getState().snapshot()
         }}
       >
         <div className="insp-clipname">{track.name}</div>
@@ -774,7 +775,7 @@ export default function Inspector() {
         onPointerDownCapture={snapshotOnControl}
         onKeyDownCapture={(e) => {
           // Keyboard nudges on a slider also need a pre-edit snapshot for undo.
-          if ((e.target as HTMLInputElement).type === 'range') useEditor.getState().snapshot()
+          if ((e.target as HTMLInputElement).type === 'range' && SLIDER_KEYS.has(e.key)) useEditor.getState().snapshot()
         }}
       >
         <div className="insp-clipname">{title}</div>

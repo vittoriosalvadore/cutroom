@@ -159,8 +159,11 @@ export function resolveEncoder(
   working: readonly string[]
 ): { encoder: string; hardware: boolean } {
   const codec = formatInfo(format).codec
+  // A chosen family that isn't available on this machine (e.g. settings
+  // carried over from another PC) behaves like Auto — the Export modal shows
+  // it that way, so the encoder that runs must match what it promised.
   const families: readonly HwFamily[] =
-    choice === 'auto' ? HW_FAMILIES : choice === 'software' ? [] : [choice]
+    choice === 'auto' ? HW_FAMILIES : choice === 'software' ? [] : [choice, ...HW_FAMILIES.filter((f) => f !== choice)]
   for (const f of families) {
     const name = hwEncoderName(f, codec)
     if (name && working.includes(name)) return { encoder: name, hardware: true }
