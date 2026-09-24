@@ -223,6 +223,8 @@ function clampNum(v: number, lo: number, hi: number, fallback: number): number {
 // FFmpeg rejects out-of-range filter options and aborts the whole mux, while
 // the Inspector sliders allow e.g. attack = 0 ms. These mirror the option
 // ranges of agate / acompressor / sidechaincompress.
+/** Fixed-size blocks for both sidechaincompress inputs (see buildFxGraph). */
+const SC_BLOCKS = 'asetnsamples=n=1024:p=1'
 const MIN_THRESHOLD = 0.000976563
 const attackMs = (v: number, max: number): number => clampNum(v, 0.01, max, 20)
 const releaseMs = (v: number): number => clampNum(v, 0.01, 9000, 250)
@@ -476,9 +478,15 @@ function buildFxGraph(clips: MuxClip[], labels: string[], sampleRate: number, ir
     if (info.duck && trigK !== undefined) {
       // The key enters the preview worklet's 2-channel input too (unity
       // up-mix); the ducked bus is already stereo (see step 2).
-      G.push(`[key_${trigK}_${k}]${UNITY_UPMIX},apad[kp_${trigK}_${k}]`)
+      // Both sidechaincompress inputs are re-blocked to a fixed frame size: its
+      // output otherwise depends on how the two inputs' frames happen to
+      // arrive (each input decodes on its own thread in FFmpeg 7), so the same
+      // project could export a different glitch now and then. p=1 pads only
+      // the ducked track's final block with silence (the mix is padded anyway).
+      G.push(`[key_${trigK}_${k}]${UNITY_UPMIX},apad,${SC_BLOCKS}[kp_${trigK}_${k}]`)
+      G.push(`${term}${SC_BLOCKS}[mb_${k}]`)
       G.push(
-        `${term}[kp_${trigK}_${k}]sidechaincompress=` +
+        `[mb_${k}][kp_${trigK}_${k}]sidechaincompress=` +
           `threshold=${threshold(info.duck.thresholdDb)}:ratio=${ratio(info.duck.ratio)}` +
           `:attack=${attackMs(info.duck.attackMs, 2000)}:release=${releaseMs(info.duck.releaseMs)}[dk_${k}]`
       )

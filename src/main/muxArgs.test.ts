@@ -169,11 +169,13 @@ describe('buildMuxArgs FX path (gate / duck)', () => {
     expect(g).toContain('[bus_0]asplit=2[main_0][key_0_1]')
     // key padded + unity-upmixed (like the worklet's key input) so a short
     // trigger can't truncate the ducked track
-    expect(g).toContain(`[key_0_1]${UNITY_UPMIX},apad[kp_0_1]`)
+    expect(g).toContain(`[key_0_1]${UNITY_UPMIX},apad,asetnsamples=n=1024:p=1[kp_0_1]`)
     // the ducked bus runs the worklet in preview -> unity upmix on the bus
     expect(g).toContain(`[c1]volume=1.0000,${UNITY_UPMIX}[bus_1]`)
     // ducked track (tB = track 1) sidechain-compressed; ratio clamped to 20
-    expect(g).toContain('[bus_1][kp_0_1]sidechaincompress=threshold=0.031623:ratio=20:attack=15:release=250[dk_1]')
+    // both inputs re-blocked to fixed frames so the output is deterministic
+    expect(g).toContain('[bus_1]asetnsamples=n=1024:p=1[mb_1]')
+    expect(g).toContain('[mb_1][kp_0_1]sidechaincompress=threshold=0.031623:ratio=20:attack=15:release=250[dk_1]')
     expect(g).not.toContain('aformat=channel_layouts=stereo[')
   })
 
