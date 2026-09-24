@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { buildMuxArgs, panGains, speedFilter, type MuxClip } from './muxArgs'
+import { buildMuxArgs, buildMuxGraph, panGains, planReverbs, speedFilter, stereoPanFilter, type MuxClip } from './muxArgs'
+import { reverbIRLength, reverbMixGains } from '../shared/reverb'
 
 const base = { silentPath: '/tmp/silent.mp4', outputPath: '/tmp/out.mp4', sampleRate: 48000 }
 
@@ -239,5 +240,95 @@ describe('buildMuxArgs input planning + safety', () => {
   it('names the muxer explicitly so the output may use a temp extension', () => {
     const args = buildMuxArgs({ ...base, clips: [clip({})] })
     expect(args.slice(-3)).toEqual(['-f', 'mp4', '/tmp/out.mp4'])
+  })
+})
+
+describe('buildMuxArgs reverb', () => {
+  const reverb = { mix: 0.3, decaySec: 1.5, preDelayMs: 20, tone: 0.5 }
+
+  it('adds one IR input per reverb track, after the sources, in planReverbs order', () => {
+    const clips = [
+      clip({ trackId: 'tA', path: '/a.wav' }),
+      clip({ trackId: 'tB', path: '/b.wav', reverb }),
+      clip({ trackId: 'tB', path: '/b.wav', startSec: 6, reverb }),
+      clip({ trackId: 'tC', path: '/c.wav', reverb: { ...reverb, decaySec: 3 } })
+    ]
+    expect(planReverbs(clips).map((r) => r.trackId)).toEqual(['tB', 'tC'])
+    const args = buildMuxArgs({ ...base, clips, irPaths: ['/tmp/irB.wav', '/tmp/irC.wav'] })
+    const inputs = args.flatMap((a, i) => (a === '-i' ? [args[i + 1]] : []))
+    expect(inputs).toEqual(['/tmp/silent.mp4', '/a.wav', '/b.wav', '/c.wav', '/tmp/irB.wav', '/tmp/irC.wav'])
+    const g = graphOf(args)
+    // tB is track 1 -> IR input 4; tC is track 2 -> IR input 5
+    expect(g).toContain('[rx_1][4:a]afir=irnorm=-1:irgain=1')
+    expect(g).toContain('[rx_2][5:a]afir=irnorm=-1:irgain=1')
+    expect(g).not.toContain('[rx_0]') // tA has no reverb
+    expect(g).toContain('[bus_0]anull[t_0]')
+  })
+
+  it('splits dry/wet with the shared equal-power gains, pads the wet by the IR length', () => {
+    const g = graphOf(buildMuxArgs({ ...base, clips: [clip({ reverb })], irPaths: ['/tmp/ir.wav'] }))
+    const { dry, wet } = reverbMixGains(0.3)
+    const pad = (reverbIRLength(reverb, 48000) / 48000).toFixed(3)
+    expect(g).toContain('[bus_0]asplit=2[rd_0][rw_0]')
+    // wet: unity upmix (mono FC -> both sides at full level, as WebAudio does), pad, convolve, gain
+    expect(g).toContain(`[rw_0]pan=stereo|FL=FL+FC|FR=FR+FC,apad=pad_dur=${pad}[rx_0]`)
+    expect(g).toContain(`[rx_0][2:a]afir=irnorm=-1:irgain=1,volume=${wet.toFixed(6)}[rwo_0]`)
+    // dry: the no-reverb terminal's gains (mono FC -> -3 dB each side, stereo as-is),
+    // via pan — an aformat here would upmix the bus before the asplit, wet included
+    expect(g).toContain(`[rd_0]volume=${dry.toFixed(6)},pan=stereo|FL=1.00000*FL+0.70711*FC|FR=1.00000*FR+0.70711*FC[rdo_0]`)
+    expect(g).not.toMatch(/aformat=channel_layouts=stereo\[rdo_0\]/)
+    expect(g).toContain('[rdo_0][rwo_0]amix=inputs=2:normalize=0:duration=longest[t_0]')
+    expect(g).toContain('[t_0]alimiter=limit=0.97,apad[aout]')
+  })
+
+  it('pans the dry and wet branches separately (like the preview’s two panners)', () => {
+    const g = graphOf(buildMuxArgs({ ...base, clips: [clip({ reverb, pan: -0.5 })], irPaths: ['/tmp/ir.wav'] }))
+    const { left, right } = panGains(-0.5)
+    // wet (always stereo): WebAudio's exact stereo-input pan law
+    expect(g).toContain(`afir=irnorm=-1:irgain=1,volume=${reverbMixGains(0.3).wet.toFixed(6)},${stereoPanFilter(-0.5)}[rwo_0]`)
+    // dry: the same gains the no-reverb terminal applies after its -3 dB mono upmix
+    const l = left.toFixed(5)
+    const r = right.toFixed(5)
+    const lc = (left * Math.SQRT1_2).toFixed(5)
+    const rc = (right * Math.SQRT1_2).toFixed(5)
+    expect(g).toContain(`,pan=stereo|FL=${l}*FL+${lc}*FC|FR=${r}*FR+${rc}*FC[rdo_0]`)
+  })
+
+  it('stereoPanFilter mirrors StereoPannerNode for stereo input (identity at centre)', () => {
+    expect(stereoPanFilter(0)).toBe('pan=stereo|c0=c0+0.00000*c1|c1=1.00000*c1')
+    // hard left folds R into L; hard right folds L into R
+    expect(stereoPanFilter(-1)).toBe('pan=stereo|c0=c0+1.00000*c1|c1=0.00000*c1')
+    expect(stereoPanFilter(1)).toBe('pan=stereo|c0=0.00000*c0|c1=c1+1.00000*c0')
+    expect(stereoPanFilter(0.5)).toBe('pan=stereo|c0=0.70711*c0|c1=c1+0.70711*c0')
+    expect(stereoPanFilter(9)).toBe(stereoPanFilter(1))
+  })
+
+  it('sits after the duck and before the pan on the track terminal', () => {
+    const g = buildMuxGraph(
+      [
+        clip({ trackId: 'tA', path: '/vo.wav' }),
+        clip({
+          trackId: 'tB',
+          path: '/music.wav',
+          duck: { triggerTrackId: 'tA', thresholdDb: -30, ratio: 8, attackMs: 15, releaseMs: 250 },
+          reverb
+        })
+      ],
+      48000
+    )
+    expect(g).toContain('[dk_1]asplit=2[rd_1][rw_1]')
+    // the duck key is still taken from the trigger's pre-reverb bus
+    expect(g).toContain('[bus_0]asplit=2[main_0][key_0_1]')
+  })
+
+  it('clamps settings in main and treats a zero mix as no reverb', () => {
+    const wild = { mix: 7, decaySec: 500, preDelayMs: -3, tone: 9 }
+    expect(planReverbs([clip({ reverb: wild })])[0].reverb).toEqual({ mix: 1, decaySec: 10, preDelayMs: 0, tone: 1 })
+    const g = buildMuxGraph([clip({ reverb: wild })], 48000)
+    expect(g).toContain('apad=pad_dur=10.000')
+    expect(g).toContain(`[rd_0]volume=${reverbMixGains(1).dry.toFixed(6)},pan=`)
+    expect(planReverbs([clip({ reverb: { ...reverb, mix: 0 } })])).toEqual([])
+    const off = buildMuxGraph([clip({ reverb: { ...reverb, mix: 0 } })], 48000)
+    expect(off).not.toContain('afir')
   })
 })

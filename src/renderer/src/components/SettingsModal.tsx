@@ -124,6 +124,17 @@ export default function SettingsModal() {
                   checked={s.showPlaceholders}
                   onChange={(v) => s.set({ showPlaceholders: v })}
                 />
+                <Segmented
+                  label={t('Preview quality')}
+                  desc={t('Render the preview at a lower resolution for smoother playback. Export always renders at full resolution.')}
+                  value={s.previewQuality}
+                  options={[
+                    { value: 'full', label: t('Full') },
+                    { value: 'half', label: t('Half') },
+                    { value: 'quarter', label: t('Quarter') }
+                  ]}
+                  onChange={(v) => s.set({ previewQuality: v })}
+                />
               </>
             )}
 

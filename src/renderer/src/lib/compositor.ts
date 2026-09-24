@@ -5,6 +5,7 @@ import { mediaUrl } from './media'
 import { VideoPool } from './videoPool'
 import { roundRectPath } from './canvas'
 import { RestoreMachine } from './webglRestore'
+import { scaledCanvasSize } from './previewScale'
 import type { FrameSource } from './videoSource'
 
 // ---------------------------------------------------------------------------
@@ -226,8 +227,13 @@ export class Compositor {
   private aPos = 0
   private u: Record<string, WebGLUniformLocation | null> = {}
 
+  /** Backing-canvas size in pixels (the project size x the render scale). */
   private W = 1920
   private H = 1080
+  /** Logical frame size (the project's). Aspect math uses this, so a scaled
+   *  preview whose pixel size rounds keeps the exact project geometry. */
+  private LW = 1920
+  private LH = 1080
 
   private images = new Map<string, ImageEntry>()
   private canvasCache = new Map<string, CachedTex>()
@@ -475,7 +481,7 @@ export class Compositor {
     gl.uniform2f(u.uTrans, tf.posX, tf.posY)
     gl.uniform1f(u.uScale, tf.scale)
     gl.uniform1f(u.uRot, (tf.rotationDeg * Math.PI) / 180)
-    gl.uniform1f(u.uAspect, this.W / this.H)
+    gl.uniform1f(u.uAspect, this.LW / this.LH)
     // Pivot is the ORIGINAL (uncropped) content centre, so a keyframed crop
     // pivots in place instead of swimming.
     gl.uniform2f(u.uAnchor, baseRect.x + baseRect.w * 0.5, baseRect.y + baseRect.h * 0.5)
@@ -556,7 +562,7 @@ export class Compositor {
       const frame = this.videos.want(clip.id, media.path, srcTime, this.playing, speed)
       if (frame && frame.width > 0 && frame.height > 0) {
         const tex = this.uploadVideoFrame(clip.id, frame.source)
-        this.drawQuad(containRect(frame.width, frame.height, this.W, this.H), tex, null, effects, tf, opacity)
+        this.drawQuad(containRect(frame.width, frame.height, this.LW, this.LH), tex, null, effects, tf, opacity)
         return
       }
       if (this.hidePlaceholders) return
@@ -569,7 +575,7 @@ export class Compositor {
     if (media && media.kind === 'image' && media.path) {
       const entry = this.imageTexture(media)
       if (entry.status === 'ready' && entry.tex) {
-        this.drawQuad(containRect(entry.w, entry.h, this.W, this.H), entry.tex, null, effects, tf, opacity)
+        this.drawQuad(containRect(entry.w, entry.h, this.LW, this.LH), entry.tex, null, effects, tf, opacity)
         return
       }
       if (this.hidePlaceholders) return
@@ -589,11 +595,16 @@ export class Compositor {
     this.drawQuad({ x: 0, y: 0, w: 1, h: 1 }, tex.tex, null, effects, tf, opacity)
   }
 
+  /**
+   * Draw the frame at `playheadSec`. `opts.scale` (0..1] renders into a
+   * proportionally smaller canvas — the preview-quality setting; the export
+   * never passes it, so it always renders at the full project size.
+   */
   render(
     project: Project,
     playheadSec: number,
     playing = false,
-    opts: { hidePlaceholders?: boolean } = {}
+    opts: { hidePlaceholders?: boolean; scale?: number } = {}
   ): void {
     // While a lost context is being recovered, drawing would hit a dead GL
     // context. Skip silently — the overlay tells the user what's happening.
@@ -619,9 +630,12 @@ export class Compositor {
     project: Project,
     playheadSec: number,
     playing: boolean,
-    opts: { hidePlaceholders?: boolean }
+    opts: { hidePlaceholders?: boolean; scale?: number }
   ): void {
-    this.setSize(project.width, project.height)
+    this.LW = project.width
+    this.LH = project.height
+    const px = scaledCanvasSize(project.width, project.height, opts.scale ?? 1)
+    this.setSize(px.w, px.h)
     this.playing = playing
     this.hidePlaceholders = opts.hidePlaceholders ?? false
     const gl = this.gl

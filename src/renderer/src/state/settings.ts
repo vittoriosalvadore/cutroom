@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { applyTheme } from '../lib/theme'
 import type { Lang } from '../lib/i18n'
+import { PREVIEW_QUALITIES, type PreviewQuality } from '../lib/previewScale'
 
 // ---------------------------------------------------------------------------
 // App settings (theme, decoding, editing, export, visual options).
@@ -21,6 +22,8 @@ export interface Settings {
   hardwareAcceleration: boolean
   /** Show placeholder cards in the preview for clips that can't be decoded yet. */
   showPlaceholders: boolean
+  /** Preview render resolution (export always renders full size). */
+  previewQuality: PreviewQuality
   // --- editing ---
   /** Snap clip edges to other clips and the playhead while dragging. */
   snapping: boolean
@@ -46,6 +49,7 @@ export interface Settings {
 export const DEFAULT_SETTINGS: Settings = {
   hardwareAcceleration: true,
   showPlaceholders: true,
+  previewQuality: 'full',
   snapping: true,
   defaultFadeSec: 0.5,
   showWaveforms: true,
@@ -93,6 +97,8 @@ export function sanitize(raw: unknown): Partial<Settings> {
   if (theme) out.theme = theme
   const density = oneOf(o.density, ['comfortable', 'compact'] as const)
   if (density) out.density = density
+  const quality = oneOf(o.previewQuality, PREVIEW_QUALITIES)
+  if (quality) out.previewQuality = quality
   const language = oneOf(o.language, ['en', 'es', 'fr', 'de'] as const)
   if (language) out.language = language
   if (typeof o.accent === 'string' && /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(o.accent)) out.accent = o.accent
@@ -104,6 +110,7 @@ function pick(s: Settings): Settings {
   return {
     hardwareAcceleration: s.hardwareAcceleration,
     showPlaceholders: s.showPlaceholders,
+    previewQuality: s.previewQuality,
     snapping: s.snapping,
     defaultFadeSec: s.defaultFadeSec,
     showWaveforms: s.showWaveforms,

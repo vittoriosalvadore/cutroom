@@ -31,22 +31,28 @@ candidate features. Ordered roughly by how much they came up. Update as we go.
   floor). A parallel-bus emulation could add a floor later if wanted.
 - **Gate/duck apply to audio tracks only** — video-track audio bypasses the
   per-track dynamics chain in preview. Revisit if video-track gating is needed.
+- **Mono-source level: preview vs export (pre-existing, measured)** — FFmpeg's
+  `aformat` mono→stereo upmix is −3 dB, WebAudio's is unity. So a *mono* source is
+  3 dB quieter in export than preview when it is panned off-centre (export upmixes
+  then pans; preview pans mono at full level) or when its track runs the dynamics
+  worklet (EQ/gate/comp/duck — the worklet upmixes at unity). Unpanned, worklet-free
+  mono and all stereo sources match. Fix: build the pan with StereoPannerNode's exact
+  mono/stereo matrices in one `pan` filter (the reverb wet branch already does, see
+  `stereoPanFilter`) and upmix at unity where the preview does.
+- **Reverb wet level on a ducked mono track** — the duck path forces stereo via
+  `aformat` (−3 dB for mono) before the reverb split, so the wet follows the gap
+  above in that one case. Reverb is otherwise sample-exact (see Done).
 
 ## Candidate features (Vegas-style, not yet built — rough priority)
 
-1. **Reverb** — true convolution reverb: a native `ConvolverNode` (preview) + a shared
-   impulse-response WAV echoed by FFmpeg `afir` (export) for WYSIWYG parity. Needs the
-   per-track audio chain to gain a native wet/dry node (graph rewiring) — its own pass.
-2. **i18n full coverage** — framework + switcher + chrome shipped; sweep the remaining
+1. **i18n full coverage** — framework + switcher + chrome shipped; sweep the remaining
    Inspector/Transport/MediaBin strings into the dictionary (incremental).
-3. **Export presets** — resolution / bitrate / format presets.
-4. **Proxy / optimized media** for heavy footage.
-5. **Transport niceties** — J/K/L shuttle, frame-step, audio scrubbing.
-6. **Preview quality setting** — render the preview at half resolution for perf
-   (deferred from Options to avoid touching the compositor before transform).
-7. **Hardware export encoder** — h264_nvenc / qsv / amf with x264 fallback; needs
+2. **Export presets** — resolution / bitrate / format presets.
+3. **Proxy / optimized media** for heavy footage.
+4. **Transport niceties** — J/K/L shuttle, frame-step, audio scrubbing.
+5. **Hardware export encoder** — h264_nvenc / qsv / amf with x264 fallback; needs
    encoder probing + per-encoder args (deferred from Options; CRF/preset shipped).
-8. **Color curves / scopes** — beyond primary grade: RGB curves, histogram/vectorscope.
+6. **Color curves / scopes** — beyond primary grade: RGB curves, histogram/vectorscope.
 
 ## Done
 
@@ -83,6 +89,13 @@ candidate features. Ordered roughly by how much they came up. Update as we go.
   Ctrl+C/V copy-paste at playhead (fresh ids, project-isolated). `selectedClipId` = primary.
 - **Normalize** — one-click per-track peak-normalize (sets the track gain to −1 dBFS;
   parity-perfect since it's just a gain). Inspector → track → Normalize.
+- **Reverb** — per-track convolution reverb (mix / decay / pre-delay / tone). One pure
+  seeded IR generator (`src/shared/reverb.ts`) feeds the preview `ConvolverNode`
+  (normalize off) and a float-WAV IR for FFmpeg `afir` (`irnorm=-1`, no auto-gain);
+  equal-power dry/wet, post-duck/pre-pan. Measured vs Chromium: wet sample-exact
+  (≤ −107 dB error). Select an audio track → Inspector → Reverb.
+- **Preview quality** — Full / Half / Quarter preview resolution (Options → Performance);
+  the compositor renders a smaller backing canvas, CSS keeps the size, export stays full.
 - **i18n / languages** — `t()`/`useT()` framework (English = key, fallback-safe), EN/ES/FR/DE
   dictionaries, language switcher in Options; chrome (top bar, Options, Inspector) translated.
 - **Rubber-band marquee** — drag on empty lane space to box-select clips (Shift/Ctrl adds);

@@ -5,7 +5,8 @@ import { getAudioEntry, type AudioEntry } from './audioCache'
 import { getDenoiseEntry, type DenoiseEntry } from './denoiseCache'
 import { computeFadeSchedule, fadeGainAt } from './fades'
 import { setMeterAnalyser } from './audioMeter'
-import { resolveDuck } from '../state/selectors'
+import { resolveDuck, resolveReverb } from '../state/selectors'
+import { generateReverbIR, reverbMixGains, reverbShapeKey, type ReverbShape } from '../../../shared/reverb'
 import type { VideoPool } from './videoPool'
 
 /**
@@ -107,15 +108,58 @@ interface VideoAudio {
 }
 
 const DRIFT_TOLERANCE = 0.05
+/** Min gap between IR rebuilds while a reverb slider is being dragged. */
+const REVERB_REBUILD_MS = 150
+/** Let the wet gain fade out before the convolver is unhooked (saves CPU). */
+const REVERB_UNHOOK_MS = 200
+
+/**
+ * Build the ConvolverNode buffer for a reverb shape: the SAME samples the export
+ * writes to its afir IR WAV (src/shared/reverb.ts), at the context's rate.
+ */
+export function buildReverbBuffer(ctx: BaseAudioContext, shape: ReverbShape): AudioBuffer {
+  const [l, r] = generateReverbIR(shape, ctx.sampleRate)
+  const buf = ctx.createBuffer(2, l.length, ctx.sampleRate)
+  buf.getChannelData(0).set(l)
+  buf.getChannelData(1).set(r)
+  return buf
+}
+
+/**
+ * A track's reverb send: tap -> convolver -> wet -> its own panner -> master.
+ * A separate panner (not the dry one) keeps the dry path's channel count, and
+ * so its pan law, exactly what it is without reverb; the export mirrors it by
+ * panning its dry and wet branches separately. The convolver runs with
+ * normalize = false: the IR is already level-normalized, and afir on export
+ * applies no auto-gain either (irnorm=-1), so wet levels match.
+ */
+interface ReverbSend {
+  convolver: ConvolverNode | null
+  wet: GainNode
+  panner: StereoPannerNode
+  /** reverbShapeKey of the loaded IR. */
+  key: string
+  builtAt: number
+  /** Whether tap -> convolver is connected. */
+  hooked: boolean
+  unhookTimer: number
+}
+
+interface TrackChain {
+  input: GainNode
+  dynamics: AudioWorkletNode | null
+  /** Unity node after [dynamics]: the dry/wet split point. */
+  tap: GainNode
+  dry: GainNode
+  panner: StereoPannerNode
+  reverb: ReverbSend | null
+}
 
 export class AudioPool {
   private ctx: AudioContext
   private master: DynamicsCompressorNode
   private analyser: AnalyserNode
-  private trackChains = new Map<
-    string,
-    { input: GainNode; dynamics: AudioWorkletNode | null; panner: StereoPannerNode }
-  >()
+  private trackChains = new Map<string, TrackChain>()
   private trackMuted = new Map<string, boolean>()
   // trackId -> the trigger track currently wired into its duck sidechain input.
   private duckEdges = new Map<string, string>()
@@ -177,18 +221,24 @@ export class AudioPool {
 
   /**
    * Per-track input node. Chain: gain (mute + audioGain dB) -> [dynamics] ->
-   * stereo panner -> master. The dynamics worklet (gate/duck) is inserted ONCE,
+   * tap -> dry -> stereo panner -> master, plus an optional reverb send off the
+   * tap (see ReverbSend). The dynamics worklet (gate/duck) is inserted ONCE,
    * the first time a track needs it and the module is ready; thereafter it stays
    * and just runs passthrough when gate/duck are off, so toggling never reclicks.
+   * tap and dry are unity gains when reverb is off, so the dry path is unchanged.
    */
   private trackInput(track: Track, project: Project): GainNode {
     let chain = this.trackChains.get(track.id)
     if (!chain) {
       const input = this.ctx.createGain()
+      const tap = this.ctx.createGain()
+      const dry = this.ctx.createGain()
       const panner = this.ctx.createStereoPanner()
-      input.connect(panner)
+      input.connect(tap)
+      tap.connect(dry)
+      dry.connect(panner)
       panner.connect(this.master)
-      chain = { input, dynamics: null, panner }
+      chain = { input, dynamics: null, tap, dry, panner, reverb: null }
       this.trackChains.set(track.id, chain)
     }
     const muted = !!track.muted
@@ -211,11 +261,11 @@ export class AudioPool {
       try {
         const node = new AudioWorkletNode(this.ctx, 'cutroom-dynamics', DYNAMICS_NODE_OPTIONS)
         // The worklet starts passthrough (gain 1), so swapping it in is
-        // sample-continuous. Disconnect ONLY the input->panner edge so any
+        // sample-continuous. Disconnect ONLY the input->tap edge so any
         // sidechain taps from this input (it may be a duck trigger) survive.
-        chain.input.disconnect(chain.panner)
+        chain.input.disconnect(chain.tap)
         chain.input.connect(node)
-        node.connect(chain.panner)
+        node.connect(chain.tap)
         chain.dynamics = node
       } catch (e) {
         workletFailed = true
@@ -254,7 +304,80 @@ export class AudioPool {
       set('duckAttackMs', resolved?.attackMs ?? 15)
       set('duckReleaseMs', resolved?.releaseMs ?? 250)
     }
+    this.syncReverb(track, chain)
     return chain.input
+  }
+
+  /**
+   * Reconcile a track's reverb send with its settings. The ConvolverNode is
+   * created on first use and rebuilt (a fresh node, swapped in) only when the
+   * IR shape changes — throttled so dragging the decay slider doesn't
+   * regenerate a multi-second IR every frame. Turning reverb off fades the wet
+   * gain, then unhooks the convolver so an idle reverb costs no CPU.
+   */
+  private syncReverb(track: Track, chain: TrackChain): void {
+    const rv = resolveReverb(track)
+    const now = this.ctx.currentTime
+    const { dry, wet } = reverbMixGains(rv ? rv.mix : 0)
+    chain.dry.gain.setTargetAtTime(dry, now, 0.01)
+    let send = chain.reverb
+    if (!rv) {
+      if (send?.hooked && !send.unhookTimer) {
+        send.wet.gain.setTargetAtTime(0, now, 0.01)
+        const s = send
+        s.unhookTimer = window.setTimeout(() => {
+          s.unhookTimer = 0
+          if (s.convolver && s.hooked) {
+            try {
+              chain.tap.disconnect(s.convolver)
+            } catch {
+              /* already gone */
+            }
+          }
+          s.hooked = false
+        }, REVERB_UNHOOK_MS)
+      }
+      return
+    }
+    if (!send) {
+      const wetGain = this.ctx.createGain()
+      wetGain.gain.value = 0
+      const panner = this.ctx.createStereoPanner()
+      wetGain.connect(panner)
+      panner.connect(this.master)
+      send = { convolver: null, wet: wetGain, panner, key: '', builtAt: 0, hooked: false, unhookTimer: 0 }
+      chain.reverb = send
+    }
+    if (send.unhookTimer) {
+      window.clearTimeout(send.unhookTimer)
+      send.unhookTimer = 0
+    }
+    const key = reverbShapeKey(rv, this.ctx.sampleRate)
+    const wall = performance.now()
+    if (send.key !== key && (!send.convolver || wall - send.builtAt >= REVERB_REBUILD_MS)) {
+      try {
+        const conv = this.ctx.createConvolver()
+        conv.normalize = false // must be set before the buffer to take effect
+        conv.buffer = buildReverbBuffer(this.ctx, rv)
+        conv.connect(send.wet)
+        if (send.convolver) {
+          if (send.hooked) chain.tap.disconnect(send.convolver)
+          send.convolver.disconnect()
+        }
+        send.convolver = conv
+        send.hooked = false
+        send.key = key
+        send.builtAt = wall
+      } catch (e) {
+        console.warn('[cutroom] could not build reverb', e)
+      }
+    }
+    if (send.convolver && !send.hooked) {
+      chain.tap.connect(send.convolver)
+      send.hooked = true
+    }
+    send.wet.gain.setTargetAtTime(wet, now, 0.01)
+    send.panner.pan.setTargetAtTime(Math.max(-1, Math.min(1, track.pan ?? 0)), now, 0.01)
   }
 
   /**
@@ -461,7 +584,15 @@ export class AudioPool {
         chain.input.disconnect()
         chain.dynamics?.port.postMessage(DYNAMICS_DISPOSE_MESSAGE)
         chain.dynamics?.disconnect()
+        chain.tap.disconnect()
+        chain.dry.disconnect()
         chain.panner.disconnect()
+        if (chain.reverb) {
+          window.clearTimeout(chain.reverb.unhookTimer)
+          chain.reverb.convolver?.disconnect()
+          chain.reverb.wet.disconnect()
+          chain.reverb.panner.disconnect()
+        }
       } catch {
         /* already gone */
       }

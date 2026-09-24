@@ -4,6 +4,8 @@ import { useSettings } from '../state/settings'
 import { Compositor } from '../lib/compositor'
 import { AudioPool } from '../lib/audioPool'
 import { resumeAudioContext } from '../lib/audioContext'
+import { previewScale } from '../lib/previewScale'
+import { useT } from '../lib/i18n'
 import type { Project } from '../types'
 
 /**
@@ -18,8 +20,11 @@ function safeFrame(
   playing: boolean
 ): void {
   try {
+    const settings = useSettings.getState()
     comp?.render(project, playhead, playing, {
-      hidePlaceholders: !useSettings.getState().showPlaceholders
+      hidePlaceholders: !settings.showPlaceholders,
+      // Preview-only resolution; the canvas CSS keeps the on-screen size.
+      scale: previewScale(settings.previewQuality)
     })
   } catch (e) {
     console.error('[cutroom] preview render error:', e)
@@ -48,6 +53,8 @@ export default function Preview() {
   const playhead = useEditor((s) => s.playheadSec)
   const isPlaying = useEditor((s) => s.isPlaying)
   const showPlaceholders = useSettings((s) => s.showPlaceholders)
+  const previewQuality = useSettings((s) => s.previewQuality)
+  const t = useT()
 
   // Keep the newest state reachable from async redraws (e.g. an image finishing
   // loading or a video seek completing) without re-creating the compositor.
@@ -124,7 +131,7 @@ export default function Preview() {
 
   useEffect(() => {
     safeFrame(compRef.current, audioRef.current, project, playhead, isPlaying)
-  }, [project, playhead, isPlaying, showPlaceholders])
+  }, [project, playhead, isPlaying, showPlaceholders, previewQuality])
 
   return (
     <section className="preview">
@@ -138,6 +145,7 @@ export default function Preview() {
         )}
         <div className="monitor-overlay">
           {project.width}×{project.height} · {project.fps} fps · {playhead.toFixed(2)}s
+          {previewQuality !== 'full' && ` · ${t('Preview')} ${previewQuality === 'half' ? '½' : '¼'}`}
         </div>
         {gpuStatus === 'reconnecting' && (
           <div className="monitor-overlay warn">Reconnecting GPU…</div>

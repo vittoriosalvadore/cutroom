@@ -1,7 +1,7 @@
 import type { Project } from '../types'
 import type { AudioClipPlanEntry } from '../../../preload'
 import { Compositor } from './compositor'
-import { resolveDuck } from '../state/selectors'
+import { resolveDuck, resolveReverb } from '../state/selectors'
 import { useSettings } from '../state/settings'
 import { ensureDenoisedForExport, getDenoiseEntry } from './denoiseCache'
 
@@ -64,6 +64,10 @@ function buildAudioPlan(project: Project): AudioClipPlanEntry[] {
             makeupDb: track.comp.makeupDb
           }
         : undefined
+    const rv = resolveReverb(track)
+    const reverb = rv
+      ? { mix: rv.mix, decaySec: rv.decaySec, preDelayMs: rv.preDelayMs, tone: rv.tone }
+      : undefined
     // Denoise is a source-media substitution: swap in the cached temp WAV
     // (readied by the export preflight below) when enabled, falling back to
     // the original on any glitch — export must never hard-fail over denoise.
@@ -85,7 +89,8 @@ function buildAudioPlan(project: Project): AudioClipPlanEntry[] {
       gate,
       duck,
       eq,
-      comp
+      comp,
+      reverb
     })
   }
   return plan

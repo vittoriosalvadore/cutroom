@@ -53,6 +53,14 @@ describe('settings sanitize', () => {
     expect(sanitize({ snapping: false }).snapping).toBe(false)
   })
 
+  it('keeps a valid preview quality and drops an unknown one', () => {
+    expect(sanitize({ previewQuality: 'half' }).previewQuality).toBe('half')
+    expect(sanitize({ previewQuality: 'quarter' }).previewQuality).toBe('quarter')
+    expect(sanitize({ previewQuality: 'eighth' })).not.toHaveProperty('previewQuality')
+    expect(sanitize({ previewQuality: 0.5 })).not.toHaveProperty('previewQuality')
+    expect(DEFAULT_SETTINGS.previewQuality).toBe('full')
+  })
+
   it('every default value survives a round-trip through sanitize', () => {
     expect(sanitize(DEFAULT_SETTINGS)).toEqual(DEFAULT_SETTINGS)
   })

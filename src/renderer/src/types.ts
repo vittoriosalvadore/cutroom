@@ -10,6 +10,8 @@
 //     startSec". Trimming changes numbers, never the underlying file.
 // ---------------------------------------------------------------------------
 
+import { REVERB_DEFAULTS } from '../../shared/reverb'
+
 export type MediaKind = 'video' | 'audio' | 'image'
 export type TrackKind = 'video' | 'audio'
 /** What a clip represents. 'media' references a file; 'title'/'subtitle' own text. */
@@ -52,6 +54,8 @@ export interface Track {
   eq?: TrackEQ
   /** Audio: per-track compressor. Absent = disabled. Audio tracks only. */
   comp?: TrackComp
+  /** Audio: per-track convolution reverb. Absent = disabled. Audio tracks only. */
+  reverb?: TrackReverb
 }
 
 /** Per-track 3-band EQ (low shelf 120Hz, mid peak 1kHz, high shelf 8kHz), in dB. */
@@ -70,6 +74,27 @@ export interface TrackComp {
   attackMs: number
   releaseMs: number
   makeupDb: number
+}
+
+/**
+ * Per-track convolution reverb. The impulse response is generated from
+ * decay / pre-delay / tone by src/shared/reverb.ts, identically for the
+ * preview ConvolverNode and the export's FFmpeg afir.
+ */
+export interface TrackReverb {
+  enabled: boolean
+  /** Wet amount 0..1 (equal-power dry/wet crossfade). */
+  mix: number
+  /** RT60 decay time in seconds. */
+  decaySec: number
+  /** Gap before the reverb tail, in ms. */
+  preDelayMs: number
+  /** 0 = dark .. 1 = bright. */
+  tone: number
+}
+
+export function defaultTrackReverb(): TrackReverb {
+  return { enabled: false, ...REVERB_DEFAULTS }
 }
 
 export function defaultTrackEQ(): TrackEQ {

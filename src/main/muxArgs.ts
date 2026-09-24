@@ -9,7 +9,12 @@
 //
 // Filter order aresample -> atrim -> asetpts -> volume -> afade -> adelay is
 // mandatory; reordering produces wrong timing or silence.
+//
+// Reverb impulse responses (one float WAV per reverb track, written by
+// audioMux.ts from the shared generator) are extra inputs AFTER the sources.
 // ---------------------------------------------------------------------------
+
+import { clampReverb, reverbIRLength, reverbMixGains, type ReverbSettings } from '../shared/reverb'
 
 /** Resolved per-track gate (see renderer TrackGate). */
 export interface MuxGate {
@@ -33,6 +38,8 @@ export interface MuxEQ {
   midDb: number
   highDb: number
 }
+/** Per-track convolution reverb (see renderer TrackReverb); mix = wet 0..1. */
+export type MuxReverb = ReverbSettings
 /** Per-track compressor (see renderer TrackComp). */
 export interface MuxComp {
   thresholdDb: number
@@ -60,6 +67,7 @@ export interface MuxClip {
   duck?: MuxDuck
   eq?: MuxEQ
   comp?: MuxComp
+  reverb?: MuxReverb
 }
 
 /**
@@ -92,6 +100,20 @@ export function panGains(pan: number): { left: number; right: number } {
   return { left: Math.cos(theta), right: Math.sin(theta) }
 }
 
+/**
+ * `pan` filter for an already-STEREO signal that reproduces WebAudio's
+ * StereoPannerNode stereo-input algorithm exactly (the side being panned away
+ * from is folded into the other with an equal-power gain). Used for the reverb
+ * wet branch, which is always stereo in both preview and export.
+ */
+export function stereoPanFilter(pan: number): string {
+  const p = Math.max(-1, Math.min(1, pan))
+  const x = p <= 0 ? p + 1 : p
+  const gl = Math.cos((x * Math.PI) / 2).toFixed(5)
+  const gr = Math.sin((x * Math.PI) / 2).toFixed(5)
+  return p <= 0 ? `pan=stereo|c0=c0+${gl}*c1|c1=${gr}*c1` : `pan=stereo|c0=${gl}*c0|c1=c1+${gr}*c0`
+}
+
 export interface BuildMuxArgsOptions {
   silentPath: string
   outputPath: string
@@ -110,6 +132,12 @@ export interface BuildMuxArgsOptions {
    * timeline's graph easily exceeds the Windows 32K command-line limit.
    */
   filterScriptPath?: string
+  /**
+   * Reverb IR WAV paths, one per `planReverbs(clips)` entry and in that order.
+   * They become inputs N+1.. after the sources; the graph's afir filters
+   * reference them by that index.
+   */
+  irPaths?: string[]
 }
 
 function dbToLinear(db: number): number {
@@ -178,15 +206,35 @@ function planInputs(clips: MuxClip[]): { paths: string[]; prelude: string[]; lab
   return { paths, prelude, labels }
 }
 
+/**
+ * The reverb tracks that need an impulse response, in the order their IR
+ * inputs are passed to FFmpeg (track first-seen order). Settings are clamped
+ * here (main never trusts the renderer's numbers); a zero mix is no reverb.
+ */
+export function planReverbs(clips: MuxClip[]): { trackId: string; reverb: ReverbSettings }[] {
+  const out: { trackId: string; reverb: ReverbSettings }[] = []
+  const seen = new Set<string>()
+  for (const c of clips) {
+    if (seen.has(c.trackId)) continue
+    seen.add(c.trackId)
+    if (!c.reverb) continue
+    const reverb = clampReverb(c.reverb)
+    if (reverb.mix > 0) out.push({ trackId: c.trackId, reverb })
+  }
+  return out
+}
+
 /** The full mux filtergraph (see buildMuxArgs). */
 export function buildMuxGraph(clips: MuxClip[], sampleRate: number): string {
-  const { prelude, labels } = planInputs(clips)
+  const { paths, prelude, labels } = planInputs(clips)
   // Projects with NO gate/duck use the original flat per-clip graph (verified,
   // byte-stable). Only when a track enables gate/duck do we switch to per-track
   // submixing, which is what lets a gate act on a track's mix and a ducker key
   // off another track.
-  const usesTrackFx = clips.some((c) => c.gate || c.duck || c.eq || c.comp)
-  const graph = usesTrackFx ? buildFxGraph(clips, labels, sampleRate) : buildFlatGraph(clips, labels, sampleRate)
+  const usesTrackFx = clips.some((c) => c.gate || c.duck || c.eq || c.comp || c.reverb)
+  const graph = usesTrackFx
+    ? buildFxGraph(clips, labels, sampleRate, paths.length + 1)
+    : buildFlatGraph(clips, labels, sampleRate)
   return [...prelude, graph].join(';')
 }
 
@@ -194,6 +242,7 @@ export function buildMuxArgs(opts: BuildMuxArgsOptions): string[] {
   const { silentPath, outputPath, sampleRate, clips, filterScriptPath, durationSec } = opts
   const args: string[] = ['-y', '-i', silentPath]
   for (const p of planInputs(clips).paths) args.push('-i', p)
+  for (const p of opts.irPaths ?? []) args.push('-i', p)
 
   if (filterScriptPath) args.push('-filter_complex_script', filterScriptPath)
   else args.push('-filter_complex', buildMuxGraph(clips, sampleRate))
@@ -261,10 +310,13 @@ function buildFlatGraph(clips: MuxClip[], labels: string[], sampleRate: number):
  * ducking stays a DAG), padded with apad so a short trigger can't truncate the
  * longer ducked track, and forced to stereo (sidechaincompress needs matching
  * layouts). dB levels -> linear; times stay in ms; every option is clamped to
- * FFmpeg's accepted range.
+ * FFmpeg's accepted range. Reverb sits after the duck and before the pan (as in
+ * the preview chain), on its own dry/wet split; `irBase` is the FFmpeg input
+ * index of the first reverb IR.
  */
-function buildFxGraph(clips: MuxClip[], labels: string[], sampleRate: number): string {
+function buildFxGraph(clips: MuxClip[], labels: string[], sampleRate: number, irBase: number): string {
   const G: string[] = []
+  const irInput = new Map(planReverbs(clips).map((r, j) => [r.trackId, { input: irBase + j, reverb: r.reverb }]))
 
   // 1. per-clip -> [c{i}] (clip volume + fades only; trackGain & pan move to the bus)
   clips.forEach((c, i) => {
@@ -367,9 +419,41 @@ function buildFxGraph(clips: MuxClip[], labels: string[], sampleRate: number): s
       )
       term = `[dk_${k}]`
     }
-    if (info.pan && Math.abs(info.pan) > 0.001) {
-      const { left, right } = panGains(info.pan)
-      G.push(`${term}aformat=channel_layouts=stereo,pan=stereo|c0=${left.toFixed(5)}*c0|c1=${right.toFixed(5)}*c1[t_${k}]`)
+    const panned = !!info.pan && Math.abs(info.pan) > 0.001
+    const { left, right } = panGains(info.pan ?? 0)
+    const panFilter = `pan=stereo|c0=${left.toFixed(5)}*c0|c1=${right.toFixed(5)}*c1`
+    const ir = irInput.get(tid)
+    if (ir) {
+      // Reverb: split -> dry (volume) + wet (afir with the shared IR, volume),
+      // each panned like the preview's two StereoPanners, then summed.
+      // Both branches reach stereo through `pan` filters, which accept any
+      // input layout: an aformat on either branch would make FFmpeg convert the
+      // bus BEFORE the asplit (at swresample's -3 dB mono upmix) for both.
+      //  • wet: unity upmix (mono FC -> both sides at full level, as a WebAudio
+      //    ConvolverNode treats mono; stereo passes through), padded by the IR
+      //    length so the tail rings out past the last clip, convolved with
+      //    irnorm=-1:irgain=1 = no auto-gain (the IR is pre-normalized, see
+      //    shared/reverb.ts), then WebAudio's exact stereo pan law.
+      //  • dry: exactly the no-reverb terminal (mono -> stereo at -3 dB, as
+      //    swresample does, then the same pan gains), so a 0% mix changes nothing.
+      const { dry, wet } = reverbMixGains(ir.reverb.mix)
+      const padSec = reverbIRLength(ir.reverb, sampleRate) / sampleRate
+      const dl = panned ? left : 1
+      const dr = panned ? right : 1
+      const up = Math.SQRT1_2
+      G.push(`${term}asplit=2[rd_${k}][rw_${k}]`)
+      G.push(`[rw_${k}]pan=stereo|FL=FL+FC|FR=FR+FC,apad=pad_dur=${padSec.toFixed(3)}[rx_${k}]`)
+      G.push(
+        `[rx_${k}][${ir.input}:a]afir=irnorm=-1:irgain=1,volume=${wet.toFixed(6)}` +
+          `${panned ? `,${stereoPanFilter(info.pan)}` : ''}[rwo_${k}]`
+      )
+      G.push(
+        `[rd_${k}]volume=${dry.toFixed(6)},pan=stereo` +
+          `|FL=${dl.toFixed(5)}*FL+${(dl * up).toFixed(5)}*FC|FR=${dr.toFixed(5)}*FR+${(dr * up).toFixed(5)}*FC[rdo_${k}]`
+      )
+      G.push(`[rdo_${k}][rwo_${k}]amix=inputs=2:normalize=0:duration=longest[t_${k}]`)
+    } else if (panned) {
+      G.push(`${term}aformat=channel_layouts=stereo,${panFilter}[t_${k}]`)
     } else {
       G.push(`${term}anull[t_${k}]`)
     }

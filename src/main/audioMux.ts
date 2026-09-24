@@ -5,13 +5,16 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 import { ffmpegPath, releaseTemp, trackProcess, trackTemp } from './ffmpeg'
 import { isLocalFilePath, isOwnTempFile } from './paths'
-import { buildMuxArgs, buildMuxGraph, type MuxClip } from './muxArgs'
+import { buildMuxArgs, buildMuxGraph, planReverbs, type MuxClip } from './muxArgs'
+import { encodeWavFloat32, generateReverbIR } from '../shared/reverb'
 
 // ---------------------------------------------------------------------------
 // Export audio mux (main process). Pass 2 of export: take the silent video the
 // frame-server produced and add a mixed soundtrack built from source files on
 // disk (no PCM crosses IPC). Sources without an audio stream are dropped so a
-// video with no audio can never abort the mux.
+// video with no audio can never abort the mux. Reverb tracks get their impulse
+// response written here as temp WAVs, generated from the renderer's (clamped)
+// settings by the same pure code the preview's ConvolverNode uses.
 // ---------------------------------------------------------------------------
 
 interface MuxOptions {
@@ -80,12 +83,17 @@ async function runMux(opts: MuxOptions): Promise<{ ok: boolean; error?: string }
   if (!isOwnTempFile(opts.silentPath, tmpdir())) return { ok: false, error: 'Invalid export temp path.' }
   if (!isLocalFilePath(opts.outputPath)) return { ok: false, error: 'Invalid export output path.' }
   if (!Array.isArray(opts.clips)) return { ok: false, error: 'Invalid audio plan.' }
+  // The rate sizes the reverb IR buffers too, so a garbage value must not reach them.
+  if (!Number.isInteger(opts.sampleRate) || opts.sampleRate < 8000 || opts.sampleRate > 192000) {
+    return { ok: false, error: 'Invalid sample rate.' }
+  }
   busy = true
 
   // Write to a sibling temp name and rename on success, so a failed mux never
   // destroys an existing file the user chose to replace or leaves a corrupt one.
   const partPath = `${opts.outputPath}.part`
   const scriptPath = tempPath('graph.txt')
+  const irPaths: string[] = []
   trackTemp(partPath)
   trackTemp(opts.silentPath)
   try {
@@ -106,6 +114,13 @@ async function runMux(opts: MuxOptions): Promise<{ ok: boolean; error?: string }
       // Windows 32K command-line limit when passed inline.
       trackTemp(scriptPath)
       await writeFile(scriptPath, buildMuxGraph(audible, opts.sampleRate), 'utf-8')
+      // One IR per reverb track, in planReverbs order (the graph's input order).
+      for (const { reverb } of planReverbs(audible)) {
+        const irPath = tempPath('reverb.wav')
+        trackTemp(irPath)
+        irPaths.push(irPath)
+        await writeFile(irPath, encodeWavFloat32(generateReverbIR(reverb, opts.sampleRate), opts.sampleRate))
+      }
       result = await runFfmpeg(
         buildMuxArgs({
           silentPath: opts.silentPath,
@@ -113,7 +128,8 @@ async function runMux(opts: MuxOptions): Promise<{ ok: boolean; error?: string }
           sampleRate: opts.sampleRate,
           clips: audible,
           filterScriptPath: scriptPath,
-          durationSec: opts.durationSec
+          durationSec: opts.durationSec,
+          irPaths
         })
       )
     }
@@ -122,7 +138,7 @@ async function runMux(opts: MuxOptions): Promise<{ ok: boolean; error?: string }
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : 'Audio mux failed.' }
   } finally {
-    for (const p of [partPath, scriptPath, opts.silentPath]) {
+    for (const p of [partPath, scriptPath, opts.silentPath, ...irPaths]) {
       await unlink(p).catch(() => undefined)
       releaseTemp(p)
     }

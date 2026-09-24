@@ -7,15 +7,17 @@ import {
   defaultTrackGate,
   defaultTrackDuck,
   defaultTrackEQ,
-  defaultTrackComp
+  defaultTrackComp,
+  defaultTrackReverb
 } from '../types'
+import { REVERB_LIMITS } from '../../../shared/reverb'
 import { sampleOpacity, sampleTransform, KEY_EPS } from '../lib/keyframes'
 import { useT } from '../lib/i18n'
 import { normalizeGainDb } from '../lib/normalize'
 import { canRemoveTrack, MAX_TRACK_HEIGHT, MIN_TRACK_HEIGHT } from '../lib/tracks'
 import { removeTrackWithConfirm } from '../lib/trackActions'
 import { denoiseCacheVersion, ensureDenoised, getDenoiseEntry, subscribeDenoiseCache } from '../lib/denoiseCache'
-import type { AnimProp, Marker, TextAlign, Track, TrackGate, TrackDuck, TrackEQ, TrackComp } from '../types'
+import type { AnimProp, Marker, TextAlign, Track, TrackGate, TrackDuck, TrackEQ, TrackComp, TrackReverb } from '../types'
 
 /** Labelled range slider that shows its current value. */
 /**
@@ -224,8 +226,10 @@ function TrackPanel(props: {
   updateTrackDuck: (id: string, patch: Partial<TrackDuck>) => void
   updateTrackEQ: (id: string, patch: Partial<TrackEQ>) => void
   updateTrackComp: (id: string, patch: Partial<TrackComp>) => void
+  updateTrackReverb: (id: string, patch: Partial<TrackReverb>) => void
 }) {
-  const { track, tracks, updateTrack, updateTrackGate, updateTrackDuck, updateTrackEQ, updateTrackComp } = props
+  const { track, tracks, updateTrack, updateTrackGate, updateTrackDuck, updateTrackEQ, updateTrackComp, updateTrackReverb } =
+    props
   const t = useT()
   const gain = track.audioGain ?? 0
   const pan = track.pan ?? 0
@@ -233,6 +237,7 @@ function TrackPanel(props: {
   const duck = track.duck ?? defaultTrackDuck()
   const eq = track.eq ?? defaultTrackEQ()
   const comp = track.comp ?? defaultTrackComp()
+  const reverb = track.reverb ?? defaultTrackReverb()
   const otherAudio = tracks.filter((t) => t.kind === 'audio' && t.id !== track.id)
   return (
     <aside className="inspector">
@@ -288,7 +293,7 @@ function TrackPanel(props: {
           )}
           <p className="insp-note">
             Mute this track with the M badge on its timeline lane.
-            {track.kind === 'video' ? ' EQ, gate, compressor, pan and ducking apply to audio tracks.' : ''}
+            {track.kind === 'video' ? ' EQ, gate, compressor, pan, ducking and reverb apply to audio tracks.' : ''}
           </p>
         </section>
 
@@ -529,6 +534,59 @@ function TrackPanel(props: {
             </p>
           </section>
         )}
+
+        {track.kind === 'audio' && (
+          <section className="insp-section">
+            <h4>
+              {t('Reverb')}
+              <label className="insp-switch">
+                <input
+                  type="checkbox"
+                  checked={reverb.enabled}
+                  onChange={(e) => updateTrackReverb(track.id, { enabled: e.target.checked })}
+                />
+                <span>{reverb.enabled ? t('On') : t('Off')}</span>
+              </label>
+            </h4>
+            <Slider
+              label={t('Mix')}
+              value={reverb.mix}
+              min={REVERB_LIMITS.mix[0]}
+              max={REVERB_LIMITS.mix[1]}
+              step={0.01}
+              onChange={(v) => updateTrackReverb(track.id, { mix: v })}
+              format={(v) => `${Math.round(v * 100)}% ${t('wet')}`}
+            />
+            <Slider
+              label={t('Decay')}
+              value={reverb.decaySec}
+              min={REVERB_LIMITS.decaySec[0]}
+              max={REVERB_LIMITS.decaySec[1]}
+              step={0.1}
+              onChange={(v) => updateTrackReverb(track.id, { decaySec: v })}
+              format={(v) => `${v.toFixed(1)} s`}
+            />
+            <Slider
+              label={t('Pre-delay')}
+              value={reverb.preDelayMs}
+              min={REVERB_LIMITS.preDelayMs[0]}
+              max={REVERB_LIMITS.preDelayMs[1]}
+              step={1}
+              onChange={(v) => updateTrackReverb(track.id, { preDelayMs: v })}
+              format={(v) => `${v.toFixed(0)} ms`}
+            />
+            <Slider
+              label={t('Tone')}
+              value={reverb.tone}
+              min={REVERB_LIMITS.tone[0]}
+              max={REVERB_LIMITS.tone[1]}
+              step={0.01}
+              onChange={(v) => updateTrackReverb(track.id, { tone: v })}
+              format={(v) => (v < 0.34 ? t('Dark') : v > 0.66 ? t('Bright') : t('Neutral'))}
+            />
+            <p className="insp-note">{t('Convolution reverb — the export uses the exact same impulse response.')}</p>
+          </section>
+        )}
       </div>
     </aside>
   )
@@ -638,6 +696,7 @@ export default function Inspector() {
   const updateTrackDuck = useEditor((s) => s.updateTrackDuck)
   const updateTrackEQ = useEditor((s) => s.updateTrackEQ)
   const updateTrackComp = useEditor((s) => s.updateTrackComp)
+  const updateTrackReverb = useEditor((s) => s.updateTrackReverb)
   const selCount = useEditor((s) => s.selectedClipIds.size)
   const marker = useEditor((s) =>
     s.selectedMarkerId ? s.project.markers?.find((m) => m.id === s.selectedMarkerId) ?? null : null
@@ -659,6 +718,7 @@ export default function Inspector() {
           updateTrackDuck={updateTrackDuck}
           updateTrackEQ={updateTrackEQ}
           updateTrackComp={updateTrackComp}
+          updateTrackReverb={updateTrackReverb}
         />
       )
     return (

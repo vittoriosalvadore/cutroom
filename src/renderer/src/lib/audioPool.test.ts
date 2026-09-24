@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { DYNAMICS_DISPOSE_MESSAGE, DYNAMICS_NODE_OPTIONS, resolvePreviewBuffer } from './audioPool'
+import { DYNAMICS_DISPOSE_MESSAGE, DYNAMICS_NODE_OPTIONS, buildReverbBuffer, resolvePreviewBuffer } from './audioPool'
+import { generateReverbIR } from '../../../shared/reverb'
+import { resolveReverb } from '../state/selectors'
+import { defaultTrackReverb } from '../types'
 import type { AudioEntry } from './audioCache'
 import type { DenoiseEntry } from './denoiseCache'
 import type { Clip, Track } from '../types'
@@ -103,5 +106,35 @@ describe('dynamics worklet wiring', () => {
     expect(proc.process([[new Float32Array(128)], []], [out], params)).toBe(true)
     proc.port.onmessage?.({ data: DYNAMICS_DISPOSE_MESSAGE })
     expect(proc.process([[new Float32Array(128)], []], [out], params)).toBe(false)
+  })
+})
+
+describe('preview reverb', () => {
+  it('loads the ConvolverNode with exactly the samples the export writes to its IR WAV', () => {
+    // A stand-in context: only createBuffer + sampleRate are used.
+    const fakeCtx = {
+      sampleRate: 44100,
+      createBuffer: (channels: number, length: number, sampleRate: number) => {
+        const data = Array.from({ length: channels }, () => new Float32Array(length))
+        return { numberOfChannels: channels, length, sampleRate, getChannelData: (c: number) => data[c] }
+      }
+    } as unknown as BaseAudioContext
+    const shape = { decaySec: 0.8, preDelayMs: 12, tone: 0.4 }
+    const buf = buildReverbBuffer(fakeCtx, shape)
+    const [l, r] = generateReverbIR(shape, 44100) // what main generates at this rate
+    expect(buf.sampleRate).toBe(44100)
+    expect(buf.numberOfChannels).toBe(2)
+    expect(buf.getChannelData(0)).toEqual(l)
+    expect(buf.getChannelData(1)).toEqual(r)
+  })
+
+  it('resolveReverb: audio tracks only, enabled, non-zero mix', () => {
+    const on = { ...defaultTrackReverb(), enabled: true }
+    expect(resolveReverb({ ...audioTrack, reverb: on })).toBe(on)
+    expect(resolveReverb({ ...audioTrack, reverb: { ...on, enabled: false } })).toBeNull()
+    expect(resolveReverb({ ...audioTrack, reverb: { ...on, mix: 0 } })).toBeNull()
+    expect(resolveReverb({ ...audioTrack, reverb: { ...on, mix: NaN } })).toBeNull()
+    expect(resolveReverb({ ...videoTrack, reverb: on })).toBeNull()
+    expect(resolveReverb(audioTrack)).toBeNull()
   })
 })

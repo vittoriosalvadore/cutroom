@@ -60,6 +60,20 @@ export interface AudioPlanComp {
   makeupDb: number
 }
 
+/**
+ * Per-track convolution reverb for the export (present only when enabled with
+ * a non-zero mix). Main clamps every field and generates the impulse response
+ * from decay / pre-delay / tone with the same code as the preview.
+ */
+export interface AudioPlanReverb {
+  /** Wet amount 0..1. */
+  mix: number
+  decaySec: number
+  preDelayMs: number
+  /** 0 = dark .. 1 = bright. */
+  tone: number
+}
+
 /** One audible clip in the export plan (positions/gains for the mux filtergraph). */
 export interface AudioClipPlanEntry {
   path: string
@@ -83,6 +97,8 @@ export interface AudioClipPlanEntry {
   eq?: AudioPlanEQ
   /** Present only when the track's compressor is enabled. */
   comp?: AudioPlanComp
+  /** Present only when the track's reverb is enabled (mix > 0). */
+  reverb?: AudioPlanReverb
 }
 
 /** Inputs for the export audio-mux pass. */

@@ -15,7 +15,8 @@ import type {
   TrackGate,
   TrackDuck,
   TrackEQ,
-  TrackComp
+  TrackComp,
+  TrackReverb
 } from '../types'
 import {
   clampSpeed,
@@ -29,7 +30,8 @@ import {
   defaultTrackGate,
   defaultTrackDuck,
   defaultTrackEQ,
-  defaultTrackComp
+  defaultTrackComp,
+  defaultTrackReverb
 } from '../types'
 import {
   computeCrossfade,
@@ -260,6 +262,7 @@ interface EditorState {
   updateTrackDuck: (trackId: string, patch: Partial<TrackDuck>) => void
   updateTrackEQ: (trackId: string, patch: Partial<TrackEQ>) => void
   updateTrackComp: (trackId: string, patch: Partial<TrackComp>) => void
+  updateTrackReverb: (trackId: string, patch: Partial<TrackReverb>) => void
 
   // --- transform / keyframes ---
   /** Set the STATIC value of an animatable property (when its track is disarmed). */
@@ -1177,6 +1180,14 @@ export const useEditor = create<EditorState>((set) => {
     set((s) => {
       const tracks = s.project.tracks.map((t) =>
         t.id === trackId ? { ...t, comp: { ...(t.comp ?? defaultTrackComp()), ...patch } } : t
+      )
+      return { project: { ...s.project, tracks } }
+    }),
+
+  updateTrackReverb: (trackId, patch) =>
+    set((s) => {
+      const tracks = s.project.tracks.map((t) =>
+        t.id === trackId ? { ...t, reverb: { ...(t.reverb ?? defaultTrackReverb()), ...patch } } : t
       )
       return { project: { ...s.project, tracks } }
     }),
