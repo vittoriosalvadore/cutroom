@@ -12,6 +12,8 @@ import {
 import { sampleOpacity, sampleTransform, KEY_EPS } from '../lib/keyframes'
 import { useT } from '../lib/i18n'
 import { normalizeGainDb } from '../lib/normalize'
+import { canRemoveTrack, MAX_TRACK_HEIGHT, MIN_TRACK_HEIGHT } from '../lib/tracks'
+import { removeTrackWithConfirm } from '../lib/trackActions'
 import { denoiseCacheVersion, ensureDenoised, getDenoiseEntry, subscribeDenoiseCache } from '../lib/denoiseCache'
 import type { AnimProp, Marker, TextAlign, Track, TrackGate, TrackDuck, TrackEQ, TrackComp } from '../types'
 
@@ -156,6 +158,63 @@ function KeyableSlider(props: {
 
 const ALIGNS: TextAlign[] = ['left', 'center', 'right']
 
+/** Track layout controls: lane height, stacking order, delete. Reordering and
+ *  deleting record their own undo step (data-no-snapshot); the height slider
+ *  relies on the panel's pre-edit snapshot like every other slider. */
+function TrackLayoutSection(props: { track: Track; tracks: Track[] }) {
+  const { track, tracks } = props
+  const t = useT()
+  const index = tracks.findIndex((tr) => tr.id === track.id)
+  const removable = canRemoveTrack(tracks, track.id)
+  const st = useEditor.getState
+  return (
+    <section className="insp-section">
+      <h4>{t('Track')}</h4>
+      <Slider
+        label={t('Height')}
+        value={track.height}
+        min={MIN_TRACK_HEIGHT}
+        max={MAX_TRACK_HEIGHT}
+        step={1}
+        onChange={(v) => st().setTrackHeight(track.id, v)}
+        format={(v) => `${Math.round(v)} px`}
+      />
+      <div className="insp-row">
+        <button
+          className="btn small"
+          data-no-snapshot
+          disabled={index <= 0}
+          title={t('Move track up')}
+          onClick={() => st().moveTrack(track.id, index - 1)}
+        >
+          ▲ {t('Up')}
+        </button>
+        <button
+          className="btn small"
+          data-no-snapshot
+          disabled={index < 0 || index >= tracks.length - 1}
+          title={t('Move track down')}
+          onClick={() => st().moveTrack(track.id, index + 1)}
+        >
+          ▼ {t('Down')}
+        </button>
+        <button
+          className="btn small"
+          data-no-snapshot
+          disabled={!removable}
+          title={removable ? undefined : t('The last video or audio track can’t be deleted.')}
+          onClick={() => removeTrackWithConfirm(track.id)}
+        >
+          {t('Delete track')}
+        </button>
+      </div>
+      {track.kind === 'video' && (
+        <p className="insp-note">{t('Higher video tracks draw on top of lower ones.')}</p>
+      )}
+    </section>
+  )
+}
+
 /** Mixer + dynamics panel for a selected track: volume, pan, gate, ducking. */
 function TrackPanel(props: {
   track: Track
@@ -190,6 +249,7 @@ function TrackPanel(props: {
         <div className="insp-clipmeta">
           {track.kind} track{track.muted ? ' · muted' : ''}
         </div>
+        <TrackLayoutSection track={track} tracks={tracks} />
         <section className="insp-section">
           <h4>Mixer</h4>
           <Slider

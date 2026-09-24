@@ -553,3 +553,101 @@ describe('streamed subtitle import', () => {
     expect(Object.values(useEditor.getState().project.clips).some((c) => c.role === 'subtitle')).toBe(false)
   })
 })
+
+describe('track management', () => {
+  const withTracks = (): void => {
+    const p = makeProject()
+    p.tracks = [
+      { id: 'v1', kind: 'video', name: 'V1', height: 68, muted: false, hidden: false },
+      { id: 'v2', kind: 'video', name: 'V2', height: 68, muted: false, hidden: false },
+      { id: 'a1', kind: 'audio', name: 'A1', height: 52, muted: false, hidden: false },
+      {
+        id: 'a2',
+        kind: 'audio',
+        name: 'A2',
+        height: 52,
+        muted: false,
+        hidden: false,
+        duck: { enabled: true, triggerTrackId: 'a1', thresholdDb: -30, ratio: 8, attackMs: 20, releaseMs: 250 }
+      }
+    ]
+    p.clips.c3 = { ...p.clips.c3, trackId: 'v2' }
+    p.clips.c4 = { id: 'c4', trackId: 'a1', mediaId: 'm1', startSec: 0, durationSec: 5, inSec: 0 }
+    useEditor.setState({ project: p, past: [], future: [], selectedTrackId: null })
+  }
+  const ids = (): string[] => useEditor.getState().project.tracks.map((t) => t.id)
+
+  it('addVideoTrack inserts above the topmost video track, undoably', () => {
+    useEditor.getState().addVideoTrack()
+    const tracks = useEditor.getState().project.tracks
+    expect(tracks[0].kind).toBe('video')
+    expect(tracks[0].name).toBe('V2')
+    expect(tracks[1].id).toBe('v1')
+    useEditor.getState().undo()
+    expect(ids()).toEqual(['v1'])
+  })
+
+  it('removeTrack deletes its clips, prunes selection and dangling duck triggers', () => {
+    withTracks()
+    useEditor.getState().setClipSelection(['c1', 'c3'])
+    useEditor.getState().removeTrack('v2')
+    let s = useEditor.getState()
+    expect(ids()).toEqual(['v1', 'a1', 'a2'])
+    expect(s.project.clips.c3).toBeUndefined()
+    expect([...s.selectedClipIds]).toEqual(['c1'])
+
+    useEditor.getState().selectTrack('a1')
+    useEditor.getState().removeTrack('a1')
+    s = useEditor.getState()
+    expect(s.project.clips.c4).toBeUndefined()
+    expect(s.project.tracks.find((t) => t.id === 'a2')!.duck!.triggerTrackId).toBeNull()
+    expect(s.selectedTrackId).toBeNull()
+
+    // One undo step per removal, restoring the clips and the ducker link.
+    useEditor.getState().undo()
+    s = useEditor.getState()
+    expect(s.project.clips.c4).toBeDefined()
+    expect(s.project.tracks.find((t) => t.id === 'a2')!.duck!.triggerTrackId).toBe('a1')
+    useEditor.getState().undo()
+    expect(ids()).toEqual(['v1', 'v2', 'a1', 'a2'])
+    expect(useEditor.getState().project.clips.c3.trackId).toBe('v2')
+  })
+
+  it('refuses to remove the last video (or audio) track', () => {
+    useEditor.getState().removeTrack('v1')
+    expect(ids()).toEqual(['v1'])
+    expect(useEditor.getState().past.length).toBe(0)
+  })
+
+  it('moveTrack reorders (stacking order) as one undo step; no-op records nothing', () => {
+    withTracks()
+    useEditor.getState().moveTrack('v2', 0)
+    expect(ids()).toEqual(['v2', 'v1', 'a1', 'a2'])
+    expect(useEditor.getState().past.length).toBe(1)
+    useEditor.getState().moveTrack('v2', 0)
+    expect(useEditor.getState().past.length).toBe(1)
+    useEditor.getState().undo()
+    expect(ids()).toEqual(['v1', 'v2', 'a1', 'a2'])
+    useEditor.getState().redo()
+    expect(ids()).toEqual(['v2', 'v1', 'a1', 'a2'])
+  })
+
+  it('setTrackHeight clamps and pairs with snapshot for a single undo', () => {
+    useEditor.getState().snapshot()
+    useEditor.getState().setTrackHeight('v1', 120)
+    useEditor.getState().setTrackHeight('v1', 5000)
+    expect(useEditor.getState().project.tracks[0].height).toBe(200)
+    useEditor.getState().setTrackHeight('v1', 1)
+    expect(useEditor.getState().project.tracks[0].height).toBe(36)
+    useEditor.getState().undo()
+    expect(useEditor.getState().project.tracks[0].height).toBe(68)
+  })
+
+  it('undoing an added track clears it from the track selection', () => {
+    useEditor.getState().addVideoTrack()
+    const added = useEditor.getState().project.tracks[0].id
+    useEditor.getState().selectTrack(added)
+    useEditor.getState().undo()
+    expect(useEditor.getState().selectedTrackId).toBeNull()
+  })
+})

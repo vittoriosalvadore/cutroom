@@ -650,6 +650,55 @@ input[type='color']:hover {
   display: block;
   cursor: crosshair;
 }
+/* track-header context menu */
+.tl-menu {
+  position: absolute;
+  z-index: 20;
+  min-width: 176px;
+  padding: var(--sp-2);
+  background: var(--panel-3);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-md);
+  display: flex;
+  flex-direction: column;
+}
+.tl-menu-title {
+  padding: var(--sp-2) var(--sp-4) var(--sp-3);
+  font-size: var(--fs-11);
+  font-weight: var(--fw-semibold);
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-cap);
+}
+.tl-menu button {
+  all: unset;
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--r-xs);
+  font-size: var(--fs-12);
+  color: var(--text-2);
+  cursor: pointer;
+}
+.tl-menu button:hover:not(:disabled),
+.tl-menu button:focus-visible {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.tl-menu button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.tl-menu button.danger {
+  color: var(--danger);
+}
+.tl-menu button.danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+}
+.tl-menu-sep {
+  height: 1px;
+  margin: var(--sp-2) 0;
+  background: var(--line);
+}
 
 /* ---- inspector ---- */
 .inspector {

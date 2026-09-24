@@ -39,16 +39,14 @@ candidate features. Ordered roughly by how much they came up. Update as we go.
    per-track audio chain to gain a native wet/dry node (graph rewiring) — its own pass.
 2. **i18n full coverage** — framework + switcher + chrome shipped; sweep the remaining
    Inspector/Transport/MediaBin strings into the dictionary (incremental).
-3. **Rubber-band marquee** selection (shift/ctrl-click + group ops shipped; marquee deferred).
-4. **Track management** — reorder, add/remove video tracks, resize lane height.
-5. **Export presets** — resolution / bitrate / format presets.
-6. **Proxy / optimized media** for heavy footage.
-7. **Transport niceties** — J/K/L shuttle, frame-step, audio scrubbing.
-8. **Preview quality setting** — render the preview at half resolution for perf
+3. **Export presets** — resolution / bitrate / format presets.
+4. **Proxy / optimized media** for heavy footage.
+5. **Transport niceties** — J/K/L shuttle, frame-step, audio scrubbing.
+6. **Preview quality setting** — render the preview at half resolution for perf
    (deferred from Options to avoid touching the compositor before transform).
-9. **Hardware export encoder** — h264_nvenc / qsv / amf with x264 fallback; needs
+7. **Hardware export encoder** — h264_nvenc / qsv / amf with x264 fallback; needs
    encoder probing + per-encoder args (deferred from Options; CRF/preset shipped).
-10. **Color curves / scopes** — beyond primary grade: RGB curves, histogram/vectorscope.
+8. **Color curves / scopes** — beyond primary grade: RGB curves, histogram/vectorscope.
 
 ## Done
 
@@ -87,4 +85,8 @@ candidate features. Ordered roughly by how much they came up. Update as we go.
   parity-perfect since it's just a gain). Inspector → track → Normalize.
 - **i18n / languages** — `t()`/`useT()` framework (English = key, fallback-safe), EN/ES/FR/DE
   dictionaries, language switcher in Options; chrome (top bar, Options, Inspector) translated.
-</content>
+- **Rubber-band marquee** — drag on empty lane space to box-select clips (Shift/Ctrl adds);
+  scroll-aware; a plain click still deselects + seeks. Pure hit-test in `lib/tracks.ts`.
+- **Track management** — `+ Video` / `+ Audio`, delete (confirm if it has clips; last video /
+  audio track kept), reorder (drag header, right-click menu, Inspector ▲/▼ = compositor stacking),
+  drag a lane's bottom edge to resize (36–200 px, saved). All undoable.

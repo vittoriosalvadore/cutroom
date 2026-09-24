@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useEditor } from '../state/store'
 import { useSettings } from '../state/settings'
 import { audioCacheVersion, getAudioEntry, PEAKS_PER_SEC, subscribeAudioCache } from '../lib/audioCache'
@@ -7,12 +7,18 @@ import { roundRectPath } from '../lib/canvas'
 import { clipSpeed } from '../lib/clipTime'
 import { timelineDuration } from '../lib/exporter'
 import { clampScrollSec, clampScrollY, followPlayhead, zoomAnchoredScroll } from '../lib/timelineScroll'
+import { canRemoveTrack, clipsInMarquee, trackDropTarget } from '../lib/tracks'
+import { removeTrackWithConfirm } from '../lib/trackActions'
+import { useT } from '../lib/i18n'
 import type { Clip, Project, Track, TrackKind } from '../types'
 
 // Layout constants (in CSS pixels).
 const GUTTER = 78 // left label column width
 const RULER = 28 // top time-ruler height
 const EDGE_PX = 7 // grab zone (and drawn width) of a trim handle
+const CLIP_PAD = 5 // clips are inset this far from their lane's top/bottom
+const RESIZE_PX = 4 // grab zone either side of a lane's bottom edge (in the gutter)
+const DRAG_SLOP = 4 // px of movement before a press becomes a marquee / track drag
 
 // Canvas can't read CSS variables, so mirror the "Graphite Cut" tokens here.
 const TL_COLORS = {
@@ -50,7 +56,8 @@ const TL_COLORS = {
   keyframe: '#ffd866',
   marker: '#ffcf4d',
   markerSel: '#ffffff',
-  playhead: '#ff5350'
+  playhead: '#ff5350',
+  marquee: '#4c8dff'
 }
 
 // Pull the structural timeline colours from the active theme's CSS variables, so
@@ -73,6 +80,7 @@ function refreshTimelineColors(): void {
   TL_COLORS.clipStrokeSel = v('--accent', '#6f9fff')
   TL_COLORS.trimHandle = v('--accent', '#4c8dff')
   TL_COLORS.stripeVideo = v('--accent', '#4c8dff')
+  TL_COLORS.marquee = v('--accent', '#4c8dff')
   TL_COLORS.muteOffBg = v('--line', '#2a2d38')
   TL_COLORS.muteOffText = v('--muted', '#7d8294')
 }
@@ -141,6 +149,14 @@ function muteRect(lane: Lane): { x: number; y: number; w: number; h: number } {
   return { x: GUTTER - w - 6, y: (lane.top + lane.bottom) / 2 - h / 2, w, h }
 }
 
+/** The lane whose bottom edge (the resize grip) is within RESIZE_PX of `y`. */
+function laneEdgeAt(lanes: Lane[], y: number): Lane | null {
+  for (const lane of lanes) {
+    if (lane.bottom >= RULER && Math.abs(y - lane.bottom) <= RESIZE_PX) return lane
+  }
+  return null
+}
+
 /** Pick a ruler label interval (seconds) so labels sit ~80px apart. */
 function chooseStep(pxPerSec: number): number {
   const raw = 80 / pxPerSec
@@ -172,6 +188,31 @@ type DragState =
     }
   | { mode: 'group'; anchorClipId: string; startT: number; minOrigStart: number; applied: number; histPushed: boolean }
   | { mode: 'seek' }
+  /** Press on empty lane space: a click (seek + deselect) until it moves past
+   *  DRAG_SLOP, then a rubber band. The anchor is in timeline seconds + content
+   *  px so it stays put if the view scrolls mid-drag. */
+  | {
+      mode: 'marquee'
+      downX: number
+      downY: number
+      t0: number
+      y0: number
+      additive: boolean
+      /** Selection at press time (kept and unioned with hits when additive). */
+      base: string[]
+      active: boolean
+    }
+  /** Drag a lane's bottom edge in the gutter to resize it. */
+  | { mode: 'resize'; trackId: string; downY: number; origHeight: number; histPushed: boolean }
+  /** Drag a track header to reorder (activates past DRAG_SLOP). */
+  | { mode: 'track'; trackId: string; downY: number; active: boolean; index: number }
+  | null
+
+/** Transient drag feedback drawn over the canvas (not part of the cached layer).
+ *  Marquee corners are in timeline seconds + content px; `gap` is a lane boundary. */
+type Overlay =
+  | { kind: 'marquee'; t0: number; y0: number; t1: number; y1: number }
+  | { kind: 'insert'; gap: number }
   | null
 
 /** Scroll position: `x` = time (s) at the lane area's left edge, `y` = lane px. */
@@ -184,6 +225,11 @@ export default function Timeline() {
   const containerRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const drag = useRef<DragState>(null)
+  const [overlay, setOverlay] = useState<Overlay>(null)
+  // Track-header context menu (position in container px).
+  const [menu, setMenu] = useState<{ x: number; y: number; trackId: string } | null>(null)
+  const closeMenu = useCallback(() => setMenu(null), [])
+  const t = useT()
 
   // Scroll state. Mirrored in a ref so native listeners / handlers always read
   // the latest value without re-binding.
@@ -218,6 +264,7 @@ export default function Timeline() {
   const selKey = useEditor((s) => [...s.selectedClipIds].sort().join(','))
   const selectedMarkerId = useEditor((s) => s.selectedMarkerId)
   const addAudioTrack = useEditor((s) => s.addAudioTrack)
+  const addVideoTrack = useEditor((s) => s.addVideoTrack)
   const showWaveforms = useSettings((s) => s.showWaveforms)
   const snapping = useSettings((s) => s.snapping)
   const themeSig = useSettings((s) => `${s.theme}|${s.accent}`)
@@ -670,6 +717,33 @@ export default function Timeline() {
         ctx.closePath()
         ctx.fill()
       }
+
+      // Drag feedback: the rubber band (lane area only) or a track-drop line.
+      if (overlay?.kind === 'marquee') {
+        const x0 = GUTTER + (Math.min(overlay.t0, overlay.t1) - sx) * pxPerSec
+        const x1 = GUTTER + (Math.max(overlay.t0, overlay.t1) - sx) * pxPerSec
+        const y0 = RULER - sy + Math.min(overlay.y0, overlay.y1)
+        const y1 = RULER - sy + Math.max(overlay.y0, overlay.y1)
+        ctx.save()
+        ctx.beginPath()
+        ctx.rect(GUTTER, RULER, w - GUTTER, h - RULER)
+        ctx.clip()
+        ctx.globalAlpha = 0.14
+        ctx.fillStyle = TL_COLORS.marquee
+        ctx.fillRect(x0, y0, x1 - x0, y1 - y0)
+        ctx.globalAlpha = 0.9
+        ctx.strokeStyle = TL_COLORS.marquee
+        ctx.lineWidth = 1
+        ctx.strokeRect(Math.round(x0) + 0.5, Math.round(y0) + 0.5, Math.round(x1 - x0), Math.round(y1 - y0))
+        ctx.restore()
+      } else if (overlay?.kind === 'insert') {
+        let gy = RULER - sy
+        for (let i = 0; i < overlay.gap && i < project.tracks.length; i++) gy += project.tracks[i].height
+        if (gy >= RULER - 1 && gy <= h + 1) {
+          ctx.fillStyle = TL_COLORS.marquee
+          ctx.fillRect(0, Math.max(RULER, gy - 1), w, 3)
+        }
+      }
     }
 
     render()
@@ -681,7 +755,7 @@ export default function Timeline() {
     })
     ro.observe(container)
     return () => ro.disconnect()
-  }, [project, playhead, pxPerSec, selKey, selectedMarkerId, audioVersion, showWaveforms, themeSig, view])
+  }, [project, playhead, pxPerSec, selKey, selectedMarkerId, audioVersion, showWaveforms, themeSig, view, overlay])
 
   // --- pointer interactions (seek + drag-to-move clips) ---
   const localPoint = (e: React.PointerEvent | React.MouseEvent): { x: number; y: number } => {
@@ -691,6 +765,8 @@ export default function Timeline() {
   // px <-> time through the current zoom and horizontal scroll.
   const xToTime = (x: number): number => viewRef.current.x + (x - GUTTER) / useEditor.getState().pxPerSec
   const timeToXNow = (t: number): number => GUTTER + (t - viewRef.current.x) * useEditor.getState().pxPerSec
+  // Canvas y <-> content y (0 = top of the first lane, independent of scroll).
+  const yToContent = (y: number): number => y - RULER + viewRef.current.y
 
   // Hit-test a point against clips, distinguishing the edge (trim) zones from
   // the body (move) zone. Later-drawn clips sit on top, so iterate in reverse.
@@ -716,10 +792,13 @@ export default function Timeline() {
   }
 
   const onPointerDown = (e: React.PointerEvent): void => {
+    if (e.button !== 0) return // right button opens the track menu (onContextMenu)
     const { x, y } = localPoint(e)
     const st = useEditor.getState()
+    setMenu(null)
 
-    // Gutter: the M badge toggles mute; clicking elsewhere selects the track.
+    // Gutter: the M badge toggles mute; a lane's bottom edge resizes it; the
+    // rest of the header selects the track and can be dragged to reorder.
     if (x < GUTTER) {
       if (y <= RULER) return // ruler corner (lanes may be scrolled under it)
       const lanes = computeLanes(st.project.tracks, viewRef.current.y)
@@ -730,8 +809,19 @@ export default function Timeline() {
           return
         }
       }
+      const edge = laneEdgeAt(lanes, y)
+      if (edge) {
+        drag.current = { mode: 'resize', trackId: edge.id, downY: y, origHeight: edge.height, histPushed: false }
+        ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+        return
+      }
       const lane = lanes.find((l) => y >= l.top && y <= l.bottom)
-      if (lane) st.selectTrack(lane.id)
+      if (lane) {
+        st.selectTrack(lane.id)
+        const index = st.project.tracks.findIndex((tr) => tr.id === lane.id)
+        drag.current = { mode: 'track', trackId: lane.id, downY: y, active: false, index }
+        ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+      }
       return
     }
 
@@ -797,11 +887,21 @@ export default function Timeline() {
       return
     }
 
-    // Otherwise: click in the time area scrubs the playhead.
+    // Otherwise: empty lane space. A plain click deselects + seeks (on release,
+    // in endDrag); dragging past DRAG_SLOP draws a rubber-band selection
+    // instead. Shift/Ctrl/Cmd adds the boxed clips to the current selection.
     if (x > GUTTER) {
-      st.selectClip(null)
-      st.setPlayhead(xToTime(x))
-      drag.current = { mode: 'seek' }
+      const additive = e.shiftKey || e.ctrlKey || e.metaKey
+      drag.current = {
+        mode: 'marquee',
+        downX: x,
+        downY: y,
+        t0: xToTime(x),
+        y0: yToContent(y),
+        additive,
+        base: additive ? [...st.selectedClipIds] : [],
+        active: false
+      }
       ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
     }
   }
@@ -816,19 +916,62 @@ export default function Timeline() {
       const hit = hitTest(x, y)
       const canvas = canvasRef.current
       if (canvas) {
+        const inGutterLanes = x < GUTTER && y > RULER
+        const lanes = inGutterLanes ? computeLanes(st.project.tracks, viewRef.current.y) : []
         canvas.style.cursor = hit
           ? hit.zone === 'body'
             ? 'grab'
             : 'ew-resize'
           : x > GUTTER
             ? 'crosshair'
-            : 'default'
+            : inGutterLanes && laneEdgeAt(lanes, y)
+              ? 'ns-resize'
+              : 'default'
       }
       return
     }
 
     if (d.mode === 'seek') {
       st.setPlayhead(xToTime(x))
+      return
+    }
+
+    if (d.mode === 'marquee') {
+      if (!d.active) {
+        if (Math.hypot(x - d.downX, y - d.downY) < DRAG_SLOP) return
+        d.active = true
+      }
+      const rect = { t0: d.t0, y0: d.y0, t1: xToTime(x), y1: yToContent(y) }
+      const hits = clipsInMarquee(st.project.tracks, st.project.clips, rect, CLIP_PAD)
+      const next = d.additive ? [...d.base, ...hits.filter((id) => !d.base.includes(id))] : hits
+      // Only touch the store when the set changes (each change repaints the clips).
+      // An empty non-additive box still clears a track/marker selection once.
+      const cur = st.selectedClipIds
+      const changed = next.length !== cur.size || next.some((id) => !cur.has(id))
+      if (changed || (next.length === 0 && (st.selectedTrackId || st.selectedMarkerId))) st.setClipSelection(next)
+      setOverlay({ kind: 'marquee', ...rect })
+      return
+    }
+
+    if (d.mode === 'track') {
+      if (!d.active) {
+        if (Math.abs(y - d.downY) < DRAG_SLOP) return
+        d.active = true
+      }
+      const target = trackDropTarget(st.project.tracks, d.trackId, yToContent(y))
+      d.index = target.index
+      setOverlay({ kind: 'insert', gap: target.gap })
+      if (canvasRef.current) canvasRef.current.style.cursor = 'grabbing'
+      return
+    }
+
+    // Lane resize: snapshot once on the first real move, so the drag = 1 undo.
+    if (d.mode === 'resize') {
+      if (!d.histPushed) {
+        st.snapshot()
+        d.histPushed = true
+      }
+      st.setTrackHeight(d.trackId, d.origHeight + (y - d.downY))
       return
     }
 
@@ -880,9 +1023,23 @@ export default function Timeline() {
 
   const endDrag = (e: React.PointerEvent): void => {
     const d = drag.current
+    const st = useEditor.getState()
+    const cancelled = e.type === 'pointercancel'
     // A plain click (no move) on a clip already in a multi-selection collapses to it.
-    if (d && d.mode === 'group' && !d.histPushed) useEditor.getState().selectClip(d.anchorClipId)
+    if (d && d.mode === 'group' && !d.histPushed && !cancelled) st.selectClip(d.anchorClipId)
+    // A press on empty space that never became a rubber band is a click: seek
+    // there and (unless a modifier was held) clear the selection.
+    if (d && d.mode === 'marquee' && !d.active && !cancelled) {
+      if (!d.additive) st.selectClip(null)
+      st.setPlayhead(d.t0)
+    }
+    // Dropping a dragged track header moves the track (one undo step; no-op if unmoved).
+    if (d && d.mode === 'track' && d.active && !cancelled) st.moveTrack(d.trackId, d.index)
+    setOverlay(null)
+    if (d && d.mode === 'track' && canvasRef.current) canvasRef.current.style.cursor = 'default'
     drag.current = null
+    // Re-clamp scroll skipped mid-drag (e.g. a lane shrunk while scrolled down).
+    if (d && d.mode === 'resize') applyViewRef.current(viewRef.current)
     try {
       ;(e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId)
     } catch {
@@ -890,11 +1047,20 @@ export default function Timeline() {
     }
   }
 
-  // Right-click a marker flag in the ruler to delete it.
+  // Right-click a marker flag in the ruler to delete it; right-click a track
+  // header to open the track menu.
   const onContextMenu = (e: React.MouseEvent): void => {
     const { x, y } = localPoint(e)
-    if (y > RULER || y < RULER - 10 || x < GUTTER) return
     const st = useEditor.getState()
+    if (x < GUTTER && y > RULER) {
+      e.preventDefault()
+      const lane = computeLanes(st.project.tracks, viewRef.current.y).find((l) => y >= l.top && y <= l.bottom)
+      if (!lane) return
+      st.selectTrack(lane.id)
+      setMenu({ x, y, trackId: lane.id })
+      return
+    }
+    if (y > RULER || y < RULER - 10 || x < GUTTER) return
     for (const m of st.project.markers ?? []) {
       if (Math.abs(x - timeToXNow(m.timeSec)) <= 7) {
         e.preventDefault()
@@ -910,15 +1076,19 @@ export default function Timeline() {
         <span>Timeline</span>
         <span className="hint">
           drag to move · drag edges to trim · S split · X crossfade · M marker · ,/. jump · shift-click
-          multi-select · Ctrl+A all · Ctrl+C/V copy · Del remove · wheel scroll · Ctrl+wheel zoom
+          multi-select · drag empty area to box-select · Ctrl+A all · Ctrl+C/V copy · Del remove · wheel
+          scroll · Ctrl+wheel zoom · track header: drag to reorder, bottom edge to resize, right-click for menu
         </span>
         <button
           className="btn small"
-          title="Add an audio track"
+          title={t('Add a video track')}
           style={{ marginLeft: 'auto' }}
-          onClick={() => addAudioTrack()}
+          onClick={() => addVideoTrack()}
         >
-          + Audio
+          + {t('Video')}
+        </button>
+        <button className="btn small" title={t('Add an audio track')} onClick={() => addAudioTrack()}>
+          + {t('Audio')}
         </button>
       </div>
       <div
@@ -931,7 +1101,101 @@ export default function Timeline() {
         onContextMenu={onContextMenu}
       >
         <canvas ref={canvasRef} />
+        {menu && <TrackMenu {...menu} onClose={closeMenu} />}
       </div>
     </section>
+  )
+}
+
+/**
+ * Right-click menu for a track header: reorder (stacking order — top lane
+ * composites on top), add tracks, delete. Positioned in the canvas wrap's
+ * coordinates and nudged inside it; closes on any outside press, Esc or blur.
+ */
+function TrackMenu(props: { x: number; y: number; trackId: string; onClose: () => void }) {
+  const { x, y, trackId, onClose } = props
+  const t = useT()
+  const tracks = useEditor((s) => s.project.tracks)
+  const ref = useRef<HTMLDivElement>(null)
+  const [pos, setPos] = useState({ left: x, top: y })
+
+  // Keep the menu inside the timeline (it opens near the bottom lanes a lot).
+  useLayoutEffect(() => {
+    const el = ref.current
+    const parent = el?.offsetParent as HTMLElement | null
+    if (!el || !parent) return
+    setPos({
+      left: Math.max(0, Math.min(x, parent.clientWidth - el.offsetWidth - 4)),
+      top: Math.max(0, Math.min(y, parent.clientHeight - el.offsetHeight - 4))
+    })
+  }, [x, y])
+
+  useEffect(() => {
+    const onDown = (e: PointerEvent): void => {
+      if (!ref.current?.contains(e.target as Node)) onClose()
+    }
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('pointerdown', onDown, true)
+    window.addEventListener('keydown', onKey)
+    window.addEventListener('blur', onClose)
+    window.addEventListener('wheel', onClose, { passive: true })
+    return () => {
+      window.removeEventListener('pointerdown', onDown, true)
+      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('blur', onClose)
+      window.removeEventListener('wheel', onClose)
+    }
+  }, [onClose])
+
+  const index = tracks.findIndex((tr) => tr.id === trackId)
+  if (index < 0) return null
+  const run = (fn: () => void) => (): void => {
+    fn()
+    onClose()
+  }
+  const st = useEditor.getState
+  return (
+    <div
+      ref={ref}
+      className="tl-menu"
+      role="menu"
+      style={{ left: pos.left, top: pos.top }}
+      onPointerDown={(e) => e.stopPropagation()}
+      onContextMenu={(e) => {
+        e.preventDefault()
+        e.stopPropagation()
+      }}
+    >
+      <div className="tl-menu-title">{tracks[index].name}</div>
+      <button role="menuitem" disabled={index === 0} onClick={run(() => st().moveTrack(trackId, index - 1))}>
+        {t('Move track up')}
+      </button>
+      <button
+        role="menuitem"
+        disabled={index === tracks.length - 1}
+        onClick={run(() => st().moveTrack(trackId, index + 1))}
+      >
+        {t('Move track down')}
+      </button>
+      <div className="tl-menu-sep" />
+      <button role="menuitem" onClick={run(() => st().addVideoTrack())}>
+        {t('Add a video track')}
+      </button>
+      <button role="menuitem" onClick={run(() => st().addAudioTrack())}>
+        {t('Add an audio track')}
+      </button>
+      <div className="tl-menu-sep" />
+      <button
+        role="menuitem"
+        className="danger"
+        disabled={!canRemoveTrack(tracks, trackId)}
+        title={canRemoveTrack(tracks, trackId) ? undefined : t('The last video or audio track can’t be deleted.')}
+        onClick={run(() => removeTrackWithConfirm(trackId))}
+      >
+        {t('Delete track')}
+      </button>
+    </div>
   )
 }

@@ -58,7 +58,22 @@ const STRINGS: Record<Exclude<Lang, 'en'>, Record<string, string>> = {
     Language: 'Idioma',
     'Reduce motion': 'Reducir movimiento',
     'Done': 'Hecho',
-    'Reset to defaults': 'Restablecer valores'
+    'Reset to defaults': 'Restablecer valores',
+    // timeline / track management
+    Video: 'Vídeo',
+    'Add a video track': 'Añadir pista de vídeo',
+    'Add an audio track': 'Añadir pista de audio',
+    'Move track up': 'Subir pista',
+    'Move track down': 'Bajar pista',
+    'Delete track': 'Eliminar pista',
+    'The last video or audio track can’t be deleted.': 'No se puede eliminar la última pista de vídeo o de audio.',
+    'Delete track "{name}" and its {n} clip(s)?': '¿Eliminar la pista "{name}" y sus {n} clip(s)?',
+    Track: 'Pista',
+    Height: 'Altura',
+    Up: 'Subir',
+    Down: 'Bajar',
+    'Higher video tracks draw on top of lower ones.':
+      'Las pistas de vídeo superiores se dibujan encima de las inferiores.'
   },
   fr: {
     New: 'Nouveau',
@@ -95,7 +110,21 @@ const STRINGS: Record<Exclude<Lang, 'en'>, Record<string, string>> = {
     Language: 'Langue',
     'Reduce motion': 'Réduire les animations',
     Done: 'Terminé',
-    'Reset to defaults': 'Valeurs par défaut'
+    'Reset to defaults': 'Valeurs par défaut',
+    Video: 'Vidéo',
+    'Add a video track': 'Ajouter une piste vidéo',
+    'Add an audio track': 'Ajouter une piste audio',
+    'Move track up': 'Monter la piste',
+    'Move track down': 'Descendre la piste',
+    'Delete track': 'Supprimer la piste',
+    'The last video or audio track can’t be deleted.': 'La dernière piste vidéo ou audio ne peut pas être supprimée.',
+    'Delete track "{name}" and its {n} clip(s)?': 'Supprimer la piste « {name} » et ses {n} clip(s) ?',
+    Track: 'Piste',
+    Height: 'Hauteur',
+    Up: 'Monter',
+    Down: 'Descendre',
+    'Higher video tracks draw on top of lower ones.':
+      'Les pistes vidéo supérieures s’affichent au-dessus des pistes inférieures.'
   },
   de: {
     New: 'Neu',
@@ -132,7 +161,20 @@ const STRINGS: Record<Exclude<Lang, 'en'>, Record<string, string>> = {
     Language: 'Sprache',
     'Reduce motion': 'Bewegung reduzieren',
     Done: 'Fertig',
-    'Reset to defaults': 'Standard wiederherstellen'
+    'Reset to defaults': 'Standard wiederherstellen',
+    Video: 'Video',
+    'Add a video track': 'Videospur hinzufügen',
+    'Add an audio track': 'Audiospur hinzufügen',
+    'Move track up': 'Spur nach oben',
+    'Move track down': 'Spur nach unten',
+    'Delete track': 'Spur löschen',
+    'The last video or audio track can’t be deleted.': 'Die letzte Video- oder Audiospur kann nicht gelöscht werden.',
+    'Delete track "{name}" and its {n} clip(s)?': 'Spur „{name}“ und ihre {n} Clip(s) löschen?',
+    Track: 'Spur',
+    Height: 'Höhe',
+    Up: 'Hoch',
+    Down: 'Runter',
+    'Higher video tracks draw on top of lower ones.': 'Höhere Videospuren werden über tieferen gezeichnet.'
   }
 }
 

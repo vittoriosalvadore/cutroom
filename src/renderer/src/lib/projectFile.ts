@@ -1,4 +1,5 @@
 import type { AnimProp, Clip, Easing, Keyframe, MediaItem, Marker, Project, Track } from '../types'
+import { clampTrackHeight } from './tracks'
 
 // ---------------------------------------------------------------------------
 // Pure project (de)serialization. Defensive on the way IN so a corrupt or
@@ -69,7 +70,7 @@ function sanitizeTracks(raw: unknown[]): Track[] | string {
     out.push({
       ...(t as unknown as Track),
       name: typeof t.name === 'string' ? t.name : t.id,
-      height: num(t.height, t.kind === 'audio' ? 52 : 68),
+      height: clampTrackHeight(num(t.height, t.kind === 'audio' ? 52 : 68)),
       muted: t.muted === true,
       hidden: t.hidden === true
     })

@@ -41,6 +41,7 @@ import {
   splitClipAt
 } from '../lib/editing'
 import { clampFades } from '../lib/fades'
+import { canRemoveTrack, clampTrackHeight, moveTrackTo, newVideoTrackIndex, nextTrackName } from '../lib/tracks'
 import { clampProp, keyIndexAt, KEY_EPS, rebaseTracks, sortKeys, splitTracksAt, withTransformProp } from '../lib/keyframes'
 import { useSettings } from './settings'
 
@@ -243,6 +244,16 @@ interface EditorState {
   setDenoiseEnabled: (clipId: string, enabled: boolean) => void
   toggleTrackMute: (trackId: string, muted: boolean) => void
   addAudioTrack: (name?: string) => void
+  /** Add a video track above the topmost video track (under the subtitle lane). */
+  addVideoTrack: (name?: string) => void
+  /** Delete a track and every clip on it (one undo step). No-op for the last
+   *  video / audio track (see canRemoveTrack). */
+  removeTrack: (trackId: string) => void
+  /** Reorder: move a track to its final index in Project.tracks (= stacking
+   *  order: index 0 composites on top). One undo step. */
+  moveTrack: (trackId: string, toIndex: number) => void
+  /** Set a lane's height (clamped). No internal history; the resize drag snapshots. */
+  setTrackHeight: (trackId: string, height: number) => void
   selectTrack: (trackId: string | null) => void
   updateTrack: (trackId: string, patch: { audioGain?: number; pan?: number; name?: string }) => void
   updateTrackGate: (trackId: string, patch: Partial<TrackGate>) => void
@@ -418,12 +429,24 @@ function removedIds(before: Record<string, Clip>, after: Record<string, Clip>): 
 function pruneToProject(
   s: EditorState,
   project: Project
-): { selectedClipId: string | null; selectedClipIds: Set<string>; selectedMarkerId: string | null } {
+): {
+  selectedClipId: string | null
+  selectedClipIds: Set<string>
+  selectedMarkerId: string | null
+  selectedTrackId: string | null
+} {
   const ids = new Set([...s.selectedClipIds].filter((id) => project.clips[id]))
   const primary =
     s.selectedClipId && project.clips[s.selectedClipId] ? s.selectedClipId : ids.size > 0 ? [...ids][0] : null
   const markerOk = !!s.selectedMarkerId && (project.markers ?? []).some((m) => m.id === s.selectedMarkerId)
-  return { selectedClipId: primary, selectedClipIds: ids, selectedMarkerId: markerOk ? s.selectedMarkerId : null }
+  // Undoing an "add track" (or redoing a delete) can remove the selected track.
+  const trackOk = !!s.selectedTrackId && project.tracks.some((t) => t.id === s.selectedTrackId)
+  return {
+    selectedClipId: primary,
+    selectedClipIds: ids,
+    selectedMarkerId: markerOk ? s.selectedMarkerId : null,
+    selectedTrackId: trackOk ? s.selectedTrackId : null
+  }
 }
 
 /** A single-clip selection set + that clip as primary (the common case). */
@@ -1061,6 +1084,60 @@ export const useEditor = create<EditorState>((set) => {
         hidden: false
       }
       return { ...recordHistory(s), project: { ...s.project, tracks: [...s.project.tracks, track] } }
+    }),
+
+  addVideoTrack: (name) =>
+    set((s) => {
+      const track: Track = {
+        id: uid('t'),
+        kind: 'video',
+        name: name ?? nextTrackName(s.project.tracks, 'video'),
+        height: 68,
+        muted: false,
+        hidden: false
+      }
+      const tracks = [...s.project.tracks]
+      tracks.splice(newVideoTrackIndex(tracks), 0, track)
+      return { ...recordHistory(s), project: { ...s.project, tracks } }
+    }),
+
+  removeTrack: (trackId) =>
+    set((s) => {
+      if (!canRemoveTrack(s.project.tracks, trackId)) return {}
+      const clips = { ...s.project.clips }
+      const removed = new Set<string>()
+      for (const c of Object.values(s.project.clips)) {
+        if (c.trackId === trackId) {
+          delete clips[c.id]
+          removed.add(c.id)
+        }
+      }
+      // A ducker keyed off the deleted track would reference a dangling id.
+      const tracks = s.project.tracks
+        .filter((t) => t.id !== trackId)
+        .map((t) => (t.duck?.triggerTrackId === trackId ? { ...t, duck: { ...t.duck, triggerTrackId: null } } : t))
+      return {
+        ...recordHistory(s),
+        project: { ...s.project, tracks, clips },
+        ...pruneSelection(s, removed),
+        selectedTrackId: s.selectedTrackId === trackId ? null : s.selectedTrackId
+      }
+    }),
+
+  moveTrack: (trackId, toIndex) =>
+    set((s) => {
+      const tracks = moveTrackTo(s.project.tracks, trackId, toIndex)
+      if (tracks === s.project.tracks) return {}
+      return { ...recordHistory(s), project: { ...s.project, tracks } }
+    }),
+
+  setTrackHeight: (trackId, height) =>
+    set((s) => {
+      const h = clampTrackHeight(height)
+      const cur = s.project.tracks.find((t) => t.id === trackId)
+      if (!cur || cur.height === h) return {}
+      const tracks = s.project.tracks.map((t) => (t.id === trackId ? { ...t, height: h } : t))
+      return { project: { ...s.project, tracks } }
     }),
 
   selectTrack: (trackId) =>
