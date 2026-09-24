@@ -6,6 +6,7 @@ import { Readable } from 'stream'
 import { registerExportIpc } from './export'
 import { registerAudioMuxIpc } from './audioMux'
 import { registerDenoiseIpc } from './denoise'
+import { registerScrubAudioIpc } from './scrubAudio'
 import { registerProxyIpc, sweepStaleProxyPartials } from './proxy'
 import { clearSessionLock, flagRecoveryPending, initProjectStore, registerProjectIpc } from './projectStore'
 import { readSettingsSync, registerSettingsIpc } from './settings'
@@ -239,6 +240,7 @@ function registerIpc(): void {
   registerExportIpc()
   registerAudioMuxIpc()
   registerDenoiseIpc()
+  registerScrubAudioIpc()
   // Preview proxies (optimized media) in userData/proxies.
   registerProxyIpc()
 

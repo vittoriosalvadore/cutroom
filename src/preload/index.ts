@@ -217,6 +217,8 @@ const api = {
   // --- AI noise removal ---
   /** Run FFmpeg's arnndn filter on a source file; resolves a temp WAV path. */
   denoiseStart: (sourcePath: string): Promise<DenoiseResult> => ipcRenderer.invoke('denoise:start', sourcePath),
+  /** Light mono copy of a video's audio, used only for audio-scrub grains. */
+  scrubAudioStart: (sourcePath: string): Promise<DenoiseResult> => ipcRenderer.invoke('scrubAudio:start', sourcePath),
 
   // --- proxies (optimized preview media) ---
   /** Finished proxies for these sources (null = none). Never creates one. */

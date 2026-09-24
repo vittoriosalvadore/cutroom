@@ -39,11 +39,8 @@ candidate features. Ordered roughly by how much they came up. Update as we go.
   floor). A parallel-bus emulation could add a floor later if wanted.
 - **Gate/duck apply to audio tracks only** — video-track audio bypasses the
   per-track dynamics chain in preview. Revisit if video-track gating is needed.
-- **Audio scrubbing skips `<video>`-element audio** — scrub grains are cut from
-  decoded AudioBuffers, which exist for audio media (and denoised clips). A plain
-  video-track clip's audio lives only in its `<video>` element, so it is silent
-  while scrubbing/shuttling (1× playback is unaffected). Grains also play at the
-  clip's normal pitch whatever the shuttle speed.
+- **Scrub grains play at the clip's normal pitch** whatever the shuttle speed. Video clips
+  scrub from a light 16 kHz mono copy of their audio (extracted in the background on import).
 
 ## Candidate features (Vegas-style, not yet built — rough priority)
 

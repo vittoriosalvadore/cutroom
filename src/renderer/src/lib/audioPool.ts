@@ -8,6 +8,7 @@ import { setMeterAnalyser } from './audioMeter'
 import { resolveDuck, resolveReverb } from '../state/selectors'
 import { generateReverbIR, reverbMixGains, reverbShapeKey, type ReverbShape } from '../../../shared/reverb'
 import type { VideoPool } from './videoPool'
+import { getScrubAudio } from './scrubAudioCache'
 import { grainEnvelope, grainSpan, reverseInto, scrubTargets, shouldGrain, type ScrubThrottle } from './scrub'
 
 /**
@@ -643,13 +644,19 @@ export class AudioPool {
     if (!shouldGrain(this.scrubThrottle, nowMs, timeSec)) return 0
     this.scrubThrottle = { lastMs: nowMs, lastTime: timeSec }
     if (this.grains.size >= MAX_GRAINS) return 0
-    const targets = scrubTargets(project, timeSec, (clip, track) =>
-      resolvePreviewBuffer(
-        clip,
-        track,
-        clip.mediaId ? getAudioEntry(clip.mediaId) : undefined,
-        clip.mediaId ? getDenoiseEntry(clip.mediaId) : undefined
-      )
+    const targets = scrubTargets(
+      project,
+      timeSec,
+      (clip, track) =>
+        resolvePreviewBuffer(
+          clip,
+          track,
+          clip.mediaId ? getAudioEntry(clip.mediaId) : undefined,
+          clip.mediaId ? getDenoiseEntry(clip.mediaId) : undefined
+        ) ??
+        // Plain video clips play through their <video> element, which can't do
+        // grains — scrub from the light copy of their audio instead.
+        (track.kind === 'video' && clip.mediaId ? getScrubAudio(clip.mediaId) : null)
     )
     if (targets.length === 0) return 0
     resumeAudioContext()

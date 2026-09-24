@@ -47,6 +47,8 @@ export default function CurvesEditor({ clipId, curves }: { clipId: string; curve
   const svgRef = useRef<SVGSVGElement>(null)
   // Index of the point being dragged (null = no gesture in progress).
   const drag = useRef<number | null>(null)
+  /** Whether this gesture already recorded its undo snapshot. */
+  const snapped = useRef(false)
   const [active, setActive] = useState<number | null>(null)
 
   const all = curves ?? identityCurves()
@@ -89,10 +91,14 @@ export default function CurvesEditor({ clipId, curves }: { clipId: string; curve
     const pos = toCurve(e)
     if (!pos) return
     let i = hit(pos)
-    useEditor.getState().snapshot()
+    // Snapshot for undo only once something actually changes: a plain click
+    // on a point (or a refused add) must not push an empty step / clear redo.
+    snapped.current = false
     if (i < 0) {
       const added = addCurvePoint(points, pos.x, pos.y)
       if (!added) return
+      useEditor.getState().snapshot()
+      snapped.current = true
       set(added.points)
       i = added.index
     }
@@ -109,7 +115,13 @@ export default function CurvesEditor({ clipId, curves }: { clipId: string; curve
     if (!pos) return
     // Read the live points (the prop may lag a render behind a fast drag).
     const live = useEditor.getState().project.clips[clipId]?.effects?.curves?.[channel] ?? points
-    set(moveCurvePoint(live, i, pos.x, pos.y))
+    const moved = moveCurvePoint(live, i, pos.x, pos.y)
+    if (moved[i]?.x === live[i]?.x && moved[i]?.y === live[i]?.y) return
+    if (!snapped.current) {
+      useEditor.getState().snapshot() // first real move of this drag = one undo step
+      snapped.current = true
+    }
+    set(moved)
   }
 
   const endDrag = (): void => {

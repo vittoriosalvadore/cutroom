@@ -3,6 +3,7 @@ import { useEditor } from './state/store'
 import { useSettings } from './state/settings'
 import { probeAudio, probeImage, probeVideo } from './lib/probe'
 import { ensureAudioDecoded } from './lib/audioCache'
+import { ensureScrubAudio } from './lib/scrubAudioCache'
 import { serializeProject } from './lib/projectFile'
 import { timelineDuration } from './lib/exporter'
 import { createNewProject, openProject, saveProject } from './lib/projectIO'
@@ -79,7 +80,11 @@ function useMediaProbe(): void {
       probed.current.add(m.id)
       if (m.kind === 'video') {
         probeVideo(m.path)
-          .then((r) => setMediaInfo(m.id, r))
+          .then((r) => {
+            setMediaInfo(m.id, r)
+            // Light copy of its audio for audio scrubbing (background, queued in main).
+            ensureScrubAudio(m.id, m.path, r.durationSec)
+          })
           .catch(() => undefined)
       } else if (m.kind === 'image') {
         probeImage(m.path)
