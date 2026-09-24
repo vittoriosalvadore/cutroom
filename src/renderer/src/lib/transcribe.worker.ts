@@ -23,34 +23,41 @@ if (env.backends.onnx.wasm) {
   env.backends.onnx.wasm.proxy = false
 }
 
-const MODEL = 'Xenova/whisper-tiny.en'
-
 // transformers.js types are loose; the transcriber is an async-callable.
 type Transcriber = (
   audio: Float32Array,
   opts: Record<string, unknown>
 ) => Promise<{ text: string; chunks?: Array<{ timestamp: [number, number | null]; text: string }> }>
 
-let transcriber: Transcriber | null = null
+// One loaded model at a time (switching models frees the previous one).
+let loaded: { model: string; transcriber: Transcriber } | null = null
 
-async function getTranscriber(): Promise<Transcriber> {
-  if (transcriber) return transcriber
-  transcriber = (await pipeline('automatic-speech-recognition', MODEL, {
+async function getTranscriber(model: string): Promise<Transcriber> {
+  if (loaded?.model === model) return loaded.transcriber
+  loaded = null
+  const transcriber = (await pipeline('automatic-speech-recognition', model, {
     progress_callback: (p: unknown) => self.postMessage({ type: 'progress', data: p })
   })) as unknown as Transcriber
+  loaded = { model, transcriber }
   return transcriber
 }
 
 self.onmessage = async (e: MessageEvent): Promise<void> => {
-  const data = e.data as { type: string; id?: number; pcm?: Float32Array }
-  if (data.type !== 'transcribe' || !data.pcm) return
+  const data = e.data as { type: string; id?: number; pcm?: Float32Array; model?: string; language?: string }
+  if (data.type !== 'transcribe' || !data.pcm || !data.model) return
   try {
-    const t = await getTranscriber()
+    const t = await getTranscriber(data.model)
     self.postMessage({ type: 'status', id: data.id, status: 'transcribing' })
     const output = await t(data.pcm, {
       return_timestamps: true,
+      // The pipeline overlaps its own 30 s chunks (5 s stride) and merges them,
+      // so a window longer than 30 s is transcribed without seams.
       chunk_length_s: 30,
-      stride_length_s: 5
+      stride_length_s: 5,
+      // Always transcribe (never translate to English). A null language lets
+      // the multilingual model detect it.
+      task: 'transcribe',
+      language: data.language && data.language !== 'auto' ? data.language : null
     })
     self.postMessage({ type: 'result', id: data.id, chunks: output.chunks ?? [], text: output.text })
   } catch (err) {

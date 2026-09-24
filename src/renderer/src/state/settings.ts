@@ -14,6 +14,13 @@ import {
   type ExportResolution,
   type QualityMode
 } from '../../../shared/exportOptions'
+import {
+  defaultTranscribeLanguage,
+  TRANSCRIBE_LANGUAGES,
+  TRANSCRIBE_MODEL_IDS,
+  type TranscribeLanguage,
+  type TranscribeModel
+} from '../lib/transcribeOptions'
 
 // ---------------------------------------------------------------------------
 // App settings (theme, decoding, editing, export, visual options).
@@ -64,6 +71,11 @@ export interface Settings {
   exportBitrateMbps: number
   /** Auto = first working hardware encoder, else software. */
   exportEncoder: EncoderChoice
+  // --- AI subtitles ---
+  /** Whisper model size (tiny = fast .. small = accurate). */
+  transcribeModel: TranscribeModel
+  /** Spoken language of the audio, or 'auto' to detect it. */
+  transcribeLanguage: TranscribeLanguage
   // --- appearance ---
   theme: ThemePreset
   /** Accent colour (hex). Drives all primary + selection state. */
@@ -93,6 +105,9 @@ export const DEFAULT_SETTINGS: Settings = {
   exportQualityMode: 'crf',
   exportBitrateMbps: BITRATE_CHOICES[1],
   exportEncoder: 'auto',
+  // Accuracy first (users judge subtitles by it); Balanced/Fast are one pick away.
+  transcribeModel: 'small',
+  transcribeLanguage: defaultTranscribeLanguage(typeof navigator === 'undefined' ? undefined : navigator.language),
   theme: 'graphite',
   accent: '#4c8dff',
   density: 'comfortable',
@@ -145,6 +160,10 @@ export function sanitize(raw: unknown): Partial<Settings> {
   if (mbps !== undefined) out.exportBitrateMbps = mbps
   const encoder = oneOf(o.exportEncoder, ENCODER_CHOICES)
   if (encoder) out.exportEncoder = encoder
+  const tModel = oneOf(o.transcribeModel, TRANSCRIBE_MODEL_IDS)
+  if (tModel) out.transcribeModel = tModel
+  const tLang = oneOf(o.transcribeLanguage, TRANSCRIBE_LANGUAGES)
+  if (tLang) out.transcribeLanguage = tLang
   const theme = oneOf(o.theme, ['graphite', 'midnight', 'slate', 'contrast'] as const)
   if (theme) out.theme = theme
   const density = oneOf(o.density, ['comfortable', 'compact'] as const)
@@ -177,6 +196,8 @@ function pick(s: Settings): Settings {
     exportQualityMode: s.exportQualityMode,
     exportBitrateMbps: s.exportBitrateMbps,
     exportEncoder: s.exportEncoder,
+    transcribeModel: s.transcribeModel,
+    transcribeLanguage: s.transcribeLanguage,
     theme: s.theme,
     accent: s.accent,
     density: s.density,

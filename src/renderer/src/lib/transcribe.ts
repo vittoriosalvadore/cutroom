@@ -3,6 +3,7 @@ import type { SubtitleCue } from '../state/store'
 import { getOrDecodeBuffer } from './audioCache'
 import { WorkerJob, JobCancelled } from './workerJob'
 import { clipSourceSpan, sourceToTimeline } from './clipTime'
+import { isSilent, modelHub, splitAtQuiet, type TranscribeLanguage, type TranscribeModel } from './transcribeOptions'
 
 // ---------------------------------------------------------------------------
 // Drives the Whisper worker: extract a clip's audio to 16 kHz mono PCM (Whisper's
@@ -68,6 +69,15 @@ function chunksToCues(chunks: WhisperChunk[], toTimeline: (winSec: number) => nu
 interface TranscribeIn {
   type: 'transcribe'
   pcm: Float32Array
+  /** Hugging Face model id. */
+  model: string
+  /** Whisper language name, or 'auto'. */
+  language: string
+}
+
+export interface TranscribeOptions {
+  model: TranscribeModel
+  language: TranscribeLanguage
 }
 interface TranscribeOut {
   chunks: WhisperChunk[]
@@ -79,11 +89,13 @@ const job = new WorkerJob<TranscribeIn, TranscribeOut>(
 )
 
 const SAMPLE_RATE = 16000
-// 30s per call so a crash mid-transcription only loses the current window's
-// cues, not the whole clip — each window's cues are surfaced via onCue as
-// soon as they resolve, so the caller can commit them into the project
-// immediately (see TranscribeModal.tsx) rather than batching until the end.
-const CHUNK_SEC = 30
+// Windows of up to 2 min, each ending at the quietest spot of its last 4 s so
+// no word is sliced at a boundary (the pipeline itself overlaps its 30 s
+// chunks inside a window). Each window's cues are surfaced via onCue as soon
+// as it resolves, so the caller commits them immediately (see
+// TranscribeModal.tsx) and a crash only loses the window in flight.
+const WINDOW_SEC = 120
+const QUIET_SEARCH_SEC = 4
 
 /**
  * Transcribe a clip window by window. Resolves with every cue once done (for
@@ -95,32 +107,35 @@ export async function transcribeClip(
   clip: Clip,
   onProgress: (p: TranscribeProgress) => void,
   onCue: (cue: SubtitleCue) => void,
-  shouldCancel: () => boolean = () => false
+  shouldCancel: () => boolean = () => false,
+  options: TranscribeOptions = { model: 'small', language: 'auto' }
 ): Promise<SubtitleCue[]> {
   onProgress({ stage: 'extracting' })
   const pcm = await getClipPcm16k(project, clip)
-  const chunkLen = CHUNK_SEC * SAMPLE_RATE
-  const chunkCount = Math.max(1, Math.ceil(pcm.length / chunkLen))
   const allCues: SubtitleCue[] = []
 
-  for (let i = 0; i < chunkCount; i++) {
+  for (const [start, end] of splitAtQuiet(pcm, SAMPLE_RATE, WINDOW_SEC, QUIET_SEARCH_SEC)) {
     if (shouldCancel()) throw new JobCancelled()
-    const start = i * chunkLen
-    // .slice() (not .subarray()) copies into a fresh buffer per chunk, so it's
-    // safe to transfer to the worker without affecting the other chunks.
-    const chunkPcm = pcm.slice(start, Math.min(pcm.length, start + chunkLen))
+    // Whisper invents stock phrases on silence — don't feed it any.
+    if (isSilent(pcm, start, end)) continue
+    // .slice() (not .subarray()) copies into a fresh buffer per window, so it's
+    // safe to transfer to the worker without affecting the others.
+    const chunkPcm = pcm.slice(start, end)
     // PCM is SOURCE audio: window offsets map to the timeline through speed.
     const winSrcSec = clip.inSec + start / SAMPLE_RATE
     const toTimeline = (winSec: number): number => sourceToTimeline(clip, winSrcSec + winSec)
 
     const { chunks } = await job.call(
-      { type: 'transcribe', pcm: chunkPcm },
+      { type: 'transcribe', pcm: chunkPcm, model: modelHub(options.model), language: options.language },
       {
         onProgress: (p) => onProgress({ stage: 'loading', progress: p.progress, file: p.file }),
         onStatus: (msg) => {
           if ((msg as { status?: string }).status === 'transcribing') onProgress({ stage: 'transcribing' })
         },
         shouldCancel,
+        // A 2 min window on the "Accurate" model can run for minutes on CPU
+        // without an intermediate message; only a truly hung worker should trip this.
+        timeoutMs: 15 * 60_000,
         transfer: [chunkPcm.buffer]
       }
     )

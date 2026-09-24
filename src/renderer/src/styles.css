@@ -1583,3 +1583,8 @@ input[type='color']:hover {
   white-space: pre-wrap;
   margin-bottom: 14px;
 }
+
+/* AI Subtitles: space the language/model pickers from the intro text */
+.modal-body .modal-note + .export-options {
+  margin-top: var(--sp-5);
+}

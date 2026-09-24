@@ -35,6 +35,10 @@ function usedKeys(): Set<string> {
 // Keys reached through t(variable): settings tab names, crop sides, media kinds,
 // export preset names (shared/exportOptions) and the exporter's fallback warning.
 const DYNAMIC_KEYS = [
+  // transcription model labels (lib/transcribeOptions)
+  'Fast',
+  'Balanced',
+  'Accurate',
   'Performance',
   'Editing',
   'Export',

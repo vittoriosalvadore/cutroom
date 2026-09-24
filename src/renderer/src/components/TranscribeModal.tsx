@@ -2,6 +2,37 @@ import { useRef, useState } from 'react'
 import { useEditor } from '../state/store'
 import { transcribeClip, type TranscribeProgress } from '../lib/transcribe'
 import { interpolateParts, useT } from '../lib/i18n'
+import { useSettings } from '../state/settings'
+import {
+  TRANSCRIBE_LANGUAGES,
+  TRANSCRIBE_MODELS,
+  type TranscribeLanguage,
+  type TranscribeModel
+} from '../lib/transcribeOptions'
+
+/** Display names for the spoken-language picker (endonyms, so they read the
+ *  same in every UI language). */
+const LANGUAGE_NAMES: Record<TranscribeLanguage, string> = {
+  auto: '',
+  italian: 'Italiano',
+  english: 'English',
+  spanish: 'Español',
+  french: 'Français',
+  german: 'Deutsch',
+  portuguese: 'Português',
+  dutch: 'Nederlands',
+  polish: 'Polski',
+  romanian: 'Română',
+  greek: 'Ελληνικά',
+  turkish: 'Türkçe',
+  russian: 'Русский',
+  ukrainian: 'Українська',
+  arabic: 'العربية',
+  hindi: 'हिन्दी',
+  chinese: '中文',
+  japanese: '日本語',
+  korean: '한국어'
+}
 
 type Status = 'idle' | 'running' | 'done' | 'error'
 
@@ -21,6 +52,9 @@ export default function TranscribeModal() {
   const [count, setCount] = useState(0)
   const cancelRef = useRef(false)
   const t = useT()
+  const model = useSettings((s) => s.transcribeModel)
+  const language = useSettings((s) => s.transcribeLanguage)
+  const setSettings = useSettings((s) => s.set)
 
   if (!open) return null
 
@@ -63,7 +97,8 @@ export default function TranscribeModal() {
           first = false
           setCount((c) => c + 1)
         },
-        () => cancelRef.current
+        () => cancelRef.current,
+        { model, language }
       )
       setCount(cues.length)
       setStatus('done')
@@ -101,10 +136,45 @@ export default function TranscribeModal() {
               <p className="modal-note">
                 {interpolateParts(
                   t(
-                    'Transcribe {name} into subtitle clips using on-device speech recognition (Whisper) — no account or upload. The first run downloads a small model (~75 MB); after that it works offline.'
+                    'Transcribe {name} into subtitle clips using on-device speech recognition (Whisper) — no account or upload. Each model is downloaded once on first use; after that it works offline.'
                   ),
                   { name: <strong key="name">{media?.name}</strong> }
                 )}
+              </p>
+              <div className="export-options">
+                <label className="export-opt">
+                  <span>{t('Spoken language')}</span>
+                  <select
+                    className="insp-select"
+                    disabled={running}
+                    value={language}
+                    onChange={(e) => setSettings({ transcribeLanguage: e.target.value as TranscribeLanguage })}
+                  >
+                    {TRANSCRIBE_LANGUAGES.map((l) => (
+                      <option key={l} value={l}>
+                        {l === 'auto' ? t('Detect automatically') : LANGUAGE_NAMES[l]}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="export-opt">
+                  <span>{t('Model')}</span>
+                  <select
+                    className="insp-select"
+                    disabled={running}
+                    value={model}
+                    onChange={(e) => setSettings({ transcribeModel: e.target.value as TranscribeModel })}
+                  >
+                    {TRANSCRIBE_MODELS.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {t(m.label)} (~{m.approxMb} MB)
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <p className="modal-note">
+                {t('Pick the language spoken in the clip for the best results. "Accurate" is much better on non-English speech but slower.')}
               </p>
               {running && (
                 <div className="export-progress">
