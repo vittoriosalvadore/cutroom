@@ -274,7 +274,8 @@ export async function exportTimeline(
       silentPath,
       outputPath,
       sampleRate: project.sampleRate,
-      clips: buildAudioPlan(project)
+      clips: buildAudioPlan(project),
+      durationSec: totalFrames / fps
     })
     if (!mux.ok) {
       await discardTemp() // covers mux guard-returns that don't delete the temp

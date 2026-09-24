@@ -230,6 +230,12 @@ describe('buildMuxArgs input planning + safety', () => {
     expect(g).toContain('acompressor=threshold=0.010000:ratio=20:attack=0.01:release=9000:makeup=64.0000')
   })
 
+  it('caps the padded soundtrack at the video length', () => {
+    const args = buildMuxArgs({ ...base, clips: [clip({})], durationSec: 8 })
+    expect(args[args.indexOf('-t') + 1]).toBe('8.000')
+    expect(buildMuxArgs({ ...base, clips: [clip({})] })).not.toContain('-t')
+  })
+
   it('names the muxer explicitly so the output may use a temp extension', () => {
     const args = buildMuxArgs({ ...base, clips: [clip({})] })
     expect(args.slice(-3)).toEqual(['-f', 'mp4', '/tmp/out.mp4'])

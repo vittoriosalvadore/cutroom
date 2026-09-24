@@ -1,6 +1,8 @@
 import { app } from 'electron'
 import type { ChildProcess } from 'child_process'
-import { unlinkSync } from 'fs'
+import { readdirSync, unlinkSync } from 'fs'
+import { join } from 'path'
+import { tmpdir } from 'os'
 import ffmpegPathRaw from 'ffmpeg-static'
 
 // ffmpeg-static returns a path inside app.asar, which can't be executed.
@@ -56,4 +58,39 @@ export function shutdownFfmpeg(): void {
     }
   }
   temps.clear()
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (e) {
+    // EPERM: the process exists but belongs to someone else.
+    return (e as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+/**
+ * Delete temp files left by an earlier session that crashed or was killed
+ * (quit cleanup never ran). Temp names embed the creating pid
+ * (`cutroom-<pid>-...`), so files of a still-running process are kept.
+ */
+export function sweepStaleTemps(): void {
+  let names: string[]
+  try {
+    names = readdirSync(tmpdir())
+  } catch {
+    return
+  }
+  for (const name of names) {
+    const m = /^cutroom-(\d+)-/.exec(name)
+    if (!m) continue
+    const pid = Number(m[1])
+    if (pid === process.pid || isAlive(pid)) continue
+    try {
+      unlinkSync(join(tmpdir(), name))
+    } catch {
+      /* in use or already gone */
+    }
+  }
 }

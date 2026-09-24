@@ -91,6 +91,8 @@ export interface MuxAudioOptions {
   outputPath: string
   sampleRate: number
   clips: AudioClipPlanEntry[]
+  /** Length of the exported video in seconds (caps the padded soundtrack). */
+  durationSec?: number
 }
 
 /** Result of saving a project. */

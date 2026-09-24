@@ -19,6 +19,8 @@ interface MuxOptions {
   outputPath: string
   sampleRate: number
   clips: MuxClip[]
+  /** Length of the exported video in seconds. */
+  durationSec?: number
 }
 
 const PROBE_TIMEOUT_MS = 15000
@@ -110,7 +112,8 @@ async function runMux(opts: MuxOptions): Promise<{ ok: boolean; error?: string }
           outputPath: partPath,
           sampleRate: opts.sampleRate,
           clips: audible,
-          filterScriptPath: scriptPath
+          filterScriptPath: scriptPath,
+          durationSec: opts.durationSec
         })
       )
     }

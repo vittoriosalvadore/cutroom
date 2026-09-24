@@ -98,6 +98,13 @@ export interface BuildMuxArgsOptions {
   sampleRate: number
   clips: MuxClip[]
   /**
+   * Exact output length (the video's). apad makes the audio infinite so it
+   * always spans the video; -shortest alone is meant to cut it back, but with
+   * a stream-copied video FFmpeg 7 never stops, so the length is also set
+   * explicitly with -t.
+   */
+  durationSec?: number
+  /**
    * When set, the filtergraph is passed as `-filter_complex_script <path>`
    * (the caller writes `buildMuxGraph(...)` there) instead of inline. A long
    * timeline's graph easily exceeds the Windows 32K command-line limit.
@@ -184,7 +191,7 @@ export function buildMuxGraph(clips: MuxClip[], sampleRate: number): string {
 }
 
 export function buildMuxArgs(opts: BuildMuxArgsOptions): string[] {
-  const { silentPath, outputPath, sampleRate, clips, filterScriptPath } = opts
+  const { silentPath, outputPath, sampleRate, clips, filterScriptPath, durationSec } = opts
   const args: string[] = ['-y', '-i', silentPath]
   for (const p of planInputs(clips).paths) args.push('-i', p)
 
@@ -200,6 +207,7 @@ export function buildMuxArgs(opts: BuildMuxArgsOptions): string[] {
     '-ar', String(sampleRate),
     '-ac', '2',
     '-shortest',
+    ...(durationSec && Number.isFinite(durationSec) && durationSec > 0 ? ['-t', durationSec.toFixed(3)] : []),
     '-movflags', '+faststart',
     // Explicit muxer: the caller may write to a `.part` name and rename on success.
     '-f', 'mp4',

@@ -9,7 +9,7 @@ import { registerDenoiseIpc } from './denoise'
 import { clearSessionLock, flagRecoveryPending, initProjectStore, registerProjectIpc } from './projectStore'
 import { readSettingsSync, registerSettingsIpc } from './settings'
 import { shouldFlagRecovery } from './crashFlags'
-import { shutdownFfmpeg } from './ffmpeg'
+import { shutdownFfmpeg, sweepStaleTemps } from './ffmpeg'
 import { isLocalFilePath } from './paths'
 import { parseRange } from './range'
 
@@ -280,6 +280,7 @@ app.on('second-instance', () => {
 
 app.whenReady().then(() => {
   initProjectStore() // detect a prior crash + mark this session active
+  sweepStaleTemps() // temp media left behind by a crashed/killed session
   registerIpc()
   createWindow()
 
