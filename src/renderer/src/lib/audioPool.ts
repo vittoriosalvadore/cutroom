@@ -99,7 +99,7 @@ interface LiveSource {
 
 interface VideoAudio {
   /** The element this tap was made from; the video pool may dispose and
-   *  recreate a media id's element (idle eviction), making the tap stale. */
+   *  recreate a clip's element (idle eviction), making the tap stale. */
   el: HTMLVideoElement
   source: MediaElementAudioSourceNode
   gain: GainNode
@@ -120,6 +120,8 @@ export class AudioPool {
   // trackId -> the trigger track currently wired into its duck sidechain input.
   private duckEdges = new Map<string, string>()
   private live = new Map<string, LiveSource>()
+  /** Keyed by clip id, like the video pool: overlapping clips of one file each
+   *  get their own element and gain. */
   private videoAudio = new Map<string, VideoAudio>()
 
   constructor() {
@@ -140,20 +142,23 @@ export class AudioPool {
     setMeterAnalyser(this.analyser)
   }
 
-  /** Lazily route a <video> element's audio through WebAudio. Returns its gain. */
-  private ensureVideoAudio(mediaId: string, el: HTMLVideoElement): VideoAudio | null {
-    const existing = this.videoAudio.get(mediaId)
-    if (existing && existing.el === el) return existing
-    if (existing) {
-      // The pool replaced the element: drop the dead tap and tap the new one.
-      try {
-        existing.source.disconnect()
-        existing.gain.disconnect()
-      } catch {
-        /* already gone */
-      }
-      this.videoAudio.delete(mediaId)
+  /** Disconnect and forget a clip's element tap. */
+  private dropVideoAudio(clipId: string, v: VideoAudio): void {
+    try {
+      v.source.disconnect()
+      v.gain.disconnect()
+    } catch {
+      /* already gone */
     }
+    this.videoAudio.delete(clipId)
+  }
+
+  /** Lazily route a <video> element's audio through WebAudio. Returns its gain. */
+  private ensureVideoAudio(clipId: string, el: HTMLVideoElement): VideoAudio | null {
+    const existing = this.videoAudio.get(clipId)
+    if (existing && existing.el === el) return existing
+    // The pool replaced the element: drop the dead tap and tap the new one.
+    if (existing) this.dropVideoAudio(clipId, existing)
     try {
       const source = this.ctx.createMediaElementSource(el)
       const gain = this.ctx.createGain()
@@ -162,7 +167,7 @@ export class AudioPool {
       gain.connect(this.master)
       el.muted = false // audio now flows through WebAudio; controlled by `gain`
       const entry: VideoAudio = { el, source, gain, wanted: true }
-      this.videoAudio.set(mediaId, entry)
+      this.videoAudio.set(clipId, entry)
       return entry
     } catch {
       // createMediaElementSource throws if the element was already tapped.
@@ -416,9 +421,9 @@ export class AudioPool {
       } else if (track.kind === 'video' && videoPool && clip.mediaId) {
         const media = project.media[clip.mediaId]
         if (!media || media.kind !== 'video' || !media.path) continue
-        const el = videoPool.getElement(clip.mediaId)
+        const el = videoPool.getElement(clip.id)
         if (!el) continue
-        const va = this.ensureVideoAudio(clip.mediaId, el)
+        const va = this.ensureVideoAudio(clip.id, el)
         if (!va) continue
         va.wanted = true
         const env = fadeGainAt(playhead - clip.startSec, {
@@ -438,22 +443,18 @@ export class AudioPool {
     for (const [id, ls] of [...this.live.entries()]) {
       if (!ls.wanted) this.stopClip(id)
     }
-    for (const v of this.videoAudio.values()) {
-      if (!v.wanted) v.gain.gain.setTargetAtTime(0, now, 0.01)
+    for (const [id, v] of [...this.videoAudio.entries()]) {
+      if (v.wanted) continue
+      // The pool evicted this clip's element (or the clip is gone): drop the
+      // tap so per-clip keys (new ids on every split) don't pile up.
+      if (videoPool && videoPool.getElement(id) !== v.el) this.dropVideoAudio(id, v)
+      else v.gain.gain.setTargetAtTime(0, now, 0.01)
     }
   }
 
   dispose(): void {
     for (const id of [...this.live.keys()]) this.stopClip(id)
-    for (const v of this.videoAudio.values()) {
-      try {
-        v.source.disconnect()
-        v.gain.disconnect()
-      } catch {
-        /* already gone */
-      }
-    }
-    this.videoAudio.clear()
+    for (const [id, v] of [...this.videoAudio.entries()]) this.dropVideoAudio(id, v)
     this.duckEdges.clear()
     for (const chain of this.trackChains.values()) {
       try {

@@ -4,8 +4,10 @@ import { WebCodecsSource } from './webCodecsSource'
 import { resolveTier } from './videoTier'
 
 // ---------------------------------------------------------------------------
-// Drives one VideoSource per source clip and exposes its current frame to the
-// compositor. This is the dispatch boundary: the compositor asks for a frame
+// Drives one VideoSource per timeline CLIP (keyed by clip id, not media id)
+// and exposes its current frame to the compositor. Two clips of the same file
+// visible at once (split + overlap for PiP/crossfade) therefore get their own
+// decoder, frame and audio element instead of thrashing one between two times. This is the dispatch boundary: the compositor asks for a frame
 // and never knows whether it came from a <video> element (the fallback) or a
 // WebCodecs VideoDecoder (the frame-precise MP4 path).
 //
@@ -21,9 +23,13 @@ import { resolveTier } from './videoTier'
 // element source doing both jobs — a silent fallback, not a crash; a WebCodecs
 // source whose decoder keeps failing is demoted back to the element source.
 //
+// A clip on a HIDDEN track isn't drawn but must stay audible (export mixes
+// hidden tracks' audio too): wantAudio() drives only its audio element.
+//
 // Entries not wanted for IDLE_EVICT_MS are disposed (element, decoder, held
 // VideoFrame) and the owner is told via onEvict so it can free the GL texture.
-// Eviction only runs from endFrame() and skips everything wanted this frame.
+// Eviction only runs from endFrame() and skips everything wanted (drawn or
+// audio-only) this frame.
 // ---------------------------------------------------------------------------
 
 /** Dispose a source that hasn't been wanted for this long (wall clock). */
@@ -39,6 +45,9 @@ export interface VideoFrame {
 }
 
 interface PoolEntry {
+  /** The file this entry decodes; a different path for the same key (media
+   *  relinked) recreates the entry. */
+  path: string
   /** The source rendering video frames. */
   active: VideoSource
   /** The <video>-element source kept alive for audio after a WebCodecs
@@ -46,20 +55,24 @@ interface PoolEntry {
   audioCompanion: VideoElementSource | null
   /** Resolves once the tier probe settled (upgraded or not). Never rejects. */
   tierReady: Promise<void>
-  /** performance.now() of the last want()/seekTo(), for idle eviction. */
+  /** performance.now() of the last want()/wantAudio()/seekTo(), for idle eviction. */
   lastUsed: number
 }
 
 export class VideoPool {
+  /** Keyed by clip id. */
   private map = new Map<string, PoolEntry>()
-  /** Media ids whose tier probe is already in flight (don't re-probe). */
+  /** Keys whose tier probe is already in flight (don't re-probe). */
   private probing = new Set<string>()
   private host: HTMLDivElement
   private onFrameReady: () => void
-  private onEvict: (mediaId: string) => void
+  private onEvict: (key: string) => void
+  /** Keys drawn this frame (want). */
   private wanted = new Set<string>()
+  /** Keys only heard this frame (wantAudio, hidden tracks). */
+  private audible = new Set<string>()
 
-  constructor(onFrameReady: () => void, onEvict: (mediaId: string) => void = () => undefined) {
+  constructor(onFrameReady: () => void, onEvict: (key: string) => void = () => undefined) {
     this.onFrameReady = onFrameReady
     this.onEvict = onEvict
     // Off-screen (not display:none, which can pause decoding) so frames decode.
@@ -69,21 +82,23 @@ export class VideoPool {
     document.body.appendChild(this.host)
   }
 
-  /** Get (or lazily create) the entry for a media id. Creates a
+  /** Get (or lazily create) the entry for a clip id. Creates a
    *  VideoElementSource immediately and asynchronously probes for an upgrade
-   *  to WebCodecsSource (MP4/MOV only). The probe runs once per id. */
-  private ensure(mediaId: string, path: string): PoolEntry {
-    const found = this.map.get(mediaId)
-    if (found) return found
+   *  to WebCodecsSource (MP4/MOV only). The probe runs once per entry. */
+  private ensure(key: string, path: string): PoolEntry {
+    const found = this.map.get(key)
+    if (found && found.path === path) return found
+    if (found) this.evict(key, found)
     // Start with the fallback so the clip shows immediately while probing.
     const entry: PoolEntry = {
+      path,
       active: new VideoElementSource(path, this.onFrameReady, this.host),
       audioCompanion: null,
       tierReady: Promise.resolve(),
       lastUsed: performance.now()
     }
-    this.map.set(mediaId, entry)
-    entry.tierReady = this.maybeUpgradeToWebCodecs(mediaId, path, entry)
+    this.map.set(key, entry)
+    entry.tierReady = this.maybeUpgradeToWebCodecs(key, path, entry)
     return entry
   }
 
@@ -102,11 +117,11 @@ export class VideoPool {
    *  source IS the promoted source (init is the expensive part — demux +
    *  decoder config — so it's done exactly once). Any failure is swallowed
    *  and disposes the probe — the element source keeps doing both jobs. */
-  private maybeUpgradeToWebCodecs(mediaId: string, path: string, entry: PoolEntry): Promise<void> {
-    if (this.probing.has(mediaId)) return Promise.resolve()
-    this.probing.add(mediaId)
+  private maybeUpgradeToWebCodecs(key: string, path: string, entry: PoolEntry): Promise<void> {
+    if (this.probing.has(key)) return Promise.resolve()
+    this.probing.add(key)
     const candidate = new WebCodecsSource(path, this.onFrameReady)
-    return resolveTier({ id: mediaId, name: '', path, kind: 'video', durationSec: 0 }, async () => {
+    return resolveTier({ id: key, name: '', path, kind: 'video', durationSec: 0 }, async () => {
       try {
         await candidate.ensureInit()
         return candidate.resolvedCodec
@@ -115,8 +130,8 @@ export class VideoPool {
       }
     })
       .then((tier) => {
-        const live = this.map.get(mediaId)
-        // Only upgrade if this id is still mapped AND still on the fallback.
+        const live = this.map.get(key)
+        // Only upgrade if this key is still mapped AND still on the fallback.
         if (tier === 'webcodecs' && live === entry && entry.active instanceof VideoElementSource) {
           entry.audioCompanion = entry.active
           entry.active = candidate
@@ -131,14 +146,15 @@ export class VideoPool {
   }
 
   /**
-   * Ask for `mediaId`'s frame at source time `srcTime`. Returns null until a
-   * frame is ready. Mark a render pass with endFrame() afterward.
+   * Ask for clip `key`'s frame at source time `srcTime` of the file at `path`.
+   * Returns null until a frame is ready. Mark a render pass with endFrame()
+   * afterward.
    */
-  want(mediaId: string, path: string, srcTime: number, playing: boolean, speed = 1): VideoFrame | null {
-    const entry = this.ensure(mediaId, path)
+  want(key: string, path: string, srcTime: number, playing: boolean, speed = 1): VideoFrame | null {
+    const entry = this.ensure(key, path)
     this.demoteIfFailed(entry)
     entry.lastUsed = performance.now()
-    this.wanted.add(mediaId)
+    this.wanted.add(key)
     entry.active.requestTime(srcTime, playing, speed)
     // Keep the audio companion's element rolling in sync while playing (the
     // audio engine taps it). While paused just hard-pause it — no per-frame
@@ -150,11 +166,26 @@ export class VideoPool {
     return { source: f, width: entry.active.width, height: entry.active.height }
   }
 
+  /** Drive ONLY the audio side of clip `key` (a clip on a hidden track: not
+   *  drawn, still heard). Keeps the entry alive like want() but never decodes
+   *  a picture: the element source is the audio element when no WebCodecs
+   *  upgrade happened, else the audio companion is. Paused -> hard pause. */
+  wantAudio(key: string, path: string, srcTime: number, playing: boolean, speed = 1): void {
+    const entry = this.ensure(key, path)
+    this.demoteIfFailed(entry)
+    entry.lastUsed = performance.now()
+    this.audible.add(key)
+    const el = entry.audioCompanion ?? (entry.active instanceof VideoElementSource ? entry.active : null)
+    if (!el) return
+    if (playing) el.requestTime(srcTime, playing, speed)
+    else el.pause()
+  }
+
   /** Seek a video to an exact source time and resolve once the frame is ready.
    *  (Export path.) Waits for the tier probe first, so an export never starts
    *  on the element tier and switches decoders mid-file. */
-  async seekTo(mediaId: string, path: string, srcTime: number): Promise<void> {
-    const entry = this.ensure(mediaId, path)
+  async seekTo(key: string, path: string, srcTime: number): Promise<void> {
+    const entry = this.ensure(key, path)
     entry.lastUsed = performance.now()
     await entry.tierReady
     this.demoteIfFailed(entry)
@@ -162,9 +193,9 @@ export class VideoPool {
     return entry.active.seekTo(srcTime)
   }
 
-  /** The <video> element for a media id, if one exists (for audio routing). */
-  getElement(mediaId: string): HTMLVideoElement | null {
-    const entry = this.map.get(mediaId)
+  /** The <video> element for a clip id, if one exists (for audio routing). */
+  getElement(key: string): HTMLVideoElement | null {
+    const entry = this.map.get(key)
     if (!entry) return null
     return entry.audioCompanion?.getElement() ?? entry.active.getElement()
   }
@@ -174,22 +205,28 @@ export class VideoPool {
     const now = performance.now()
     for (const [id, entry] of this.map) {
       if (this.wanted.has(id)) continue
+      if (this.audible.has(id)) {
+        // Audio-only: leave the audio element alone, idle the picture side.
+        if (entry.audioCompanion) entry.active.endFrame()
+        continue
+      }
       entry.active.endFrame()
       entry.audioCompanion?.endFrame()
       if (now - entry.lastUsed > IDLE_EVICT_MS) this.evict(id, entry)
     }
     this.wanted.clear()
+    this.audible.clear()
   }
 
   /** Release an idle entry. A later want()/seekTo() simply recreates it (and
    *  re-probes); an in-flight probe for it sees a stale entry and disposes
    *  its candidate. */
-  private evict(mediaId: string, entry: PoolEntry): void {
+  private evict(key: string, entry: PoolEntry): void {
     entry.active.dispose()
     entry.audioCompanion?.dispose()
-    this.map.delete(mediaId)
-    this.probing.delete(mediaId)
-    this.onEvict(mediaId)
+    this.map.delete(key)
+    this.probing.delete(key)
+    this.onEvict(key)
   }
 
   dispose(): void {
@@ -200,6 +237,7 @@ export class VideoPool {
     this.map.clear()
     this.probing.clear()
     this.wanted.clear()
+    this.audible.clear()
     this.host.remove()
   }
 }

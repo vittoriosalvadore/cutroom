@@ -233,6 +233,7 @@ export class Compositor {
   private canvasCache = new Map<string, CachedTex>()
   private cacheOrder: string[] = []
   private videos: VideoPool
+  /** Keyed by clip id, like the video pool (two clips of one file = two textures). */
   private videoTextures = new Map<string, WebGLTexture>()
   private playing = false
   private hidePlaceholders = false
@@ -319,10 +320,10 @@ export class Compositor {
     this.gl = gl
     this.needsRender = needsRender
     // An idle-evicted video's texture goes with it.
-    this.videos = new VideoPool(needsRender, (mediaId) => {
-      const tex = this.videoTextures.get(mediaId)
+    this.videos = new VideoPool(needsRender, (clipId) => {
+      const tex = this.videoTextures.get(clipId)
       if (tex) this.gl.deleteTexture(tex)
-      this.videoTextures.delete(mediaId)
+      this.videoTextures.delete(clipId)
     })
 
     this.buildGLResources()
@@ -552,9 +553,9 @@ export class Compositor {
     if (media && media.kind === 'video' && media.path) {
       const speed = clip.speed ?? 1
       const srcTime = clip.inSec + (playheadSec - clip.startSec) * speed
-      const frame = this.videos.want(media.id, media.path, srcTime, this.playing, speed)
+      const frame = this.videos.want(clip.id, media.path, srcTime, this.playing, speed)
       if (frame && frame.width > 0 && frame.height > 0) {
-        const tex = this.uploadVideoFrame(media.id, frame.source)
+        const tex = this.uploadVideoFrame(clip.id, frame.source)
         this.drawQuad(containRect(frame.width, frame.height, this.W, this.H), tex, null, effects, tf, opacity)
         return
       }
@@ -642,17 +643,30 @@ export class Compositor {
     // Bottom track first so the topmost track ends up on top of the stack.
     for (let ti = project.tracks.length - 1; ti >= 0; ti--) {
       const track = project.tracks[ti]
-      if (track.kind !== 'video' || track.hidden) continue
+      if (track.kind !== 'video') continue
+      // Hidden tracks aren't drawn, but their audio still plays (export mixes
+      // it too), so keep their clips' audio elements driven while playing.
+      if (track.hidden && !playing) continue
       const clips = byTrack.get(track.id)
       if (!clips) continue
       for (const clip of clips) {
         if (t < clip.startSec || t >= clip.startSec + clip.durationSec) continue
-        this.drawClip(project, clip, t)
+        if (track.hidden) this.driveHiddenAudio(project, clip, t)
+        else this.drawClip(project, clip, t)
       }
     }
 
     // Pause any video elements no longer under the playhead.
     this.videos.endFrame()
+  }
+
+  /** A hidden-track video clip under the playhead: audio side only, no draw. */
+  private driveHiddenAudio(project: Project, clip: Clip, playheadSec: number): void {
+    const media = clip.mediaId ? project.media[clip.mediaId] : undefined
+    if (!media || media.kind !== 'video' || !media.path) return
+    const speed = clip.speed ?? 1
+    const srcTime = clip.inSec + (playheadSec - clip.startSec) * speed
+    this.videos.wantAudio(clip.id, media.path, srcTime, this.playing, speed)
   }
 
   /** Ensure every image used by the project is decoded. For export preflight. */
@@ -687,7 +701,7 @@ export class Compositor {
         if (!clip.mediaId) continue
         const media = project.media[clip.mediaId]
         if (media && media.kind === 'video' && media.path) {
-          seeks.push(this.videos.seekTo(media.id, media.path, clip.inSec + (t - clip.startSec) * (clip.speed ?? 1)))
+          seeks.push(this.videos.seekTo(clip.id, media.path, clip.inSec + (t - clip.startSec) * (clip.speed ?? 1)))
         }
       }
     }
