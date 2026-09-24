@@ -20,7 +20,9 @@ describe('resolveEncodeConfig', () => {
     const c = resolveEncodeConfig({ ...base, preset: 'slow', crf: 18 }, [])!
     expect(buildEncodeArgs(c)).toEqual([
       '-y', '-f', 'image2pipe', '-c:v', 'mjpeg', '-framerate', '30', '-i', 'pipe:0',
+      '-vf', 'scale=in_range=full:out_range=tv:in_color_matrix=bt601:out_color_matrix=bt709',
       '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'slow', '-crf', '18',
+      '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709', '-color_range', 'tv',
       '-movflags', '+faststart', '-f', 'mp4', '/tmp/cutroom-1-silent.mp4'
     ])
   })
@@ -58,17 +60,24 @@ describe('resolveEncodeConfig', () => {
     const c = resolveEncodeConfig({ ...base, resolution: '720', format: 'mp4-hevc' }, [])!
     expect(c.scale).toEqual({ width: 1280, height: 720 })
     const args = buildEncodeArgs(c)
-    expect(after(args, '-vf')).toBe('scale=1280:720:flags=lanczos,setsar=1')
+    expect(after(args, '-vf')).toBe('scale=1280:720:flags=lanczos:in_range=full:out_range=tv:in_color_matrix=bt601:out_color_matrix=bt709,setsar=1')
     expect(args).toContain('libx265')
     // scale filter sits after the input, before the encoder
     expect(args.indexOf('-vf')).toBeGreaterThan(args.indexOf('pipe:0'))
     expect(args.indexOf('-vf')).toBeLessThan(args.lastIndexOf('-c:v'))
   })
 
-  it('omits the scale filter when the preset equals the project size', () => {
+  it('omits resizing when the preset equals the project size (colour conversion only)', () => {
     const c = resolveEncodeConfig({ ...base, resolution: '1080' }, [])!
     expect(c.scale).toBeNull()
-    expect(buildEncodeArgs(c)).not.toContain('-vf')
+    expect(after(buildEncodeArgs(c), '-vf')).toBe('scale=in_range=full:out_range=tv:in_color_matrix=bt601:out_color_matrix=bt709')
+  })
+
+  it('converts JPEG frames to limited-range BT.709 and tags the stream', () => {
+    const args = buildEncodeArgs(resolveEncodeConfig(base, [])!)
+    expect(after(args, '-colorspace')).toBe('bt709')
+    expect(after(args, '-color_range')).toBe('tv')
+    expect(after(args, '-vf')).toContain('out_color_matrix=bt709')
   })
 
   it('only uses hardware encoders the probe verified', () => {

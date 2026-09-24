@@ -197,6 +197,11 @@ export function resolveEncodeConfig(raw: RawStartOptions, workingHw: readonly st
   return { fps, outputPath: raw.outputPath, container: formatInfo(format).container, scale, encoder, hardware, preset, quality }
 }
 
+/** JPEG (full-range BT.601) -> limited-range BT.709, inside the scale filter. */
+const COLOR_CONVERT = 'in_range=full:out_range=tv:in_color_matrix=bt601:out_color_matrix=bt709'
+/** Stream colour tags matching COLOR_CONVERT (carried through the mux's -c:v copy). */
+const COLOR_TAGS = ['-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709', '-color_range', 'tv']
+
 /**
  * Full pass-1 argument list: JPEG frames on stdin (mjpeg image2pipe) -> the
  * chosen encoder, optionally Lanczos-scaled to the preset size (frames are
@@ -212,10 +217,17 @@ export function buildEncodeArgs(c: EncodeConfig): string[] {
     '-framerate', String(c.fps),
     '-i', 'pipe:0'
   ]
+  // Colour: the canvas holds sRGB (BT.709 primaries), the JPEG carries it as
+  // full-range BT.601 YCbCr (JFIF). Convert explicitly to limited-range BT.709
+  // and tag the stream: an untagged HD file is decoded as BT.709 by players,
+  // so the old implicit BT.601 output looked shifted/washed out (up to ~14
+  // levels on saturated colours).
   // setsar=1 keeps pixels square: after even-rounding (853.3 -> 854) scale
   // would otherwise write a fractional SAR (853:854) to preserve the exact DAR.
-  if (c.scale) args.push('-vf', `scale=${c.scale.width}:${c.scale.height}:flags=lanczos,setsar=1`)
+  const size = c.scale ? `${c.scale.width}:${c.scale.height}:flags=lanczos:` : ''
+  args.push('-vf', `scale=${size}${COLOR_CONVERT}${c.scale ? ',setsar=1' : ''}`)
   args.push(...videoEncoderArgs({ encoder: c.encoder, preset: c.preset, quality: c.quality }))
+  args.push(...COLOR_TAGS)
   if (c.container === 'mp4') args.push('-movflags', '+faststart')
   args.push('-f', c.container, c.outputPath)
   return args
