@@ -64,8 +64,13 @@ export default function Transport() {
           {shuttleLabel}
         </span>
       )}
-      <button className="btn" title={t('Split clips at playhead (S)')} onClick={() => splitAtPlayhead()}>
-        ✂ {t('Split')}
+      <button
+        className="btn"
+        title={t('Split clips at playhead (S)')}
+        aria-label={t('Split')}
+        onClick={() => splitAtPlayhead()}
+      >
+        ✂ <span className="lbl">{t('Split')}</span>
       </button>
       <button className="btn" title={`${t('Undo')} (Ctrl+Z)`} disabled={!canUndo} onClick={() => undo()}>
         ⟲
@@ -74,28 +79,35 @@ export default function Transport() {
         ⟳
       </button>
       <span className="tdivider" />
-      <button className="btn" title={t('Add a title at the playhead')} onClick={() => addTitle(playhead)}>
-        T {t('Title')}
+      <button
+        className="btn"
+        title={t('Add a title at the playhead')}
+        aria-label={t('Title')}
+        onClick={() => addTitle(playhead)}
+      >
+        T <span className="lbl">{t('Title')}</span>
       </button>
       <button className="btn" title={t('Import subtitles (.srt / .vtt)')} onClick={onImportSrt}>
-        ⬇ SRT
+        ⬇<span className="lbl-srt"> SRT</span>
       </button>
       <button className="btn" title={t('Export subtitles to .srt')} onClick={onExportSrt}>
-        ⬆ SRT
+        ⬆<span className="lbl-srt"> SRT</span>
       </button>
       <button
         className="btn"
         title={t("Auto-generate subtitles from the selected clip's audio (on-device Whisper)")}
+        aria-label={t('AI Subs')}
         onClick={() => setTranscribeOpen(true)}
       >
-        ✨ {t('AI Subs')}
+        ✨ <span className="lbl">{t('AI Subs')}</span>
       </button>
       <button
         className="btn"
         title={t("Detect and ripple-delete quiet ranges in the selected clip's audio")}
+        aria-label={t('Cut Silence')}
         onClick={() => setAutoCutSilenceOpen(true)}
       >
-        🔇 {t('Cut Silence')}
+        🔇 <span className="lbl">{t('Cut Silence')}</span>
       </button>
       <div className="timecode">{timecode(playhead, fps)}</div>
       <div className="spacer" />
@@ -103,9 +115,10 @@ export default function Transport() {
       <button className="btn primary" title={t('Export the timeline to a video file')} onClick={() => setExportOpen(true)}>
         ⤓ {t('Export')}
       </button>
-      <label className="zoom">
-        {t('Zoom')}
+      <label className="zoom" title={t('Zoom')}>
+        <span className="lbl">{t('Zoom')}</span>
         <input
+          aria-label={t('Zoom')}
           type="range"
           min={10}
           max={400}

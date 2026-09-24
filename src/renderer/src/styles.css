@@ -329,6 +329,8 @@ input[type='color']:hover {
   height: 100vh;
   display: grid;
   grid-template-rows: 48px 1fr 300px;
+  /* minmax(0, …): never let a wide row (the toolbar) stretch the whole app past the window. */
+  grid-template-columns: minmax(0, 1fr);
   position: relative;
 }
 .app.drag-over::after {
@@ -357,33 +359,49 @@ input[type='color']:hover {
   background: var(--panel);
   border-bottom: 1px solid var(--line);
   box-shadow: var(--shadow-sm);
+  min-width: 0;
+  overflow: hidden;
+  /* The toolbar collapses secondary labels to icons as it narrows (below). */
+  container-type: inline-size;
 }
-.brand {
-  font-weight: var(--fw-bold);
-  font-size: var(--fs-14);
-  letter-spacing: 0.2px;
-  color: var(--text);
+.topbar .btn,
+.topbar .zoom,
+.topbar .timecode {
+  white-space: nowrap;
+  flex-shrink: 0;
 }
-.badge {
-  font-size: var(--fs-10);
-  font-weight: var(--fw-semibold);
-  text-transform: uppercase;
-  letter-spacing: var(--tracking-cap);
-  color: var(--teal);
-  background: var(--teal-soft);
-  border: 1px solid rgba(79, 214, 192, 0.3);
-  padding: 2px 6px;
-  border-radius: var(--r-xs);
-  margin-left: var(--sp-4);
+/* Narrow windows: secondary buttons become icon-only (tooltip + aria-label keep
+   the name), then the brand badge and meter go, so Export and Zoom stay on screen. */
+@container (max-width: 1480px) {
+  .transport .btn:not(.primary) .lbl,
+  .transport .zoom .lbl {
+    display: none;
+  }
 }
-
-.filebar {
-  display: flex;
-  gap: var(--sp-3);
-  align-items: center;
-  padding-right: var(--sp-5);
-  margin-right: var(--sp-2);
-  border-right: 1px solid var(--line);
+@container (max-width: 1400px) {
+  .topbar .badge {
+    display: none;
+  }
+  .transport .zoom input {
+    width: 80px;
+  }
+}
+@container (max-width: 1200px) {
+  .transport .meter,
+  .transport .lbl-srt {
+    display: none;
+  }
+}
+@container (max-width: 1060px) {
+  .topbar .brand {
+    display: none;
+  }
+  .transport {
+    gap: var(--sp-2);
+  }
+  .transport .zoom input {
+    width: 56px;
+  }
 }
 
 /* ---- transport ---- */
@@ -392,6 +410,7 @@ input[type='color']:hover {
   align-items: center;
   gap: var(--sp-4);
   flex: 1;
+  min-width: 0;
 }
 .transport .spacer {
   flex: 1;
