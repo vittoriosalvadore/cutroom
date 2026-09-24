@@ -6,7 +6,8 @@ import { computeTrim, snapMove, snapTime } from '../lib/editing'
 import { roundRectPath } from '../lib/canvas'
 import { clipSpeed } from '../lib/clipTime'
 import { timelineDuration } from '../lib/exporter'
-import { clampScrollSec, clampScrollY, followPlayhead, zoomAnchoredScroll } from '../lib/timelineScroll'
+import { clampScrollSec, clampScrollY, fitZoom, followPlayhead, scrollExtentSec, zoomAnchoredScroll } from '../lib/timelineScroll'
+import ScrollBar from './ScrollBar'
 import { canRemoveTrack, clipsInMarquee, trackDropTarget } from '../lib/tracks'
 import { removeTrackWithConfirm } from '../lib/trackActions'
 import { useT } from '../lib/i18n'
@@ -253,6 +254,18 @@ export default function Timeline() {
   }
   const applyViewRef = useRef(applyView)
   applyViewRef.current = applyView
+
+  // Viewport size, for the scrollbars (the canvas effect sizes itself).
+  const [size, setSize] = useState({ w: 0, h: 0 })
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const measure = (): void => setSize({ w: el.clientWidth, h: el.clientHeight })
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
 
   // Subscribe to the slices that affect rendering.
   const project = useEditor((s) => s.project)
@@ -1073,21 +1086,37 @@ export default function Timeline() {
     }
   }
 
+  const hint = t(
+    'drag to move · drag edges to trim · S split · X crossfade · M marker · ,/. jump · J/K/L shuttle · ←/→ frame step · shift-click multi-select · drag empty area to box-select · Ctrl+A all · Ctrl+C/V copy · Del remove · wheel scroll · Ctrl+wheel zoom · track header: drag to reorder, bottom edge to resize, right-click for menu'
+  )
+
+  // Scrollbar geometry (same units as `view`: seconds across, px down).
+  const visibleSec = visibleSecFor(size.w, pxPerSec)
+  const contentEndSec = Math.max(timelineDuration(project), playhead)
+  const lanesPx = lanesHeight(project.tracks)
+  const lanesViewport = Math.max(0, size.h - RULER)
+
+  const zoomToFit = (): void => {
+    const st = useEditor.getState()
+    st.setZoom(fitZoom(timelineDuration(st.project), (containerRef.current?.clientWidth ?? 0) - GUTTER))
+    applyView({ x: 0, y: viewRef.current.y })
+  }
+
   return (
     <section className="timeline">
       <div className="timeline-head">
         <span>{t('Timeline')}</span>
-        <span className="hint">
-          {t(
-            'drag to move · drag edges to trim · S split · X crossfade · M marker · ,/. jump · J/K/L shuttle · ←/→ frame step · shift-click multi-select · drag empty area to box-select · Ctrl+A all · Ctrl+C/V copy · Del remove · wheel scroll · Ctrl+wheel zoom · track header: drag to reorder, bottom edge to resize, right-click for menu'
-          )}
+        <span className="hint" title={hint}>
+          {hint}
         </span>
         <button
           className="btn small"
-          title={t('Add a video track')}
-          style={{ marginLeft: 'auto' }}
-          onClick={() => addVideoTrack()}
+          title={t('Zoom to fit the whole timeline')}
+          onClick={zoomToFit}
         >
+          ⤢ {t('Fit')}
+        </button>
+        <button className="btn small" title={t('Add a video track')} onClick={() => addVideoTrack()}>
           + {t('Video')}
         </button>
         <button className="btn small" title={t('Add an audio track')} onClick={() => addAudioTrack()}>
@@ -1104,7 +1133,29 @@ export default function Timeline() {
         onContextMenu={onContextMenu}
       >
         <canvas ref={canvasRef} />
+        {lanesPx > lanesViewport && (
+          <ScrollBar
+            orientation="vertical"
+            label={t('Scroll tracks')}
+            pos={view.y}
+            visible={lanesViewport}
+            extent={lanesPx}
+            onChange={(y) => applyView({ x: viewRef.current.x, y })}
+            style={{ top: RULER }}
+          />
+        )}
         {menu && <TrackMenu {...menu} onClose={closeMenu} />}
+      </div>
+      <div className="tl-hscroll-row">
+        <div className="tl-hscroll-gutter" style={{ width: GUTTER }} />
+        <ScrollBar
+          orientation="horizontal"
+          label={t('Scroll timeline')}
+          pos={view.x}
+          visible={visibleSec}
+          extent={scrollExtentSec(contentEndSec, visibleSec)}
+          onChange={(x) => applyView({ x, y: viewRef.current.y })}
+        />
       </div>
     </section>
   )

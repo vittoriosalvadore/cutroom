@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { clampScrollSec, clampScrollY, followPlayhead, zoomAnchoredScroll } from './timelineScroll'
+import { clampScrollSec, clampScrollY, fitZoom, followPlayhead, posFromThumb, scrollExtentSec, thumbGeometry, zoomAnchoredScroll } from './timelineScroll'
 
 describe('clampScrollSec', () => {
   it('never scrolls before 0', () => {
@@ -46,5 +46,31 @@ describe('zoomAnchoredScroll', () => {
   })
   it('clamps at 0', () => {
     expect(zoomAnchoredScroll(0, 100, 100, 50)).toBe(0)
+  })
+})
+
+describe('scrollbar geometry', () => {
+  it('extent lets the content end reach mid-view, never less than one view', () => {
+    expect(scrollExtentSec(100, 20)).toBe(110)
+    expect(scrollExtentSec(5, 20)).toBe(20)
+    // consistent with clampScrollSec's maximum
+    expect(clampScrollSec(1e9, 100, 20)).toBe(scrollExtentSec(100, 20) - 20)
+  })
+
+  it('thumb size/offset track the scroll and round-trip', () => {
+    const g = thumbGeometry(45, 10, 100, 500)
+    expect(g.size).toBe(50)
+    expect(g.offset).toBeCloseTo(225)
+    expect(posFromThumb(g.offset, 10, 100, 500)).toBeCloseTo(45)
+  })
+
+  it('keeps a minimum thumb size and fills the track when everything fits', () => {
+    expect(thumbGeometry(0, 1, 10000, 400).size).toBe(28)
+    expect(thumbGeometry(0, 30, 20, 400)).toEqual({ offset: 0, size: 400 })
+  })
+
+  it('fitZoom fits the duration with a margin', () => {
+    expect(fitZoom(100, 1040)).toBeCloseTo(10)
+    expect(fitZoom(0, 1000)).toBe(100)
   })
 })

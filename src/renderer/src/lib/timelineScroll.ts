@@ -42,3 +42,46 @@ export function zoomAnchoredScroll(scrollSec: number, anchorPx: number, oldPx: n
   const anchorT = scrollSec + anchorPx / oldPx
   return Math.max(0, anchorT - anchorPx / newPx)
 }
+
+/**
+ * Total scrollable length (seconds) matching clampScrollSec: you can scroll
+ * until the content end sits mid-view, so the extent is end + half a view
+ * (never less than one view).
+ */
+export function scrollExtentSec(contentEndSec: number, visibleSec: number): number {
+  return Math.max(visibleSec, contentEndSec + visibleSec / 2)
+}
+
+/**
+ * Scrollbar thumb for a scroll `pos` over `extent` with `visible` of it shown,
+ * on a track `trackPx` long. The thumb never shrinks below `minPx` so it stays
+ * grabbable on long timelines. Returns px offsets within the track.
+ */
+export function thumbGeometry(
+  pos: number,
+  visible: number,
+  extent: number,
+  trackPx: number,
+  minPx = 28
+): { offset: number; size: number } {
+  if (!(extent > 0) || !(trackPx > 0) || visible >= extent) return { offset: 0, size: Math.max(0, trackPx) }
+  const size = Math.min(trackPx, Math.max(minPx, (visible / extent) * trackPx))
+  const maxPos = extent - visible
+  const offset = maxPos > 0 ? (Math.min(Math.max(pos, 0), maxPos) / maxPos) * (trackPx - size) : 0
+  return { offset, size }
+}
+
+/** Inverse of thumbGeometry: the scroll position for a thumb at `offsetPx`. */
+export function posFromThumb(offsetPx: number, visible: number, extent: number, trackPx: number, minPx = 28): number {
+  const { size } = thumbGeometry(0, visible, extent, trackPx, minPx)
+  const room = trackPx - size
+  const maxPos = Math.max(0, extent - visible)
+  if (room <= 0) return 0
+  return (Math.min(Math.max(offsetPx, 0), room) / room) * maxPos
+}
+
+/** Zoom (px per second) that fits `durationSec` into `lanePx`, with a small margin. */
+export function fitZoom(durationSec: number, lanePx: number): number {
+  if (!(durationSec > 0) || !(lanePx > 0)) return 100
+  return lanePx / (durationSec * 1.04)
+}

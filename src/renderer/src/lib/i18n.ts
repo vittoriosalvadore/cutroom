@@ -369,6 +369,10 @@ const STRINGS: Record<Exclude<Lang, 'en'>, Record<string, string>> = {
     Preview: 'Vista previa',
 
     // timeline + inspector: track management
+    'Fit': 'Ajustar',
+    'Zoom to fit the whole timeline': 'Ajustar el zoom a toda la línea de tiempo',
+    'Scroll timeline': 'Desplazar la línea de tiempo',
+    'Scroll tracks': 'Desplazar pistas',
     'Add a video track': 'Añadir pista de vídeo',
     'Move track up': 'Subir pista',
     'Move track down': 'Bajar pista',
@@ -754,6 +758,10 @@ const STRINGS: Record<Exclude<Lang, 'en'>, Record<string, string>> = {
     Preview: 'Aperçu',
 
     // timeline + inspector: track management
+    'Fit': 'Ajuster',
+    'Zoom to fit the whole timeline': 'Ajuster le zoom à toute la timeline',
+    'Scroll timeline': 'Faire défiler la timeline',
+    'Scroll tracks': 'Faire défiler les pistes',
     'Add a video track': 'Ajouter une piste vidéo',
     'Move track up': 'Monter la piste',
     'Move track down': 'Descendre la piste',
@@ -1139,6 +1147,10 @@ const STRINGS: Record<Exclude<Lang, 'en'>, Record<string, string>> = {
     Preview: 'Vorschau',
 
     // timeline + inspector: track management
+    'Fit': 'Einpassen',
+    'Zoom to fit the whole timeline': 'Zoom an die gesamte Timeline anpassen',
+    'Scroll timeline': 'Timeline scrollen',
+    'Scroll tracks': 'Spuren scrollen',
     'Add a video track': 'Videospur hinzufügen',
     'Move track up': 'Spur nach oben',
     'Move track down': 'Spur nach unten',
