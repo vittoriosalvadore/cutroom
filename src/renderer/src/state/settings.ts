@@ -43,6 +43,8 @@ export interface Settings {
   defaultFadeSec: number
   /** Draw audio waveforms on timeline clips. */
   showWaveforms: boolean
+  /** Play short audio snippets while scrubbing the playhead or shuttling off 1×. */
+  audioScrub: boolean
   // --- export ---
   exportPreset: ExportPreset
   /** x264 CRF, 14 (high quality) .. 28 (small file). */
@@ -73,6 +75,7 @@ export const DEFAULT_SETTINGS: Settings = {
   snapping: true,
   defaultFadeSec: 0.5,
   showWaveforms: true,
+  audioScrub: true,
   exportPreset: 'medium',
   exportCrf: 20,
   exportFormat: 'mp4-h264',
@@ -111,6 +114,7 @@ export function sanitize(raw: unknown): Partial<Settings> {
   bool('showPlaceholders')
   bool('snapping')
   bool('showWaveforms')
+  bool('audioScrub')
   bool('reduceMotion')
   const fade = clampNum(o.defaultFadeSec, 0.1, 2)
   if (fade !== undefined) out.defaultFadeSec = fade
@@ -149,6 +153,7 @@ function pick(s: Settings): Settings {
     snapping: s.snapping,
     defaultFadeSec: s.defaultFadeSec,
     showWaveforms: s.showWaveforms,
+    audioScrub: s.audioScrub,
     exportPreset: s.exportPreset,
     exportCrf: s.exportCrf,
     exportFormat: s.exportFormat,

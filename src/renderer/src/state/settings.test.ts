@@ -53,6 +53,12 @@ describe('settings sanitize', () => {
     expect(sanitize({ snapping: false }).snapping).toBe(false)
   })
 
+  it('audio scrubbing defaults on and only accepts a boolean', () => {
+    expect(DEFAULT_SETTINGS.audioScrub).toBe(true)
+    expect(sanitize({ audioScrub: false }).audioScrub).toBe(false)
+    expect(sanitize({ audioScrub: 'no' })).not.toHaveProperty('audioScrub')
+  })
+
   it('keeps a valid preview quality and drops an unknown one', () => {
     expect(sanitize({ previewQuality: 'half' }).previewQuality).toBe('half')
     expect(sanitize({ previewQuality: 'quarter' }).previewQuality).toBe('quarter')

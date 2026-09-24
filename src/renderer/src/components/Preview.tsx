@@ -6,6 +6,7 @@ import { AudioPool } from '../lib/audioPool'
 import { resumeAudioContext } from '../lib/audioContext'
 import { previewScale } from '../lib/previewScale'
 import { hasVideoAt, isRealtimeRate, stepShuttleHold, type ShuttleHold } from '../lib/transport'
+import { scrubDirection } from '../lib/scrub'
 import { useT } from '../lib/i18n'
 import type { Project } from '../types'
 
@@ -53,13 +54,16 @@ export default function Preview() {
   const project = useEditor((s) => s.project)
   const playhead = useEditor((s) => s.playheadSec)
   // Only 1× forward is real playback. J/K/L shuttle rates (reverse, 2×, 4×) ride
-  // the paused/scrub path with audio silent, paced by `hold` so each seeked
-  // frame gets to land before the next one is requested (lib/transport).
+  // the paused/scrub path (audio as scrub grains, lib/scrub), paced by `hold` so
+  // each seeked frame gets to land before the next one is requested (lib/transport).
   const isPlaying = useEditor((s) => s.isPlaying && isRealtimeRate(s.shuttleRate))
   const shuttling = useEditor((s) => s.isPlaying && !isRealtimeRate(s.shuttleRate))
   const hold = useRef<ShuttleHold>({ time: 0, at: 0, landed: true })
   const showPlaceholders = useSettings((s) => s.showPlaceholders)
   const previewQuality = useSettings((s) => s.previewQuality)
+  const scrubbing = useEditor((s) => s.scrubbing)
+  const audioScrub = useSettings((s) => s.audioScrub)
+  const lastScrubTime = useRef(playhead)
   const t = useT()
 
   // Keep the newest state reachable from async redraws (e.g. an image finishing
@@ -156,6 +160,22 @@ export default function Preview() {
     }
     safeFrame(compRef.current, audioRef.current, project, time, isPlaying)
   }, [project, playhead, isPlaying, shuttling, showPlaceholders, previewQuality])
+
+  // Audio scrubbing: while the ruler playhead is dragged or the shuttle runs
+  // off 1×, each playhead move offers a short grain at the LIVE playhead (not
+  // the held shuttle frame; the pool throttles). 1× playback is untouched.
+  useEffect(() => {
+    const prev = lastScrubTime.current
+    lastScrubTime.current = playhead
+    if (!audioScrub || isPlaying || !(scrubbing || shuttling)) return
+    const st = useEditor.getState()
+    const dir = shuttling ? (st.shuttleRate < 0 ? -1 : 1) : scrubDirection(prev, playhead)
+    try {
+      audioRef.current?.scrub(st.project, playhead, dir)
+    } catch (e) {
+      console.error('[cutroom] audio scrub error:', e)
+    }
+  }, [playhead, scrubbing, shuttling, isPlaying, audioScrub])
 
   return (
     <section className="preview">

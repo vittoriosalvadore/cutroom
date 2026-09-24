@@ -152,6 +152,12 @@ export default function SettingsModal() {
                   checked={s.showWaveforms}
                   onChange={(v) => s.set({ showWaveforms: v })}
                 />
+                <Toggle
+                  label={t('Audio scrubbing')}
+                  desc={t('Play short audio snippets while dragging the playhead or shuttling with J/L.')}
+                  checked={s.audioScrub}
+                  onChange={(v) => s.set({ audioScrub: v })}
+                />
                 <RangeRow
                   label={t('Default fade length')}
                   desc={t('Used for the X crossfade and new fades.')}

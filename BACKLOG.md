@@ -17,10 +17,18 @@ candidate features. Ordered roughly by how much they came up. Update as we go.
 
 - **Pan is audio-tracks-only** — video-track audio is not panned in preview or
   export (it gets volume + mute, centre pan). Add video-track pan if needed.
-- **Stereo-source pan parity** — export pan is *sample-exact for mono* sources
-  but an equal-power *balance* approximation for already-stereo sources (preview
-  uses WebAudio `StereoPannerNode`'s redistribute algorithm). Fine for typical
-  use; revisit if exact stereo parity is required.
+- **Mixed mono + stereo clips on one panned track (FX projects)** — when a project
+  uses track FX, a plain track's clips are summed (`amix`) *before* its pan, so a
+  mono clip sharing a track with a stereo clip is up-mixed at −3 dB and then gets
+  the stereo pan law; the preview pans each clip with the law for whatever is
+  playing at that instant (mono law for the mono clip). Identical when centred;
+  differs only for a panned track that holds both kinds. The flat (no-FX) export
+  pans per clip and is exact.
+- **Dynamics worklet stays in after its FX are turned off (preview)** — once a
+  track has had EQ/gate/comp/duck on, the preview keeps the worklet inserted
+  (passthrough, so toggling never clicks). Its 2-channel input up-mixes mono at
+  unity, so a *mono* source on that track stays 3 dB louder (centred) than a fresh
+  preview or the export until the project is reopened. Stereo sources unaffected.
 - **Gate/duck preview vs export parity** — the preview AudioWorklet approximates
   FFmpeg `agate`/`sidechaincompress` (same knobs/units, perceptually matched, not
   sample-identical). Also: the duck key taps the trigger **pre-gate** in preview
@@ -31,28 +39,21 @@ candidate features. Ordered roughly by how much they came up. Update as we go.
   floor). A parallel-bus emulation could add a floor later if wanted.
 - **Gate/duck apply to audio tracks only** — video-track audio bypasses the
   per-track dynamics chain in preview. Revisit if video-track gating is needed.
-- **Mono-source level: preview vs export (pre-existing, measured)** — FFmpeg's
-  `aformat` mono→stereo upmix is −3 dB, WebAudio's is unity. So a *mono* source is
-  3 dB quieter in export than preview when it is panned off-centre (export upmixes
-  then pans; preview pans mono at full level) or when its track runs the dynamics
-  worklet (EQ/gate/comp/duck — the worklet upmixes at unity). Unpanned, worklet-free
-  mono and all stereo sources match. Fix: build the pan with StereoPannerNode's exact
-  mono/stereo matrices in one `pan` filter (the reverb wet branch already does, see
-  `stereoPanFilter`) and upmix at unity where the preview does.
-- **Reverb wet level on a ducked mono track** — the duck path forces stereo via
-  `aformat` (−3 dB for mono) before the reverb split, so the wet follows the gap
-  above in that one case. Reverb is otherwise sample-exact (see Done).
+- **Audio scrubbing skips `<video>`-element audio** — scrub grains are cut from
+  decoded AudioBuffers, which exist for audio media (and denoised clips). A plain
+  video-track clip's audio lives only in its `<video>` element, so it is silent
+  while scrubbing/shuttling (1× playback is unaffected). Grains also play at the
+  clip's normal pitch whatever the shuttle speed.
 
 ## Candidate features (Vegas-style, not yet built — rough priority)
 
 1. **Proxy / optimized media** for heavy footage.
-2. **Audio scrubbing** — audible audio while dragging the playhead or shuttling off 1×
-   (J/K/L shuttle + frame step shipped; off-1× shuttle is silent).
-3. **Color curves / scopes** — beyond primary grade: RGB curves, histogram/vectorscope.
+2. **Color curves / scopes** — beyond primary grade: RGB curves, histogram/vectorscope.
 
 ## Done
 
-- **Per-track mixer** — volume (dB) + pan, preview + export (mono pan sample-exact).
+- **Per-track mixer** — volume (dB) + pan, preview + export (pan sample-exact for mono and
+  stereo sources, see Mono/stereo level parity).
 - **Audio crossfades** — `X` crossfades a clip with its nearest neighbour; rides
   the fade/`amix` machinery; fade-ramp visuals on the timeline.
 - **Noise gate + ducking** — per-track noise gate (`agate` / AudioWorklet) and
@@ -105,7 +106,18 @@ candidate features. Ordered roughly by how much they came up. Update as we go.
 - **Hardware export encoder** — NVENC / QSV / AMF / VideoToolbox probed once in main (listed +
   tiny test encode); Encoder = Auto / Software / detected; a failed hw encode retries in software.
 - **Transport niceties** — J/K/L shuttle (L/J forward/reverse, repeat for 2×/4×, K pauses; off-1×
-  rates scrub the preview frame-paced with audio silent; rate badge in the transport), ←/→ frame
+  rates scrub the preview frame-paced with scrub-grain audio; rate badge in the transport), ←/→ frame
   step and Shift+←/→ one second. Stops at the timeline end / at 0.
 - **i18n full coverage** — every Inspector/Transport/MediaBin/Timeline/modal string goes through
   `t()` with ES/FR/DE translations and `{name}` interpolation; a test fails on any untranslated key.
+- **Mono/stereo level parity** — the export now reproduces WebAudio's channel handling instead of
+  FFmpeg's −3 dB mono→stereo conversion: one `pan` filter carries StereoPannerNode's mono law (on
+  FC) *and* stereo law (on FL/FR) — `pan` drops terms for channels the input lacks, so it works
+  without knowing the channel count — and a unity up-mix (`FL=FL+FC|FR=FR+FC`) goes wherever the
+  preview up-mixes at unity: tracks running the dynamics worklet, the duck key, the reverb wet, and
+  `<video>`-tap clips. Measured vs Chromium (16 mono/stereo × pan × EQ/reverb/duck/video cases):
+  ≤ −87 dB error (EQ cases, float32 worklet biquads), ≤ −105 dB elsewhere; was 3 dB off for mono.
+- **Audio scrubbing** — dragging the ruler playhead or shuttling off 1× (incl. reverse) plays ~70 ms
+  windowed grains of the audio under the playhead through each clip's track chain (mute / gain /
+  pan / FX / reverb), at most every 45 ms and only when the playhead moved; reverse plays the audio
+  just before the playhead backwards. Options → Editing → Audio scrubbing (on by default).

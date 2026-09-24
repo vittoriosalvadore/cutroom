@@ -157,6 +157,8 @@ interface EditorState {
   isPlaying: boolean
   /** Signed J/K/L shuttle rate while playing: 1 = normal, ±2/±4 fast, <0 reverse (see lib/transport). */
   shuttleRate: number
+  /** True while the playhead is being dragged on the ruler (drives audio scrubbing, lib/scrub). */
+  scrubbing: boolean
   /** Timeline zoom: horizontal pixels per second. */
   pxPerSec: number
   /** The PRIMARY selected clip (Inspector target). Always a member of selectedClipIds, null iff empty. */
@@ -290,6 +292,8 @@ interface EditorState {
   setPlaying: (playing: boolean) => void
   /** Play at a signed shuttle rate (J/K/L); see lib/transport. */
   setShuttle: (rate: number) => void
+  /** Ruler playhead drag started / ended (see `scrubbing`). */
+  setScrubbing: (scrubbing: boolean) => void
   setZoom: (pxPerSec: number) => void
 
   // --- history (undo/redo) ---
@@ -500,6 +504,7 @@ export const useEditor = create<EditorState>((set) => {
   playheadSec: 0,
   isPlaying: false,
   shuttleRate: 1,
+  scrubbing: false,
   pxPerSec: 80,
   selectedClipId: null,
   selectedClipIds: new Set<string>(),
@@ -1319,6 +1324,7 @@ export const useEditor = create<EditorState>((set) => {
   setPlayhead: (sec) => set({ playheadSec: Math.max(0, sec) }),
   setPlaying: (playing) => set({ isPlaying: playing, shuttleRate: 1 }),
   setShuttle: (rate) => set({ isPlaying: true, shuttleRate: rate }),
+  setScrubbing: (scrubbing) => set({ scrubbing }),
   setZoom: (pxPerSec) => set({ pxPerSec: Math.min(600, Math.max(10, pxPerSec)) }),
 
   snapshot: () =>

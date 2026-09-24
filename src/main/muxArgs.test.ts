@@ -1,5 +1,15 @@
 import { describe, it, expect } from 'vitest'
-import { buildMuxArgs, buildMuxGraph, panGains, planReverbs, speedFilter, stereoPanFilter, type MuxClip } from './muxArgs'
+import {
+  buildMuxArgs,
+  buildMuxGraph,
+  panFilter,
+  panGains,
+  planReverbs,
+  speedFilter,
+  stereoPanFilter,
+  UNITY_UPMIX,
+  type MuxClip
+} from './muxArgs'
 import { reverbIRLength, reverbMixGains } from '../shared/reverb'
 
 const base = { silentPath: '/tmp/silent.mp4', outputPath: '/tmp/out.mp4', sampleRate: 48000 }
@@ -72,12 +82,51 @@ describe('buildMuxArgs', () => {
     expect(g).toContain('afade=t=out:st=2.000:d=2.000')
   })
 
-  it('emits an equal-power pan filter only when panned', () => {
+  it('emits the StereoPannerNode pan filter only when panned', () => {
     expect(graphOf(buildMuxArgs({ ...base, clips: [clip({ pan: 0 })] }))).not.toContain('pan=stereo')
     const g = graphOf(buildMuxArgs({ ...base, clips: [clip({ pan: -1 })] }))
-    // full left: left gain 1, right gain 0
-    expect(g).toContain('aformat=channel_layouts=stereo')
-    expect(g).toContain('pan=stereo|c0=1.00000*c0|c1=0.00000*c1')
+    expect(g).toContain(`volume=1.0000,${panFilter(-1)},adelay=0:all=1[a0]`)
+    // never FFmpeg's −3 dB mono->stereo conversion in front of the pan
+    expect(g).not.toContain('aformat=channel_layouts=stereo')
+  })
+
+  it('up-mixes a <video>-tap clip at unity (the preview plays it without a panner)', () => {
+    const g = graphOf(buildMuxArgs({ ...base, clips: [clip({ directTap: true })] }))
+    expect(g).toContain(`volume=1.0000,${UNITY_UPMIX},adelay=0:all=1[a0]`)
+    expect(graphOf(buildMuxArgs({ ...base, clips: [clip({})] }))).not.toContain('FL=FL+FC')
+  })
+})
+
+describe('panFilter / UNITY_UPMIX (mono vs stereo, one filter)', () => {
+  it('carries the mono law on FC and the stereo law on FL/FR', () => {
+    // centre: stereo passes through, mono gets −3 dB per side (WebAudio's mono panner)
+    expect(panFilter(0)).toBe(
+      'aformat=channel_layouts=mono|stereo,pan=stereo|FL=FL+0.000000*FR+0.707107*FC|FR=1.000000*FR+0.707107*FC'
+    )
+    // hard left: stereo folds R into L; mono goes fully (unity) left
+    expect(panFilter(-1)).toBe(
+      'aformat=channel_layouts=mono|stereo,pan=stereo|FL=FL+1.000000*FR+1.000000*FC|FR=0.000000*FR+0.000000*FC'
+    )
+    // right of centre: the stereo law folds L into R
+    const { left, right } = panGains(0.5)
+    expect(panFilter(0.5)).toBe(
+      `aformat=channel_layouts=mono|stereo,pan=stereo|FL=0.707107*FL+${left.toFixed(6)}*FC` +
+        `|FR=FR+0.707107*FL+${right.toFixed(6)}*FC`
+    )
+    expect(panFilter(9)).toBe(panFilter(1))
+  })
+
+  it('agrees with stereoPanFilter on the stereo terms', () => {
+    for (const p of [-0.8, -0.3, 0.2, 0.9]) {
+      const st = stereoPanFilter(p).match(/[\d.]+(?=\*c)/g)!.map(Number)
+      const ours = panFilter(p).match(/[\d.]+(?=\*F[LR])/g)!.map(Number)
+      expect(ours.length).toBe(st.length)
+      ours.forEach((g, i) => expect(g).toBeCloseTo(st[i], 4))
+    }
+  })
+
+  it('up-mixes mono at unity and never converts stereo', () => {
+    expect(UNITY_UPMIX).toBe('aformat=channel_layouts=mono|stereo,pan=stereo|FL=FL+FC|FR=FR+FC')
   })
 })
 
@@ -94,8 +143,9 @@ describe('buildMuxArgs FX path (gate / duck)', () => {
     const g = graphOf(buildMuxArgs({ ...base, clips: [clip({ trackGainDb: -6, gate })] }))
     // per-clip carries only the clip volume; trackGain is NOT folded in here...
     expect(g).toContain('volume=1.0000,adelay=0:all=1[c0]')
-    // ...it moves to the bus (-6 dB ~= 0.5012), followed by agate, then the bus label
-    expect(g).toContain('[c0]volume=0.5012,agate=threshold=0.005623:range=0.001000:ratio=2:attack=5:release=120:detection=rms[bus_0]')
+    // ...it moves to the bus (-6 dB ~= 0.5012), then the worklet's unity
+    // upmix, agate, then the bus label
+    expect(g).toContain(`[c0]volume=0.5012,${UNITY_UPMIX},agate=threshold=0.005623:range=0.001000:ratio=2:attack=5:release=120:detection=rms[bus_0]`)
     // bus then terminal then single-track limiter
     expect(g).toContain('[t_0]alimiter=limit=0.97,apad[aout]')
     expect(g).not.toContain('[a0]') // not the flat path
@@ -117,10 +167,14 @@ describe('buildMuxArgs FX path (gate / duck)', () => {
     )
     // trigger (tA = track 0) split into a main + one key, taken BEFORE any duck
     expect(g).toContain('[bus_0]asplit=2[main_0][key_0_1]')
-    // key padded + stereo so a short trigger can't truncate the ducked track
-    expect(g).toContain('[key_0_1]aformat=channel_layouts=stereo,apad[kp_0_1]')
+    // key padded + unity-upmixed (like the worklet's key input) so a short
+    // trigger can't truncate the ducked track
+    expect(g).toContain(`[key_0_1]${UNITY_UPMIX},apad[kp_0_1]`)
+    // the ducked bus runs the worklet in preview -> unity upmix on the bus
+    expect(g).toContain(`[c1]volume=1.0000,${UNITY_UPMIX}[bus_1]`)
     // ducked track (tB = track 1) sidechain-compressed; ratio clamped to 20
-    expect(g).toContain('[md_1][kp_0_1]sidechaincompress=threshold=0.031623:ratio=20:attack=15:release=250[dk_1]')
+    expect(g).toContain('[bus_1][kp_0_1]sidechaincompress=threshold=0.031623:ratio=20:attack=15:release=250[dk_1]')
+    expect(g).not.toContain('aformat=channel_layouts=stereo[')
   })
 
   it('emits EQ (bass/equalizer/treble) + acompressor on the per-track bus', () => {
@@ -292,11 +346,12 @@ describe('buildMuxArgs reverb', () => {
     const pad = (reverbIRLength(reverb, 48000) / 48000).toFixed(3)
     expect(g).toContain('[bus_0]asplit=2[rd_0][rw_0]')
     // wet: unity upmix (mono FC -> both sides at full level, as WebAudio does), pad, convolve, gain
-    expect(g).toContain(`[rw_0]pan=stereo|FL=FL+FC|FR=FR+FC,apad=pad_dur=${pad}[rx_0]`)
+    expect(g).toContain(`[rw_0]${UNITY_UPMIX},apad=pad_dur=${pad}[rx_0]`)
     expect(g).toContain(`[rx_0][2:a]afir=irnorm=-1:irgain=1,volume=${wet.toFixed(6)}[rwo_0]`)
-    // dry: the no-reverb terminal's gains (mono FC -> -3 dB each side, stereo as-is),
-    // via pan — an aformat here would upmix the bus before the asplit, wet included
-    expect(g).toContain(`[rd_0]volume=${dry.toFixed(6)},pan=stereo|FL=1.00000*FL+0.70711*FC|FR=1.00000*FR+0.70711*FC[rdo_0]`)
+    // dry: the no-reverb terminal's centred panner (mono FC -> -3 dB each side,
+    // stereo as-is) — an aformat=stereo here would upmix the bus before the
+    // asplit, wet included
+    expect(g).toContain(`[rd_0]volume=${dry.toFixed(6)},${panFilter(0)}[rdo_0]`)
     expect(g).not.toMatch(/aformat=channel_layouts=stereo\[rdo_0\]/)
     expect(g).toContain('[rdo_0][rwo_0]amix=inputs=2:normalize=0:duration=longest[t_0]')
     expect(g).toContain('[t_0]alimiter=limit=0.97,apad[aout]')
@@ -307,12 +362,10 @@ describe('buildMuxArgs reverb', () => {
     const { left, right } = panGains(-0.5)
     // wet (always stereo): WebAudio's exact stereo-input pan law
     expect(g).toContain(`afir=irnorm=-1:irgain=1,volume=${reverbMixGains(0.3).wet.toFixed(6)},${stereoPanFilter(-0.5)}[rwo_0]`)
-    // dry: the same gains the no-reverb terminal applies after its -3 dB mono upmix
-    const l = left.toFixed(5)
-    const r = right.toFixed(5)
-    const lc = (left * Math.SQRT1_2).toFixed(5)
-    const rc = (right * Math.SQRT1_2).toFixed(5)
-    expect(g).toContain(`,pan=stereo|FL=${l}*FL+${lc}*FC|FR=${r}*FR+${rc}*FC[rdo_0]`)
+    // dry: the no-reverb terminal's panner (mono law on FC, stereo law on FL/FR)
+    expect(g).toContain(`,${panFilter(-0.5)}[rdo_0]`)
+    expect(panFilter(-0.5)).toContain(`${left.toFixed(6)}*FC|FR=`)
+    expect(panFilter(-0.5)).toContain(`+${right.toFixed(6)}*FC`)
   })
 
   it('stereoPanFilter mirrors StereoPannerNode for stereo input (identity at centre)', () => {
@@ -322,6 +375,27 @@ describe('buildMuxArgs reverb', () => {
     expect(stereoPanFilter(1)).toBe('pan=stereo|c0=0.00000*c0|c1=c1+1.00000*c0')
     expect(stereoPanFilter(0.5)).toBe('pan=stereo|c0=0.70711*c0|c1=c1+0.70711*c0')
     expect(stereoPanFilter(9)).toBe(stereoPanFilter(1))
+  })
+
+  it('follows the worklet: EQ/comp tracks up-mix at unity, plain tracks keep the panner law', () => {
+    const eq = { lowDb: 0, midDb: 0, highDb: 0 }
+    const g = buildMuxGraph(
+      [
+        clip({ trackId: 'tA', path: '/a.wav', eq, pan: 0.4, reverb }),
+        clip({ trackId: 'tB', path: '/b.wav', pan: 0.4 }),
+        clip({ trackId: 'tV', path: '/v.mp4', directTap: true })
+      ],
+      48000
+    )
+    // tA: bus -> unity upmix -> EQ; then reverb dry/wet, both from stereo
+    expect(g).toContain(`[c0]volume=1.0000,${UNITY_UPMIX},bass=g=0:f=120`)
+    expect(g).toContain(`[rd_0]volume=${reverbMixGains(0.3).dry.toFixed(6)},${panFilter(0.4)}[rdo_0]`)
+    // tB: no worklet -> no upmix; the one pan filter picks mono or stereo law
+    expect(g).toContain(`[c1]volume=1.0000[bus_1]`)
+    expect(g).toContain(`[bus_1]${panFilter(0.4)}[t_1]`)
+    // tV: the <video> tap clip up-mixes at unity before the bus
+    expect(g).toContain(`volume=1.0000,${UNITY_UPMIX},adelay=0:all=1[c2]`)
+    expect(g).toContain('[bus_2]anull[t_2]')
   })
 
   it('sits after the duck and before the pan on the track terminal', () => {
@@ -347,7 +421,7 @@ describe('buildMuxArgs reverb', () => {
     expect(planReverbs([clip({ reverb: wild })])[0].reverb).toEqual({ mix: 1, decaySec: 10, preDelayMs: 0, tone: 1 })
     const g = buildMuxGraph([clip({ reverb: wild })], 48000)
     expect(g).toContain('apad=pad_dur=10.000')
-    expect(g).toContain(`[rd_0]volume=${reverbMixGains(1).dry.toFixed(6)},pan=`)
+    expect(g).toContain(`[rd_0]volume=${reverbMixGains(1).dry.toFixed(6)},${panFilter(0)}[rdo_0]`)
     expect(planReverbs([clip({ reverb: { ...reverb, mix: 0 } })])).toEqual([])
     const off = buildMuxGraph([clip({ reverb: { ...reverb, mix: 0 } })], 48000)
     expect(off).not.toContain('afir')

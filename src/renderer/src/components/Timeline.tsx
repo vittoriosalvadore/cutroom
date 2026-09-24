@@ -837,6 +837,8 @@ export default function Timeline() {
           }
         }
       }
+      // Flag the drag first so the click itself already plays a scrub grain.
+      st.setScrubbing(true)
       st.setPlayhead(xToTime(x))
       drag.current = { mode: 'seek' }
       ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
@@ -1035,6 +1037,7 @@ export default function Timeline() {
     }
     // Dropping a dragged track header moves the track (one undo step; no-op if unmoved).
     if (d && d.mode === 'track' && d.active && !cancelled) st.moveTrack(d.trackId, d.index)
+    if (d && d.mode === 'seek') st.setScrubbing(false)
     setOverlay(null)
     if (d && d.mode === 'track' && canvasRef.current) canvasRef.current.style.cursor = 'default'
     drag.current = null

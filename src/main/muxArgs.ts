@@ -69,6 +69,13 @@ export interface MuxClip {
   eq?: MuxEQ
   comp?: MuxComp
   reverb?: MuxReverb
+  /**
+   * The preview plays this clip through its <video> element's audio tap,
+   * straight into the master with no track panner (video-track clips that are
+   * not denoised). WebAudio up-mixes a mono tap at unity there, so the export
+   * does the same (see UNITY_UPMIX) instead of FFmpeg's −3 dB default.
+   */
+  directTap?: boolean
 }
 
 /**
@@ -99,6 +106,51 @@ export function panGains(pan: number): { left: number; right: number } {
   const p = Math.max(-1, Math.min(1, pan))
   const theta = ((p + 1) / 2) * (Math.PI / 2)
   return { left: Math.cos(theta), right: Math.sin(theta) }
+}
+
+// ---------------------------------------------------------------------------
+// Mono vs stereo. FFmpeg converts mono to stereo (aformat, amix, -ac 2) at
+// −3 dB per side; WebAudio's channel up-mix is unity (L = R = mono), and its
+// StereoPannerNode has separate mono and stereo pan laws. The preview is the
+// reference, so wherever its signal path differs from FFmpeg's implicit
+// conversion the export spells the matrix out with a `pan` filter.
+//
+// The trick that makes one filter work without knowing the channel count:
+// `pan` silently drops terms naming a channel the input doesn't have. So in
+// `FL=FL+FC` a stereo input keeps FL (FC doesn't exist) and a mono input — whose
+// only channel is FC — gets FC. The aformat in front narrows anything else
+// (5.1, unordered 2-channel) to mono or stereo first, the way WebAudio's
+// 2-channel nodes down-mix (FFmpeg's float down-mix matrix is the same
+// L + 0.707·C + 0.707·Ls), and never touches a mono or stereo signal.
+// ---------------------------------------------------------------------------
+
+/** Narrows to mono|stereo without converting either (see above). */
+const MONO_OR_STEREO = 'aformat=channel_layouts=mono|stereo'
+
+/**
+ * Unity mono→stereo up-mix (L = R = mono), as a WebAudio node with
+ * channelCount 2 / 'explicit' (the dynamics worklet, the duck key input) or the
+ * master mix does it. Stereo passes through untouched.
+ */
+export const UNITY_UPMIX = `${MONO_OR_STEREO},pan=stereo|FL=FL+FC|FR=FR+FC`
+
+/**
+ * One `pan` filter reproducing WebAudio's StereoPannerNode for EITHER input:
+ * a mono input gets the mono equal-power law (panGains; −3 dB per side at
+ * centre), a stereo input the stereo law (see stereoPanFilter). Sample-exact
+ * for both, so the export follows whichever the preview's panner sees.
+ */
+export function panFilter(pan: number): string {
+  const p = Math.max(-1, Math.min(1, pan))
+  const m = panGains(p)
+  const x = p <= 0 ? p + 1 : p
+  const gl = Math.cos((x * Math.PI) / 2).toFixed(6)
+  const gr = Math.sin((x * Math.PI) / 2).toFixed(6)
+  const ml = m.left.toFixed(6)
+  const mr = m.right.toFixed(6)
+  return p <= 0
+    ? `${MONO_OR_STEREO},pan=stereo|FL=FL+${gl}*FR+${ml}*FC|FR=${gr}*FR+${mr}*FC`
+    : `${MONO_OR_STEREO},pan=stereo|FL=${gl}*FL+${ml}*FC|FR=FR+${gr}*FL+${mr}*FC`
 }
 
 /**
@@ -289,10 +341,11 @@ function buildFlatGraph(clips: MuxClip[], labels: string[], sampleRate: number):
     if (fo > 0) {
       chain += `,afade=t=out:st=${Math.max(0, c.durationSec - fo).toFixed(3)}:d=${fo.toFixed(3)}`
     }
-    if (c.pan && Math.abs(c.pan) > 0.001) {
-      const { left, right } = panGains(c.pan)
-      chain += `,aformat=channel_layouts=stereo,pan=stereo|c0=${left.toFixed(5)}*c0|c1=${right.toFixed(5)}*c1`
-    }
+    // Pan per clip (no track bus here), with the preview panner's exact law
+    // for this source's channel count. Unpanned mono stays mono: the final
+    // -ac 2 up-mixes it at −3 dB, which is what a centred panner does to mono.
+    if (c.pan && Math.abs(c.pan) > 0.001) chain += `,${panFilter(c.pan)}`
+    if (c.directTap) chain += `,${UNITY_UPMIX}`
     chain += `,adelay=${Math.round(c.startSec * 1000)}:all=1[a${i}]`
     return chain
   })
@@ -312,9 +365,11 @@ function buildFlatGraph(clips: MuxClip[], labels: string[], sampleRate: number):
  * trackGain -> [gate] -> [duck] -> [pan], and the buses are summed. Each duck's
  * sidechain key is split from its trigger's PRE-duck bus (so even mutual A<->B
  * ducking stays a DAG), padded with apad so a short trigger can't truncate the
- * longer ducked track, and forced to stereo (sidechaincompress needs matching
- * layouts). dB levels -> linear; times stay in ms; every option is clamped to
- * FFmpeg's accepted range. Reverb sits after the duck and before the pan (as in
+ * longer ducked track, and up-mixed to stereo at unity like the preview
+ * worklet's key input (sidechaincompress needs matching layouts). Tracks that
+ * run the preview worklet (EQ/gate/comp/duck) up-mix at unity the same way.
+ * dB levels -> linear; times stay in ms; every option is clamped to FFmpeg's
+ * accepted range. Reverb sits after the duck and before the pan (as in
  * the preview chain), on its own dry/wet split; `irBase` is the FFmpeg input
  * index of the first reverb IR.
  */
@@ -335,6 +390,7 @@ function buildFxGraph(clips: MuxClip[], labels: string[], sampleRate: number, ir
     if (fo > 0) {
       chain += `,afade=t=out:st=${Math.max(0, c.durationSec - fo).toFixed(3)}:d=${fo.toFixed(3)}`
     }
+    if (c.directTap) chain += `,${UNITY_UPMIX}`
     chain += `,adelay=${Math.round(c.startSec * 1000)}:all=1[c${i}]`
     G.push(chain)
   })
@@ -364,6 +420,10 @@ function buildFxGraph(clips: MuxClip[], labels: string[], sampleRate: number, ir
       idx.length === 1
         ? `${ins}volume=${dbToLinear(info.trackGainDb ?? 0).toFixed(4)}`
         : `${ins}amix=inputs=${idx.length}:normalize=0:duration=longest,volume=${dbToLinear(info.trackGainDb ?? 0).toFixed(4)}`
+    // A track with EQ/gate/comp/duck runs the preview's dynamics worklet,
+    // whose 2-channel explicit input up-mixes mono at unity: do the same, so
+    // the bus is stereo from here on (and the pan below uses the stereo law).
+    if (info.eq || info.gate || info.comp || info.duck) bus += `,${UNITY_UPMIX}`
     // EQ -> gate -> compressor (mirrors the preview worklet's signal flow). RBJ
     // shelving/peaking matches the worklet biquads; acompressor pairs with the
     // worklet's compressor (same knobs, perceptually matched).
@@ -414,50 +474,44 @@ function buildFxGraph(clips: MuxClip[], labels: string[], sampleRate: number, ir
     let term = consumers.has(k) ? `[main_${k}]` : `[bus_${k}]`
     const trigK = info.duck ? trackK.get(info.duck.triggerTrackId) : undefined
     if (info.duck && trigK !== undefined) {
-      G.push(`[key_${trigK}_${k}]aformat=channel_layouts=stereo,apad[kp_${trigK}_${k}]`)
-      G.push(`${term}aformat=channel_layouts=stereo[md_${k}]`)
+      // The key enters the preview worklet's 2-channel input too (unity
+      // up-mix); the ducked bus is already stereo (see step 2).
+      G.push(`[key_${trigK}_${k}]${UNITY_UPMIX},apad[kp_${trigK}_${k}]`)
       G.push(
-        `[md_${k}][kp_${trigK}_${k}]sidechaincompress=` +
+        `${term}[kp_${trigK}_${k}]sidechaincompress=` +
           `threshold=${threshold(info.duck.thresholdDb)}:ratio=${ratio(info.duck.ratio)}` +
           `:attack=${attackMs(info.duck.attackMs, 2000)}:release=${releaseMs(info.duck.releaseMs)}[dk_${k}]`
       )
       term = `[dk_${k}]`
     }
     const panned = !!info.pan && Math.abs(info.pan) > 0.001
-    const { left, right } = panGains(info.pan ?? 0)
-    const panFilter = `pan=stereo|c0=${left.toFixed(5)}*c0|c1=${right.toFixed(5)}*c1`
     const ir = irInput.get(tid)
     if (ir) {
       // Reverb: split -> dry (volume) + wet (afir with the shared IR, volume),
       // each panned like the preview's two StereoPanners, then summed.
-      // Both branches reach stereo through `pan` filters, which accept any
-      // input layout: an aformat on either branch would make FFmpeg convert the
-      // bus BEFORE the asplit (at swresample's -3 dB mono upmix) for both.
+      // Both branches only ever narrow to mono|stereo before their `pan`: an
+      // aformat=stereo on either would make FFmpeg convert the bus BEFORE the
+      // asplit (at swresample's -3 dB mono upmix) for both.
       //  • wet: unity upmix (mono FC -> both sides at full level, as a WebAudio
       //    ConvolverNode treats mono; stereo passes through), padded by the IR
       //    length so the tail rings out past the last clip, convolved with
       //    irnorm=-1:irgain=1 = no auto-gain (the IR is pre-normalized, see
       //    shared/reverb.ts), then WebAudio's exact stereo pan law.
-      //  • dry: exactly the no-reverb terminal (mono -> stereo at -3 dB, as
-      //    swresample does, then the same pan gains), so a 0% mix changes nothing.
+      //  • dry: exactly the no-reverb terminal (the panner's mono or stereo
+      //    law, centred when unpanned), so a 0% mix changes nothing.
       const { dry, wet } = reverbMixGains(ir.reverb.mix)
       const padSec = reverbIRLength(ir.reverb, sampleRate) / sampleRate
-      const dl = panned ? left : 1
-      const dr = panned ? right : 1
-      const up = Math.SQRT1_2
       G.push(`${term}asplit=2[rd_${k}][rw_${k}]`)
-      G.push(`[rw_${k}]pan=stereo|FL=FL+FC|FR=FR+FC,apad=pad_dur=${padSec.toFixed(3)}[rx_${k}]`)
+      G.push(`[rw_${k}]${UNITY_UPMIX},apad=pad_dur=${padSec.toFixed(3)}[rx_${k}]`)
       G.push(
         `[rx_${k}][${ir.input}:a]afir=irnorm=-1:irgain=1,volume=${wet.toFixed(6)}` +
           `${panned ? `,${stereoPanFilter(info.pan)}` : ''}[rwo_${k}]`
       )
-      G.push(
-        `[rd_${k}]volume=${dry.toFixed(6)},pan=stereo` +
-          `|FL=${dl.toFixed(5)}*FL+${(dl * up).toFixed(5)}*FC|FR=${dr.toFixed(5)}*FR+${(dr * up).toFixed(5)}*FC[rdo_${k}]`
-      )
+      G.push(`[rd_${k}]volume=${dry.toFixed(6)},${panFilter(panned ? info.pan : 0)}[rdo_${k}]`)
       G.push(`[rdo_${k}][rwo_${k}]amix=inputs=2:normalize=0:duration=longest[t_${k}]`)
     } else if (panned) {
-      G.push(`${term}aformat=channel_layouts=stereo,${panFilter}[t_${k}]`)
+      // The preview panner's exact law for the bus's channel count.
+      G.push(`${term}${panFilter(info.pan)}[t_${k}]`)
     } else {
       G.push(`${term}anull[t_${k}]`)
     }

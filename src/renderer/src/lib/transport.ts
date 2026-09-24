@@ -6,8 +6,9 @@
 // A shuttle rate is SIGNED: +1 is normal playback, +2/+4 fast-forward, -1/-2/-4
 // reverse. Only +1 is "real" playback (decoders rolling, audio audible); every
 // other rate drives the preview down the paused/scrub path (seeked frames, see
-// stepShuttleHold) with audio silent — reverse decode is too expensive to do
-// properly, and pitch-following fast audio isn't worth it.
+// stepShuttleHold) with audio as short scrub grains (lib/scrub, when the Audio
+// scrubbing setting is on) — reverse decode is too expensive to do properly,
+// and pitch-following fast audio isn't worth it.
 // ---------------------------------------------------------------------------
 
 import type { Project } from '../types'

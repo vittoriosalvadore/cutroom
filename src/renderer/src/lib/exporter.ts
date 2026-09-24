@@ -75,7 +75,8 @@ function buildAudioPlan(project: Project): AudioClipPlanEntry[] {
     // (readied by the export preflight below) when enabled, falling back to
     // the original on any glitch — export must never hard-fail over denoise.
     const denoised = clip.denoiseEnabled ? getDenoiseEntry(media.id) : undefined
-    const path = denoised?.status === 'ready' && denoised.tempPath ? denoised.tempPath : media.path
+    const denoisedPath = denoised?.status === 'ready' ? denoised.tempPath : undefined
+    const path = denoisedPath || media.path
     plan.push({
       path,
       startSec: clip.startSec,
@@ -93,7 +94,11 @@ function buildAudioPlan(project: Project): AudioClipPlanEntry[] {
       duck,
       eq,
       comp,
-      reverb
+      reverb,
+      // A (non-denoised) video-track clip plays through its <video> element
+      // tap straight into the preview master — no track panner — where
+      // WebAudio up-mixes mono at unity (see audioPool resolvePreviewBuffer).
+      ...(track.kind !== 'audio' && !denoisedPath ? { directTap: true } : {})
     })
   }
   return plan

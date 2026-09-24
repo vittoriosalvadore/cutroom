@@ -116,6 +116,9 @@ export interface AudioClipPlanEntry {
   comp?: AudioPlanComp
   /** Present only when the track's reverb is enabled (mix > 0). */
   reverb?: AudioPlanReverb
+  /** True when the preview plays this clip via its <video> element tap (no
+   *  track panner): the export then up-mixes a mono source at unity too. */
+  directTap?: boolean
 }
 
 /** Inputs for the export audio-mux pass. */

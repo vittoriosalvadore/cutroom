@@ -8,6 +8,7 @@ import { setMeterAnalyser } from './audioMeter'
 import { resolveDuck, resolveReverb } from '../state/selectors'
 import { generateReverbIR, reverbMixGains, reverbShapeKey, type ReverbShape } from '../../../shared/reverb'
 import type { VideoPool } from './videoPool'
+import { grainEnvelope, grainSpan, reverseInto, scrubTargets, shouldGrain, type ScrubThrottle } from './scrub'
 
 /**
  * Which AudioBuffer (if any) should back a clip's preview playback this
@@ -114,6 +115,8 @@ const DRIFT_TOLERANCE = 0.05
 const REVERB_SETTLE_MS = 250
 /** Let the wet gain fade out before the convolver is unhooked (saves CPU). */
 const REVERB_UNHOOK_MS = 200
+/** Safety cap on scrub grains in flight (they normally number 1–2 per clip). */
+const MAX_GRAINS = 24
 
 /**
  * Build the ConvolverNode buffer for a reverb shape: the SAME samples the export
@@ -171,6 +174,9 @@ export class AudioPool {
   /** Keyed by clip id, like the video pool: overlapping clips of one file each
    *  get their own element and gain. */
   private videoAudio = new Map<string, VideoAudio>()
+  /** Scrub grains in flight: short one-shots that disconnect themselves on end. */
+  private grains = new Map<AudioBufferSourceNode, GainNode>()
+  private scrubThrottle: ScrubThrottle | null = null
 
   constructor() {
     this.ctx = getAudioContext()
@@ -624,7 +630,90 @@ export class AudioPool {
     }
   }
 
+  /**
+   * Audio scrubbing (see lib/scrub): play one short windowed grain of every
+   * buffer-backed clip under timeline time `timeSec`, through its track chain
+   * (so mute / gain / pan / FX / reverb all apply). `direction` -1 plays the
+   * audio just before the playhead, reversed. Throttled internally, so it is
+   * safe to call on every playhead change while scrubbing or shuttling.
+   * Returns the number of grains started (0 when throttled or nothing to play).
+   */
+  scrub(project: Project, timeSec: number, direction: 1 | -1): number {
+    const nowMs = performance.now()
+    if (!shouldGrain(this.scrubThrottle, nowMs, timeSec)) return 0
+    this.scrubThrottle = { lastMs: nowMs, lastTime: timeSec }
+    if (this.grains.size >= MAX_GRAINS) return 0
+    const targets = scrubTargets(project, timeSec, (clip, track) =>
+      resolvePreviewBuffer(
+        clip,
+        track,
+        clip.mediaId ? getAudioEntry(clip.mediaId) : undefined,
+        clip.mediaId ? getDenoiseEntry(clip.mediaId) : undefined
+      )
+    )
+    if (targets.length === 0) return 0
+    resumeAudioContext()
+    const ctx = this.ctx
+    const t0 = ctx.currentTime
+    let started = 0
+    for (const { clip, track, buffer, srcOffset, gain } of targets) {
+      const span = grainSpan(srcOffset, clip, direction, buffer.duration)
+      if (!span) continue
+      const speed = clip.speed && clip.speed > 0 ? clip.speed : 1
+      const source = ctx.createBufferSource()
+      if (direction < 0) {
+        // A fresh little buffer holding the span backwards (~3.4k frames/ch).
+        const s0 = Math.floor(span.start * buffer.sampleRate)
+        const n = Math.max(1, Math.min(buffer.length - s0, Math.round(span.dur * buffer.sampleRate)))
+        const rev = ctx.createBuffer(buffer.numberOfChannels, n, buffer.sampleRate)
+        for (let c = 0; c < buffer.numberOfChannels; c++) {
+          reverseInto(buffer.getChannelData(c), s0, n, rev.getChannelData(c))
+        }
+        source.buffer = rev
+      } else {
+        source.buffer = buffer
+      }
+      source.playbackRate.value = speed // same pitch as 1× playback
+      const g = ctx.createGain()
+      const wallDur = span.dur / speed
+      g.gain.cancelScheduledValues(t0)
+      for (const op of grainEnvelope(gain, wallDur)) {
+        if (op.kind === 'set') g.gain.setValueAtTime(op.value, t0 + op.atOffset)
+        else g.gain.linearRampToValueAtTime(op.value, t0 + op.atOffset)
+      }
+      source.connect(g)
+      g.connect(this.trackInput(track, project))
+      if (direction < 0) source.start(t0, 0, span.dur)
+      else source.start(t0, span.start, span.dur)
+      source.onended = (): void => {
+        try {
+          source.disconnect()
+          g.disconnect()
+        } catch {
+          /* already gone */
+        }
+        this.grains.delete(source)
+      }
+      this.grains.set(source, g)
+      started += 1
+    }
+    // A ducked track's sidechain may never have been wired if nothing has played yet.
+    if (started) this.syncDuckEdges(project)
+    return started
+  }
+
   dispose(): void {
+    for (const [source, g] of this.grains) {
+      try {
+        source.onended = null
+        source.stop()
+        source.disconnect()
+        g.disconnect()
+      } catch {
+        /* already gone */
+      }
+    }
+    this.grains.clear()
     for (const id of [...this.live.keys()]) this.stopClip(id)
     for (const [id, v] of [...this.videoAudio.entries()]) this.dropVideoAudio(id, v)
     this.duckEdges.clear()
