@@ -11,6 +11,7 @@ import { useT } from '../lib/i18n'
 import { ScopeSampler } from '../lib/scopeSampler'
 import { SCOPE_INTERVAL_MS, shouldSample } from '../lib/scopes'
 import Scopes, { type ScopesHandle } from './Scopes'
+import { proxyCacheVersion, proxyPreviewPath, subscribeProxyCache } from '../lib/proxyCache'
 import type { Project } from '../types'
 
 /**
@@ -71,6 +72,11 @@ export default function Preview() {
   const audioScrub = useSettings((s) => s.audioScrub)
   const lastScrubTime = useRef(playhead)
   const showScopes = useSettings((s) => s.showScopes)
+  const useProxies = useSettings((s) => s.useProxies)
+  // Bumps when a proxy becomes ready / is cleared, so a paused preview swaps
+  // decoders without waiting for the next edit or playhead move.
+  const [proxyVersion, setProxyVersion] = useState(proxyCacheVersion)
+  useEffect(() => subscribeProxyCache(() => setProxyVersion(proxyCacheVersion())), [])
   const t = useT()
 
   // --- scopes -------------------------------------------------------------
@@ -129,11 +135,17 @@ export default function Preview() {
     if (!canvas) return
     let comp: Compositor
     try {
-      comp = new Compositor(canvas, () => {
-        hold.current.landed = true // a decoded frame / finished seek arrived
-        const l = latest.current
-        safeFrame(compRef.current, audioRef.current, l.project, l.playhead, l.isPlaying, tap)
-      })
+      comp = new Compositor(
+        canvas,
+        () => {
+          hold.current.landed = true // a decoded frame / finished seek arrived
+          const l = latest.current
+          safeFrame(compRef.current, audioRef.current, l.project, l.playhead, l.isPlaying, tap)
+        },
+        // Preview only: decode a media's proxy when one is ready and the toggle
+        // is on. The export compositor gets no resolver (originals only).
+        { resolvePreviewPath: (m) => proxyPreviewPath(m, useSettings.getState().useProxies) }
+      )
     } catch (e) {
       setError(e instanceof Error ? e.message : 'WebGL initialization failed')
       return
@@ -214,7 +226,7 @@ export default function Preview() {
       hold.current = { time: playhead, at: 0, landed: true }
     }
     safeFrame(compRef.current, audioRef.current, project, time, isPlaying, tap)
-  }, [project, playhead, isPlaying, shuttling, showPlaceholders, previewQuality])
+  }, [project, playhead, isPlaying, shuttling, showPlaceholders, previewQuality, useProxies, proxyVersion])
 
   // Audio scrubbing: while the ruler playhead is dragged or the shuttle runs
   // off 1×, each playhead move offers a short grain at the LIVE playhead (not

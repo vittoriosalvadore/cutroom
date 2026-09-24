@@ -7,6 +7,8 @@ import { serializeProject } from './lib/projectFile'
 import { timelineDuration } from './lib/exporter'
 import { createNewProject, openProject, saveProject } from './lib/projectIO'
 import { useT } from './lib/i18n'
+import { ensureProxy, getProxyEntry, lookupProxies } from './lib/proxyCache'
+import { shouldAutoProxy } from './lib/proxy'
 import { advancePlayhead, nextShuttleRate, playStartSec, SLIDER_KEYS, stepFrames } from './lib/transport'
 import MediaBin from './components/MediaBin'
 import Preview from './components/Preview'
@@ -119,6 +121,30 @@ function useAudioProbe(): void {
       }
     }
   }, [media])
+}
+
+/**
+ * Proxy state is derived at runtime, never saved: every video in the project
+ * asks main once whether a proxy already exists in the userData cache (from an
+ * earlier session). With the auto option on, probed video larger than 1080p
+ * gets one queued — once per path per session, so cancelling or clearing the
+ * cache doesn't immediately re-queue it.
+ */
+function useProxyLookup(): void {
+  const media = useEditor((s) => s.project.media)
+  const autoProxy = useSettings((s) => s.autoProxy)
+  const autoQueued = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    const videos = Object.values(media).filter((m) => m.kind === 'video' && m.path)
+    void lookupProxies(videos.map((m) => m.path)).then(() => {
+      if (!autoProxy) return
+      for (const m of videos) {
+        if (!shouldAutoProxy(m) || autoQueued.current.has(m.path) || getProxyEntry(m.path)) continue
+        autoQueued.current.add(m.path)
+        void ensureProxy(m.path, m.durationSec)
+      }
+    })
+  }, [media, autoProxy])
 }
 
 /** Debounced autosave to the crash-recovery file whenever the project changes. */
@@ -357,6 +383,7 @@ export default function App() {
   useShortcuts()
   useMediaProbe()
   useAudioProbe()
+  useProxyLookup()
   useAutosave()
   useDocumentTitle()
   useLastResortCrashNet()

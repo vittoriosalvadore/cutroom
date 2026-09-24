@@ -38,6 +38,11 @@ export interface Settings {
   previewQuality: PreviewQuality
   /** Show the histogram / waveform / vectorscope panel under the preview. */
   showScopes: boolean
+  /** Decode a media item's proxy in the preview when one is ready (export
+   *  always reads the original). */
+  useProxies: boolean
+  /** Create a proxy automatically for video larger than 1080p on import. */
+  autoProxy: boolean
   // --- editing ---
   /** Snap clip edges to other clips and the playhead while dragging. */
   snapping: boolean
@@ -75,6 +80,8 @@ export const DEFAULT_SETTINGS: Settings = {
   showPlaceholders: true,
   previewQuality: 'full',
   showScopes: false,
+  useProxies: true,
+  autoProxy: false,
   snapping: true,
   defaultFadeSec: 0.5,
   showWaveforms: true,
@@ -120,6 +127,8 @@ export function sanitize(raw: unknown): Partial<Settings> {
   bool('audioScrub')
   bool('showScopes')
   bool('reduceMotion')
+  bool('useProxies')
+  bool('autoProxy')
   const fade = clampNum(o.defaultFadeSec, 0.1, 2)
   if (fade !== undefined) out.defaultFadeSec = fade
   const crf = clampNum(o.exportCrf, 14, 28)
@@ -155,6 +164,8 @@ function pick(s: Settings): Settings {
     showPlaceholders: s.showPlaceholders,
     previewQuality: s.previewQuality,
     showScopes: s.showScopes,
+    useProxies: s.useProxies,
+    autoProxy: s.autoProxy,
     snapping: s.snapping,
     defaultFadeSec: s.defaultFadeSec,
     showWaveforms: s.showWaveforms,

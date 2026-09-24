@@ -47,7 +47,7 @@ candidate features. Ordered roughly by how much they came up. Update as we go.
 
 ## Candidate features (Vegas-style, not yet built — rough priority)
 
-1. **Proxy / optimized media** for heavy footage.
+All previously listed candidates have shipped (see Done). Add new ideas here.
 
 ## Done
 
@@ -124,3 +124,7 @@ candidate features. Ordered roughly by how much they came up. Update as we go.
   LUT sampled after the primary grade; identity skips it, byte-identical; shared by preview + export;
   saved/validated in project files), Inspector → Curves. Toggleable Scopes panel under the preview
   (RGB/luma histogram, luma waveform, BT.709 vectorscope) from a throttled 8 Hz 256-px readback.
+- **Proxy / optimized media** — Media Bin → Create proxy (or Options → auto for video > 1080p): FFmpeg in
+  main makes a 720p short-GOP H.264 copy in `userData/proxies/<hash(path,size,mtime)>.mp4` (queued one at a
+  time, progress %, rotation baked, duration-checked); the preview decodes it when "Use proxies" is on,
+  export always reads the original. Never saved in projects; Options shows/clears the cache.

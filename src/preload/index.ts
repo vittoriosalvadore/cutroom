@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer, webUtils } from 'electron'
+import { contextBridge, ipcRenderer, webUtils, type IpcRendererEvent } from 'electron'
 import type { EncoderChoice, ExportFormat, ExportResolution, QualityMode } from '../shared/exportOptions'
 
 /** Settings for a video export. Main re-validates every field. */
@@ -41,6 +41,23 @@ export interface DenoiseResult {
   /** Path to the denoised temp WAV, present only when ok. */
   tempPath?: string
   error?: string
+}
+
+/** Result of a proxy (optimized preview media) job. */
+export interface ProxyResult {
+  ok: boolean
+  /** The proxy file in the userData cache, present only when ok. */
+  proxyPath?: string
+  cancelled?: boolean
+  error?: string
+}
+
+/** Live status of a queued/running proxy job (pushed from main). */
+export interface ProxyProgress {
+  sourcePath: string
+  state: 'queued' | 'running'
+  /** 0..1 */
+  progress: number
 }
 
 // NOTE: these gate/duck shapes are hand-duplicated from renderer types.ts
@@ -200,6 +217,27 @@ const api = {
   // --- AI noise removal ---
   /** Run FFmpeg's arnndn filter on a source file; resolves a temp WAV path. */
   denoiseStart: (sourcePath: string): Promise<DenoiseResult> => ipcRenderer.invoke('denoise:start', sourcePath),
+
+  // --- proxies (optimized preview media) ---
+  /** Finished proxies for these sources (null = none). Never creates one. */
+  proxyLookup: (paths: string[]): Promise<Record<string, string | null>> => ipcRenderer.invoke('proxy:lookup', paths),
+  /** Queue a proxy transcode (one runs at a time); resolves when it finishes. */
+  proxyCreate: (sourcePath: string, durationSec: number): Promise<ProxyResult> =>
+    ipcRenderer.invoke('proxy:create', sourcePath, durationSec),
+  /** Cancel a queued/running proxy job (its partial file is deleted). */
+  proxyCancel: (sourcePath: string): Promise<boolean> => ipcRenderer.invoke('proxy:cancel', sourcePath),
+  /** Size of the proxy cache on disk. */
+  proxyCacheInfo: (): Promise<{ bytes: number; files: number }> => ipcRenderer.invoke('proxy:cacheInfo'),
+  /** Cancel every job and delete every cached proxy. `failed` = files still in use. */
+  proxyClearCache: (): Promise<{ ok: boolean; failed: number }> => ipcRenderer.invoke('proxy:clearCache'),
+  /** Subscribe to proxy job progress. Returns an unsubscribe function. */
+  onProxyProgress: (cb: (p: ProxyProgress) => void): (() => void) => {
+    const listener = (_e: IpcRendererEvent, p: ProxyProgress): void => cb(p)
+    ipcRenderer.on('proxy:progress', listener)
+    return () => {
+      ipcRenderer.removeListener('proxy:progress', listener)
+    }
+  },
 
   // --- project save / load + recovery ---
   /** Save project JSON to `filePath`, or prompt when null. */

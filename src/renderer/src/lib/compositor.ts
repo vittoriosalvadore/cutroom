@@ -7,6 +7,7 @@ import { roundRectPath } from './canvas'
 import { buildCurvesLut, isIdentityLut, LUT_SIZE } from './curves'
 import { RestoreMachine } from './webglRestore'
 import { scaledCanvasSize } from './previewScale'
+import { frameLayoutSize } from './proxy'
 import type { FrameSource } from './videoSource'
 
 // ---------------------------------------------------------------------------
@@ -265,6 +266,12 @@ export class Compositor {
    *  inside render() must not start a nested render (layers drawn twice). */
   private rendering = false
   private renderRequested = false
+  /** Preview-only path substitution (proxies). Absent on the export
+   *  compositor, so export decodes the originals. */
+  private resolvePreviewPath: ((media: MediaItem) => string) | null
+  /** True while renderExact() draws: always the original media, even on a
+   *  compositor that has a preview resolver (belt and braces for export). */
+  private exactPass = false
 
   // render()/renderExact() re-group clips by trackId on every call (every
   // animation frame during playback). project.clips is replaced wholesale on
@@ -368,7 +375,7 @@ export class Compositor {
   constructor(
     canvas: HTMLCanvasElement,
     needsRender: () => void,
-    opts: { preserveDrawingBuffer?: boolean } = {}
+    opts: { preserveDrawingBuffer?: boolean; resolvePreviewPath?: (media: MediaItem) => string } = {}
   ) {
     const gl = canvas.getContext('webgl', {
       alpha: false,
@@ -380,6 +387,7 @@ export class Compositor {
     if (!gl) throw new Error('WebGL is not available in this renderer')
     this.gl = gl
     this.needsRender = needsRender
+    this.resolvePreviewPath = opts.resolvePreviewPath ?? null
     // An idle-evicted video's texture goes with it.
     this.videos = new VideoPool(needsRender, (clipId) => {
       const tex = this.videoTextures.get(clipId)
@@ -603,6 +611,16 @@ export class Compositor {
     return tex
   }
 
+  /** The file to decode for a video media: the original on export
+   *  (renderExact, or a compositor without a resolver), else whatever the
+   *  preview resolver picks (its ready proxy, when proxies are on). The pool
+   *  keys entries by clip AND path, so a proxy becoming ready (or the toggle
+   *  flipping) swaps decoders on the next frame. */
+  private videoPath(media: MediaItem): string {
+    if (this.exactPass || !this.resolvePreviewPath) return media.path
+    return this.resolvePreviewPath(media) || media.path
+  }
+
   private drawClip(project: Project, clip: Clip, playheadSec: number): void {
     const effects = clip.effects ?? defaultEffects()
     // Sample transform + opacity once at clip-relative time; the SAME values feed
@@ -624,10 +642,13 @@ export class Compositor {
     if (media && media.kind === 'video' && media.path) {
       const speed = clip.speed ?? 1
       const srcTime = clip.inSec + (playheadSec - clip.startSec) * speed
-      const frame = this.videos.want(clip.id, media.path, srcTime, this.playing, speed)
+      const path = this.videoPath(media)
+      const frame = this.videos.want(clip.id, path, srcTime, this.playing, speed)
       if (frame && frame.width > 0 && frame.height > 0) {
         const tex = this.uploadVideoFrame(clip.id, frame.source)
-        this.drawQuad(containRect(frame.width, frame.height, this.LW, this.LH), tex, null, effects, tf, opacity)
+        // A proxy is laid out by the original's size (same geometry either way).
+        const size = frameLayoutSize(media, frame, path !== media.path)
+        this.drawQuad(containRect(size.width, size.height, this.LW, this.LH), tex, null, effects, tf, opacity)
         return
       }
       if (this.hidePlaceholders) return
@@ -745,7 +766,7 @@ export class Compositor {
     if (!media || media.kind !== 'video' || !media.path) return
     const speed = clip.speed ?? 1
     const srcTime = clip.inSec + (playheadSec - clip.startSec) * speed
-    this.videos.wantAudio(clip.id, media.path, srcTime, this.playing, speed)
+    this.videos.wantAudio(clip.id, this.videoPath(media), srcTime, this.playing, speed)
   }
 
   /** Ensure every image used by the project is decoded. For export preflight. */
@@ -767,6 +788,8 @@ export class Compositor {
    * Deterministic render for export: seek every active video to its exact source
    * time and WAIT for the frame before compositing, so each output frame is the
    * right one. Placeholders are suppressed so empty lanes export as transparent.
+   * Always decodes the ORIGINAL media (MediaItem.path), never a proxy: the
+   * seeks below and the draw (exactPass) both bypass the preview resolver.
    */
   async renderExact(project: Project, t: number): Promise<void> {
     const seeks: Promise<void>[] = []
@@ -785,7 +808,12 @@ export class Compositor {
       }
     }
     await Promise.all(seeks)
-    this.render(project, t, false, { hidePlaceholders: true })
+    this.exactPass = true
+    try {
+      this.render(project, t, false, { hidePlaceholders: true })
+    } finally {
+      this.exactPass = false
+    }
   }
 
   /** The video pool, so the audio engine can tap video-element audio. */

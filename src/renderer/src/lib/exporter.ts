@@ -190,6 +190,9 @@ export async function exportTimeline(
   canvas.width = project.width
   canvas.height = project.height
 
+  // Export ALWAYS decodes the original full-quality media: this compositor is
+  // built without the preview's proxy resolver (and renderExact bypasses it
+  // regardless), and the audio plan below reads MediaItem.path too.
   let comp: Compositor
   try {
     comp = new Compositor(canvas, () => undefined, { preserveDrawingBuffer: true })

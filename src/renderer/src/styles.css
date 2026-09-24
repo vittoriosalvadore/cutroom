@@ -572,6 +572,84 @@ input[type='color']:hover {
   font-family: var(--font-mono);
 }
 
+/* proxy (optimized preview media) status in a bin item */
+.bin-item .meta {
+  flex: 1;
+}
+.proxy-actions,
+.proxy-progress {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin-top: 3px;
+  min-width: 0;
+}
+.proxy-create {
+  padding: 1px 6px;
+  font-size: var(--fs-11);
+}
+.proxy-badge {
+  display: inline-block;
+  margin-top: 3px;
+  padding: 0 6px;
+  border-radius: var(--r-sm);
+  font-size: var(--fs-11);
+  line-height: 16px;
+  white-space: nowrap;
+}
+.proxy-actions .proxy-badge {
+  margin-top: 0;
+}
+.proxy-badge.ready {
+  color: var(--success);
+  background: var(--success-soft);
+}
+.proxy-badge.off {
+  color: var(--muted);
+  background: var(--panel-3);
+}
+.proxy-badge.error {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+.proxy-bar {
+  flex: 1;
+  min-width: 36px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--panel-3);
+  overflow: hidden;
+}
+.proxy-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width var(--t-fast);
+}
+.proxy-pct {
+  font-size: var(--fs-11);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+.proxy-x {
+  border: 0;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: var(--fs-11);
+  padding: 0 2px;
+}
+.proxy-x:hover {
+  color: var(--text);
+}
+.set-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  flex: none;
+}
+
 /* ---- preview monitor ---- */
 .preview {
   display: grid;

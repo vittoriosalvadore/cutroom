@@ -1,7 +1,9 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useEditor } from '../state/store'
 import { useSettings } from '../state/settings'
 import { LANGUAGES, useT } from '../lib/i18n'
+import { clearProxyCache } from '../lib/proxyCache'
+import { formatBytes } from '../lib/proxy'
 
 // Reusable rows -------------------------------------------------------------
 
@@ -82,6 +84,49 @@ function RangeRow(props: {
   )
 }
 
+/** Proxy cache size readout + Clear button (Performance tab). */
+function ProxyCacheRow() {
+  const t = useT()
+  const [info, setInfo] = useState<{ bytes: number; files: number } | null>(null)
+  const [busy, setBusy] = useState(false)
+  const refresh = (): void => {
+    void window.cutroom
+      .proxyCacheInfo()
+      .then(setInfo)
+      .catch(() => setInfo(null))
+  }
+  useEffect(refresh, [])
+  return (
+    <div className="set-row">
+      <div className="set-text">
+        <div className="set-label">
+          {t('Proxy cache')}
+          <em>{info ? formatBytes(info.bytes) : '…'}</em>
+        </div>
+        <div className="set-desc">
+          {t('Proxies are kept in the app data folder and reused across sessions. {n} files.', { n: info?.files ?? 0 })}
+        </div>
+      </div>
+      <div className="set-actions">
+        <button
+          className="btn small"
+          disabled={busy || !info || info.bytes === 0}
+          onClick={async () => {
+            if (!confirm(t('Delete all cached proxies? They can be created again at any time.'))) return
+            setBusy(true)
+            const r = await clearProxyCache()
+            setBusy(false)
+            refresh()
+            if (r.failed !== 0) alert(t('Some proxy files are in use and could not be deleted.'))
+          }}
+        >
+          {t('Clear proxy cache')}
+        </button>
+      </div>
+    </div>
+  )
+}
+
 const ACCENTS = ['#4c8dff', '#4fd6c0', '#8b7bff', '#ff6b8a', '#f4a93c', '#46c98a']
 const TABS = ['Performance', 'Editing', 'Export', 'Appearance'] as const
 type Tab = (typeof TABS)[number]
@@ -135,6 +180,19 @@ export default function SettingsModal() {
                   ]}
                   onChange={(v) => s.set({ previewQuality: v })}
                 />
+                <Toggle
+                  label={t('Use proxies for preview')}
+                  desc={t('Decode lightweight proxy copies in the preview when they exist. Export always uses the original media.')}
+                  checked={s.useProxies}
+                  onChange={(v) => s.set({ useProxies: v })}
+                />
+                <Toggle
+                  label={t('Create proxies automatically for video larger than 1080p')}
+                  desc={t('Transcodes in the background, one file at a time, when such video is imported.')}
+                  checked={s.autoProxy}
+                  onChange={(v) => s.set({ autoProxy: v })}
+                />
+                <ProxyCacheRow />
               </>
             )}
 

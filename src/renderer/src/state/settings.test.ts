@@ -90,6 +90,13 @@ describe('settings sanitize', () => {
     expect(sanitize({ exportBitrateMbps: 9999 }).exportBitrateMbps).toBe(200)
   })
 
+  it('proxy options: preview proxies on, auto-create off by default; booleans only', () => {
+    expect(DEFAULT_SETTINGS.useProxies).toBe(true)
+    expect(DEFAULT_SETTINGS.autoProxy).toBe(false)
+    expect(sanitize({ useProxies: false, autoProxy: true })).toEqual({ useProxies: false, autoProxy: true })
+    expect(sanitize({ useProxies: 'yes', autoProxy: 1 })).toEqual({})
+  })
+
   it('every default value survives a round-trip through sanitize', () => {
     expect(sanitize(DEFAULT_SETTINGS)).toEqual(DEFAULT_SETTINGS)
   })

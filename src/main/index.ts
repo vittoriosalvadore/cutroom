@@ -6,6 +6,7 @@ import { Readable } from 'stream'
 import { registerExportIpc } from './export'
 import { registerAudioMuxIpc } from './audioMux'
 import { registerDenoiseIpc } from './denoise'
+import { registerProxyIpc, sweepStaleProxyPartials } from './proxy'
 import { clearSessionLock, flagRecoveryPending, initProjectStore, registerProjectIpc } from './projectStore'
 import { readSettingsSync, registerSettingsIpc } from './settings'
 import { shouldFlagRecovery } from './crashFlags'
@@ -238,6 +239,8 @@ function registerIpc(): void {
   registerExportIpc()
   registerAudioMuxIpc()
   registerDenoiseIpc()
+  // Preview proxies (optimized media) in userData/proxies.
+  registerProxyIpc()
 
   // Project save/load + crash recovery.
   registerProjectIpc()
@@ -281,6 +284,7 @@ app.on('second-instance', () => {
 app.whenReady().then(() => {
   initProjectStore() // detect a prior crash + mark this session active
   sweepStaleTemps() // temp media left behind by a crashed/killed session
+  sweepStaleProxyPartials() // half-written proxies from a crashed/killed session
   registerIpc()
   createWindow()
 
@@ -294,7 +298,8 @@ app.whenReady().then(() => {
 // won't offer recovery. A crash/kill skips this, leaving the lock as the signal.
 app.on('will-quit', () => {
   clearSessionLock()
-  // Kill any encoder/mux/denoise still running and remove their temp files.
+  // Kill any encoder/mux/denoise/proxy job still running and remove their temp
+  // (and partial proxy) files.
   shutdownFfmpeg()
 })
 
