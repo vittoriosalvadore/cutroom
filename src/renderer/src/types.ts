@@ -318,7 +318,21 @@ export interface Effects {
   chroma: ChromaKey
   /** Primary colour correction. Omitted / neutral = no grade. */
   color?: ColorCorrection
+  /** RGB curves, applied after the primary grade. Omitted / identity = no curves. */
+  curves?: ColorCurves
 }
+
+/** One curve control point; input level x -> output level y, both 0..1. */
+export interface CurvePoint {
+  x: number
+  y: number
+}
+
+/** 'master' is applied to R, G and B alike, before the per-channel curves. */
+export type CurveChannel = 'master' | 'r' | 'g' | 'b'
+
+/** Per-clip RGB curves: sorted control points per channel (see lib/curves.ts). */
+export type ColorCurves = Record<CurveChannel, CurvePoint[]>
 
 export function defaultChroma(): ChromaKey {
   return { enabled: false, color: '#00d000', similarity: 0.4, smoothness: 0.1, spill: 0.25 }

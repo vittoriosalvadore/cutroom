@@ -666,3 +666,55 @@ describe('shuttle transport', () => {
     expect(useEditor.getState().shuttleRate).toBe(1)
   })
 })
+
+describe('RGB curves', () => {
+  const S = [
+    { x: 0, y: 0 },
+    { x: 0.25, y: 0.15 },
+    { x: 0.75, y: 0.85 },
+    { x: 1, y: 1 }
+  ]
+  const DIAG = [
+    { x: 0, y: 0 },
+    { x: 1, y: 1 }
+  ]
+
+  it('setCurvePoints stores one channel and leaves the others at identity', () => {
+    useEditor.getState().setCurvePoints('c1', 'master', S)
+    const curves = useEditor.getState().project.clips.c1.effects?.curves
+    expect(curves?.master).toEqual(S)
+    expect(curves?.r).toEqual(DIAG)
+  })
+
+  it('keeps points that merely render as identity (mid-drag), drops exact defaults', () => {
+    const onDiag = [{ x: 0, y: 0 }, { x: 0.5, y: 0.5 }, { x: 1, y: 1 }]
+    useEditor.getState().setCurvePoints('c1', 'g', onDiag)
+    expect(useEditor.getState().project.clips.c1.effects?.curves?.g).toEqual(onDiag)
+    useEditor.getState().setCurvePoints('c1', 'g', DIAG)
+    expect(useEditor.getState().project.clips.c1.effects?.curves).toBeUndefined()
+  })
+
+  it('a drag gesture (snapshot + many moves) is one undo step', () => {
+    const st = useEditor.getState()
+    st.snapshot()
+    for (let i = 1; i <= 5; i++) st.setCurvePoints('c1', 'r', [{ x: 0, y: 0 }, { x: 0.5, y: 0.5 + i * 0.05 }, { x: 1, y: 1 }])
+    expect(useEditor.getState().past).toHaveLength(1)
+    useEditor.getState().undo()
+    expect(useEditor.getState().project.clips.c1.effects?.curves).toBeUndefined()
+  })
+
+  it('resetCurves resets one channel or all', () => {
+    const st = useEditor.getState()
+    st.setCurvePoints('c1', 'master', S)
+    st.setCurvePoints('c1', 'b', S)
+    st.resetCurves('c1', 'b')
+    const curves = useEditor.getState().project.clips.c1.effects?.curves
+    expect(curves?.b).toEqual(DIAG)
+    expect(curves?.master).toEqual(S)
+    useEditor.getState().resetCurves('c1', 'master')
+    expect(useEditor.getState().project.clips.c1.effects?.curves).toBeUndefined()
+    st.setCurvePoints('c1', 'r', S)
+    useEditor.getState().resetCurves('c1')
+    expect(useEditor.getState().project.clips.c1.effects?.curves).toBeUndefined()
+  })
+})

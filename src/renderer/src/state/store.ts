@@ -7,6 +7,8 @@ import type {
   Effects,
   ChromaKey,
   ColorCorrection,
+  CurveChannel,
+  CurvePoint,
   MediaItem,
   MediaKind,
   Project,
@@ -43,6 +45,7 @@ import {
   splitClipAt
 } from '../lib/editing'
 import { clampFades } from '../lib/fades'
+import { CURVE_CHANNELS, identityCurves, identityPoints, isDefaultChannel } from '../lib/curves'
 import { canRemoveTrack, clampTrackHeight, moveTrackTo, newVideoTrackIndex, nextTrackName } from '../lib/tracks'
 import { clampProp, keyIndexAt, KEY_EPS, rebaseTracks, sortKeys, splitTracksAt, withTransformProp } from '../lib/keyframes'
 import { useSettings } from './settings'
@@ -235,6 +238,10 @@ interface EditorState {
   updateChroma: (clipId: string, patch: Partial<ChromaKey>) => void
   updateColor: (clipId: string, patch: Partial<ColorCorrection>) => void
   resetColor: (clipId: string) => void
+  /** Replace one curve channel's points (already sorted; the widget keeps them so). */
+  setCurvePoints: (clipId: string, channel: CurveChannel, points: CurvePoint[]) => void
+  /** Reset one curve channel, or all of them when `channel` is omitted. */
+  resetCurves: (clipId: string, channel?: CurveChannel) => void
 
   // --- subtitles ---
   /** Add cues to the subtitle lane. One recorded undo step by default; pass
@@ -1040,6 +1047,30 @@ export const useEditor = create<EditorState>((set) => {
       const c = s.project.clips[clipId]
       if (!c?.effects) return {}
       const effects: Effects = { ...c.effects, color: undefined }
+      return { project: patchClip(s.project, clipId, { effects }) }
+    }),
+
+  setCurvePoints: (clipId, channel, points) =>
+    set((s) => {
+      const c = s.project.clips[clipId]
+      if (!c) return {}
+      const base = c.effects ?? defaultEffects()
+      const curves = { ...(base.curves ?? identityCurves()), [channel]: points }
+      // Only the exact default diagonal on every channel drops the field. A curve
+      // that merely *renders* as identity (points dragged onto the diagonal)
+      // keeps its points so an in-progress drag doesn't lose its handle; the
+      // compositor still skips the LUT for it.
+      const effects: Effects = { ...base, curves: CURVE_CHANNELS.every((ch) => isDefaultChannel(curves[ch])) ? undefined : curves }
+      return { project: patchClip(s.project, clipId, { effects }) }
+    }),
+
+  resetCurves: (clipId, channel) =>
+    set((s) => {
+      const c = s.project.clips[clipId]
+      if (!c?.effects?.curves) return {}
+      const curves = channel ? { ...c.effects.curves, [channel]: identityPoints() } : undefined
+      const keep = curves && !CURVE_CHANNELS.every((ch) => isDefaultChannel(curves[ch]))
+      const effects: Effects = { ...c.effects, curves: keep ? curves : undefined }
       return { project: patchClip(s.project, clipId, { effects }) }
     }),
 

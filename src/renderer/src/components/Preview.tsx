@@ -8,6 +8,9 @@ import { previewScale } from '../lib/previewScale'
 import { hasVideoAt, isRealtimeRate, stepShuttleHold, type ShuttleHold } from '../lib/transport'
 import { scrubDirection } from '../lib/scrub'
 import { useT } from '../lib/i18n'
+import { ScopeSampler } from '../lib/scopeSampler'
+import { SCOPE_INTERVAL_MS, shouldSample } from '../lib/scopes'
+import Scopes, { type ScopesHandle } from './Scopes'
 import type { Project } from '../types'
 
 /**
@@ -19,7 +22,8 @@ function safeFrame(
   pool: AudioPool | null,
   project: Project,
   playhead: number,
-  playing: boolean
+  playing: boolean,
+  afterRender?: () => void
 ): void {
   try {
     const settings = useSettings.getState()
@@ -28,6 +32,8 @@ function safeFrame(
       // Preview-only resolution; the canvas CSS keeps the on-screen size.
       scale: previewScale(settings.previewQuality)
     })
+    // Same task as the render: the drawing buffer is still readable (scopes).
+    afterRender?.()
   } catch (e) {
     console.error('[cutroom] preview render error:', e)
   }
@@ -64,7 +70,53 @@ export default function Preview() {
   const scrubbing = useEditor((s) => s.scrubbing)
   const audioScrub = useSettings((s) => s.audioScrub)
   const lastScrubTime = useRef(playhead)
+  const showScopes = useSettings((s) => s.showScopes)
   const t = useT()
+
+  // --- scopes -------------------------------------------------------------
+  // After each preview render, at most every SCOPE_INTERVAL_MS (and only while
+  // the panel is open), the frame is read back small and reduced to scopes.
+  // A render skipped by the throttle while PAUSED schedules one trailing
+  // re-render + sample, so the scopes always settle on the frame on screen;
+  // during playback the next frame's render samples anyway. The export renders
+  // on its own offscreen compositor, and sampling stops while the Export dialog
+  // is open, so scopes never cost the export anything.
+  const scopesRef = useRef<ScopesHandle>(null)
+  const scopeState = useRef({ sampler: null as ScopeSampler | null, last: -Infinity, trailing: 0 })
+  const scopeTap = useRef<() => void>(() => undefined)
+  scopeTap.current = () => {
+    const scopes = scopesRef.current
+    const canvas = canvasRef.current
+    const comp = compRef.current
+    if (!scopes || !canvas || !comp) return
+    if (useEditor.getState().exportOpen) return scopes.update(null, 'export')
+    if (comp.restoring || comp.restoreFailed) return scopes.update(null, 'gpu')
+    const st = scopeState.current
+    const now = performance.now()
+    if (!shouldSample(now, st.last, SCOPE_INTERVAL_MS)) {
+      if (!st.trailing && !latest.current.isPlaying) {
+        st.trailing = window.setTimeout(
+          () => {
+            st.trailing = 0
+            if (performance.now() - st.last < SCOPE_INTERVAL_MS) return // sampled meanwhile
+            const l = latest.current
+            safeFrame(compRef.current, audioRef.current, l.project, l.playhead, l.isPlaying, () => scopeTap.current())
+          },
+          SCOPE_INTERVAL_MS - (now - st.last)
+        )
+      }
+      return
+    }
+    st.last = now
+    st.sampler ??= new ScopeSampler()
+    try {
+      scopes.update(st.sampler.sample(canvas))
+    } catch (e) {
+      // A readback can fail mid context-loss; skip this sample, keep the last image.
+      console.warn('[cutroom] scopes readback skipped:', e)
+    }
+  }
+  const tap = (): void => scopeTap.current()
 
   // Keep the newest state reachable from async redraws (e.g. an image finishing
   // loading or a video seek completing) without re-creating the compositor.
@@ -80,7 +132,7 @@ export default function Preview() {
       comp = new Compositor(canvas, () => {
         hold.current.landed = true // a decoded frame / finished seek arrived
         const l = latest.current
-        safeFrame(compRef.current, audioRef.current, l.project, l.playhead, l.isPlaying)
+        safeFrame(compRef.current, audioRef.current, l.project, l.playhead, l.isPlaying, tap)
       })
     } catch (e) {
       setError(e instanceof Error ? e.message : 'WebGL initialization failed')
@@ -96,6 +148,7 @@ export default function Preview() {
       window.clearTimeout(stableTimer)
       comp.handleContextLoss(e)
       setGpuStatus('reconnecting')
+      scopesRef.current?.update(null, 'gpu')
     }
     const onRestored = (): void => {
       comp.handleContextRestore()
@@ -106,7 +159,7 @@ export default function Preview() {
       // Nothing else redraws a paused preview: paint the rebuilt context now.
       if (!comp.restoring) {
         const l = latest.current
-        safeFrame(comp, audioRef.current, l.project, l.playhead, l.isPlaying)
+        safeFrame(comp, audioRef.current, l.project, l.playhead, l.isPlaying, tap)
       }
     }
     canvas.addEventListener('webglcontextlost', onLost)
@@ -126,7 +179,7 @@ export default function Preview() {
     window.addEventListener('pointerdown', unlock)
     window.addEventListener('keydown', unlock)
 
-    safeFrame(comp, pool, project, playhead, isPlaying)
+    safeFrame(comp, pool, project, playhead, isPlaying, tap)
 
     return () => {
       window.removeEventListener('pointerdown', unlock)
@@ -134,6 +187,8 @@ export default function Preview() {
       canvas.removeEventListener('webglcontextlost', onLost)
       canvas.removeEventListener('webglcontextrestored', onRestored)
       window.clearTimeout(stableTimer)
+      window.clearTimeout(scopeState.current.trailing)
+      scopeState.current.trailing = 0
       comp.dispose()
       compRef.current = null
       pool?.dispose()
@@ -158,7 +213,7 @@ export default function Preview() {
     } else {
       hold.current = { time: playhead, at: 0, landed: true }
     }
-    safeFrame(compRef.current, audioRef.current, project, time, isPlaying)
+    safeFrame(compRef.current, audioRef.current, project, time, isPlaying, tap)
   }, [project, playhead, isPlaying, shuttling, showPlaceholders, previewQuality])
 
   // Audio scrubbing: while the ruler playhead is dragged or the shuttle runs
@@ -177,8 +232,18 @@ export default function Preview() {
     }
   }, [playhead, scrubbing, shuttling, isPlaying, audioScrub])
 
+  // Opening the panel (or closing the Export dialog) needs a fresh sample even
+  // when nothing else is redrawing a paused preview.
+  const exportOpen = useEditor((s) => s.exportOpen)
+  useEffect(() => {
+    if (!showScopes || exportOpen) return
+    scopeState.current.last = -Infinity
+    const l = latest.current
+    safeFrame(compRef.current, audioRef.current, l.project, l.playhead, l.isPlaying, tap)
+  }, [showScopes, exportOpen])
+
   return (
-    <section className="preview">
+    <section className={`preview ${showScopes ? 'with-scopes' : ''}`}>
       <div className="monitor-inner">
         {error ? (
           <div className="ph-frame">
@@ -191,6 +256,14 @@ export default function Preview() {
           {project.width}×{project.height} · {project.fps} fps · {playhead.toFixed(2)}s
           {previewQuality !== 'full' && ` · ${t('Preview')} ${previewQuality === 'half' ? '½' : '¼'}`}
         </div>
+        <button
+          className={`btn small monitor-scopes-btn ${showScopes ? 'active' : ''}`}
+          title={showScopes ? t('Hide scopes') : t('Show scopes (histogram, waveform, vectorscope)')}
+          aria-pressed={showScopes}
+          onClick={() => useSettings.getState().set({ showScopes: !showScopes })}
+        >
+          {t('Scopes')}
+        </button>
         {gpuStatus === 'reconnecting' && (
           <div className="monitor-overlay warn">{t('Reconnecting GPU…')}</div>
         )}
@@ -203,6 +276,7 @@ export default function Preview() {
           </div>
         )}
       </div>
+      {showScopes && !error && <Scopes ref={scopesRef} />}
     </section>
   )
 }

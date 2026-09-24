@@ -172,4 +172,35 @@ describe('project (de)serialize', () => {
     expect(t.duck?.triggerTrackId).toBeNull()
     expect(t.eq).toBeUndefined()
   })
+
+  it('round-trips RGB curves on a clip', () => {
+    const p = sample()
+    const curves = {
+      master: [{ x: 0, y: 0 }, { x: 0.25, y: 0.15 }, { x: 0.75, y: 0.85 }, { x: 1, y: 1 }],
+      r: [{ x: 0, y: 0 }, { x: 1, y: 0.9 }],
+      g: [{ x: 0, y: 0 }, { x: 1, y: 1 }],
+      b: [{ x: 0, y: 0.05 }, { x: 1, y: 1 }]
+    }
+    p.clips.c1.effects = { opacity: 1, chroma: { enabled: false, color: '#00d000', similarity: 0.4, smoothness: 0.1, spill: 0.25 }, curves }
+    const r = deserializeProject(serializeProject(p))
+    expect(r.ok && r.project.clips.c1.effects?.curves).toEqual(curves)
+  })
+
+  it('sanitizes curve points: clamps, sorts, drops malformed, identity -> removed', () => {
+    const p = sample() as unknown as { clips: Record<string, Record<string, unknown>> }
+    p.clips.c1.effects = {
+      opacity: 1,
+      chroma: { enabled: false, color: '#00d000', similarity: 0.4, smoothness: 0.1, spill: 0.25 },
+      curves: { master: [{ x: 1, y: 1.4 }, 'junk', { x: 0.5, y: 0.2 }, { x: -3, y: 0 }], r: 'nope' }
+    }
+    p.clips.c2 = { ...p.clips.c1, id: 'c2', effects: { opacity: 1, chroma: {}, curves: { g: [{ x: 0, y: 0 }, { x: 1, y: 1 }] } } }
+    const r = deserializeProject(JSON.stringify(p))
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    const c = r.project.clips.c1.effects?.curves
+    expect(c?.master).toEqual([{ x: 0, y: 0 }, { x: 0.5, y: 0.2 }, { x: 1, y: 1 }])
+    expect(c?.r).toEqual([{ x: 0, y: 0 }, { x: 1, y: 1 }])
+    expect(r.project.clips.c2.effects).toBeDefined()
+    expect(r.project.clips.c2.effects && 'curves' in r.project.clips.c2.effects).toBe(false)
+  })
 })

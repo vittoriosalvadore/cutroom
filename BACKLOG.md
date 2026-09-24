@@ -48,7 +48,6 @@ candidate features. Ordered roughly by how much they came up. Update as we go.
 ## Candidate features (Vegas-style, not yet built — rough priority)
 
 1. **Proxy / optimized media** for heavy footage.
-2. **Color curves / scopes** — beyond primary grade: RGB curves, histogram/vectorscope.
 
 ## Done
 
@@ -121,3 +120,7 @@ candidate features. Ordered roughly by how much they came up. Update as we go.
   windowed grains of the audio under the playhead through each clip's track chain (mute / gain /
   pan / FX / reverb), at most every 45 ms and only when the playhead moved; reverse plays the audio
   just before the playhead backwards. Options → Editing → Audio scrubbing (on by default).
+- **Color curves + scopes** — per-clip master + R/G/B curves (monotone-cubic, composed into a 256×1
+  LUT sampled after the primary grade; identity skips it, byte-identical; shared by preview + export;
+  saved/validated in project files), Inspector → Curves. Toggleable Scopes panel under the preview
+  (RGB/luma histogram, luma waveform, BT.709 vectorscope) from a throttled 8 Hz 256-px readback.

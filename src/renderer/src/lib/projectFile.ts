@@ -2,6 +2,7 @@ import type { AnimProp, Clip, Easing, Keyframe, MediaItem, Marker, Project, Trac
 import { defaultTrackComp, defaultTrackDuck, defaultTrackEQ, defaultTrackGate } from '../types'
 import { clampReverb } from '../../../shared/reverb'
 import { clampTrackHeight } from './tracks'
+import { sanitizeCurves } from './curves'
 
 // ---------------------------------------------------------------------------
 // Pure project (de)serialization. Defensive on the way IN so a corrupt or
@@ -173,6 +174,14 @@ function sanitizeClips(raw: Record<string, unknown>, trackIds: Set<string>, medi
     if (c.mediaId !== null && (typeof c.mediaId !== 'string' || !media[c.mediaId])) continue
     const clip: Clip = { ...(c as unknown as Clip), id, startSec: Math.max(0, startSec as number) }
     if (c.speed !== undefined && !Number.isFinite(c.speed)) delete clip.speed
+    if (isRecord(c.effects) && c.effects.curves !== undefined) {
+      // Curves feed a GPU LUT: clamp/sort/drop bad points; identity or garbage -> no curves.
+      const curves = sanitizeCurves(c.effects.curves)
+      const effects = { ...(c.effects as unknown as NonNullable<Clip['effects']>) }
+      if (curves) effects.curves = curves
+      else delete effects.curves
+      clip.effects = effects
+    }
     if (c.keyframes !== undefined) {
       const kf = sanitizeKeyframes(c.keyframes)
       if (kf) clip.keyframes = kf

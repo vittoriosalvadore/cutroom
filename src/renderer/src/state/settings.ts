@@ -36,6 +36,8 @@ export interface Settings {
   showPlaceholders: boolean
   /** Preview render resolution (export always renders full size). */
   previewQuality: PreviewQuality
+  /** Show the histogram / waveform / vectorscope panel under the preview. */
+  showScopes: boolean
   // --- editing ---
   /** Snap clip edges to other clips and the playhead while dragging. */
   snapping: boolean
@@ -72,6 +74,7 @@ export const DEFAULT_SETTINGS: Settings = {
   hardwareAcceleration: true,
   showPlaceholders: true,
   previewQuality: 'full',
+  showScopes: false,
   snapping: true,
   defaultFadeSec: 0.5,
   showWaveforms: true,
@@ -115,6 +118,7 @@ export function sanitize(raw: unknown): Partial<Settings> {
   bool('snapping')
   bool('showWaveforms')
   bool('audioScrub')
+  bool('showScopes')
   bool('reduceMotion')
   const fade = clampNum(o.defaultFadeSec, 0.1, 2)
   if (fade !== undefined) out.defaultFadeSec = fade
@@ -150,6 +154,7 @@ function pick(s: Settings): Settings {
     hardwareAcceleration: s.hardwareAcceleration,
     showPlaceholders: s.showPlaceholders,
     previewQuality: s.previewQuality,
+    showScopes: s.showScopes,
     snapping: s.snapping,
     defaultFadeSec: s.defaultFadeSec,
     showWaveforms: s.showWaveforms,

@@ -1,9 +1,10 @@
-import type { Clip, ClipTransform, Effects, MediaItem, Project, TextProps } from '../types'
+import type { Clip, ClipTransform, ColorCurves, Effects, MediaItem, Project, TextProps } from '../types'
 import { defaultEffects, isNeutralColor } from '../types'
 import { sampleOpacity, sampleTransform } from './keyframes'
 import { mediaUrl } from './media'
 import { VideoPool } from './videoPool'
 import { roundRectPath } from './canvas'
+import { buildCurvesLut, isIdentityLut, LUT_SIZE } from './curves'
 import { RestoreMachine } from './webglRestore'
 import { scaledCanvasSize } from './previewScale'
 import type { FrameSource } from './videoSource'
@@ -68,6 +69,8 @@ uniform float uContrast;
 uniform float uSaturation;
 uniform float uTemp;
 uniform float uTint;
+uniform int uCurvesOn;
+uniform sampler2D uCurves; // 256x1 RGBA LUT: R/G/B = composed master+channel curve
 
 // Project to the chroma plane (Cb/Cr-ish) so the key ignores brightness.
 vec2 chromaCoords(vec3 c) {
@@ -101,6 +104,21 @@ void main() {
     float gl = dot(rgb, vec3(0.299, 0.587, 0.114));
     rgb = mix(vec3(gl), rgb, uSaturation);
     rgb = clamp(rgb, 0.0, 1.0);
+  }
+
+  // RGB curves, LAST: they shape the display-referred 0..1 result of the
+  // primary grade (what the scopes show), so exposure/WB move the signal and
+  // the curve then sets the final tone — a curve point means the same output
+  // level whatever the primaries are. Texel k's centre is (k + 0.5) / 256, so
+  // an 8-bit input k/255 lands exactly on LUT entry k; LINEAR filtering
+  // interpolates in-between (graded, non-8-bit) values.
+  if (uCurvesOn == 1) {
+    vec3 cu = clamp(rgb, 0.0, 1.0) * (255.0 / 256.0) + (0.5 / 256.0);
+    rgb = vec3(
+      texture2D(uCurves, vec2(cu.r, 0.5)).r,
+      texture2D(uCurves, vec2(cu.g, 0.5)).g,
+      texture2D(uCurves, vec2(cu.b, 0.5)).b
+    );
   }
 
   gl_FragColor = vec4(rgb, a * uOpacity);
@@ -296,6 +314,43 @@ export class Compositor {
     return key
   }
 
+  // Curve LUT textures, keyed by the clip's ColorCurves object. The store
+  // replaces that object on every edit (immutable updates), so identity is a
+  // valid cache key; `tex: null` caches "renders as identity" (skip the LUT).
+  // Small LRU so a long curve drag (a new object per move) can't pile up.
+  private curveTextures = new Map<ColorCurves, WebGLTexture | null>()
+
+  private curvesTexture(curves: ColorCurves): WebGLTexture | null {
+    const hit = this.curveTextures.get(curves)
+    if (hit !== undefined) {
+      // Refresh LRU position.
+      this.curveTextures.delete(curves)
+      this.curveTextures.set(curves, hit)
+      return hit
+    }
+    const lut = buildCurvesLut(curves)
+    let tex: WebGLTexture | null = null
+    if (!isIdentityLut(lut)) {
+      const gl = this.gl
+      tex = gl.createTexture() as WebGLTexture
+      gl.activeTexture(gl.TEXTURE1)
+      gl.bindTexture(gl.TEXTURE_2D, tex)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, LUT_SIZE, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, lut)
+      gl.activeTexture(gl.TEXTURE0)
+    }
+    this.curveTextures.set(curves, tex)
+    if (this.curveTextures.size > 32) {
+      const [oldKey, oldTex] = this.curveTextures.entries().next().value as [ColorCurves, WebGLTexture | null]
+      if (oldTex) this.gl.deleteTexture(oldTex)
+      this.curveTextures.delete(oldKey)
+    }
+    return tex
+  }
+
   // WebGL context-loss recovery. A lost GPU context must restore (rebuild GL
   // resources) instead of black-screening — the exact "looks like a crash"
   // symptom we want to avoid. State machine is pure (webglRestore.ts); this
@@ -353,10 +408,12 @@ export class Compositor {
     for (const name of [
       'uRect', 'uTex', 'uUseTex', 'uColor', 'uOpacity', 'uChroma', 'uKey', 'uSim', 'uSmooth', 'uSpill',
       'uUVMin', 'uUVMax', 'uTrans', 'uScale', 'uRot', 'uAspect', 'uAnchor',
-      'uColorOn', 'uExposure', 'uContrast', 'uSaturation', 'uTemp', 'uTint'
+      'uColorOn', 'uExposure', 'uContrast', 'uSaturation', 'uTemp', 'uTint', 'uCurvesOn', 'uCurves'
     ]) {
       this.u[name] = gl.getUniformLocation(this.prog, name)
     }
+    // The curve LUT always lives on texture unit 1 (unit 0 is the layer).
+    gl.uniform1i(this.u.uCurves, 1)
   }
 
   private buildProgram(vs: string, fs: string): WebGLProgram {
@@ -514,6 +571,14 @@ export class Compositor {
       gl.uniform1f(u.uSaturation, cc.saturation)
       gl.uniform1f(u.uTemp, cc.temperature)
       gl.uniform1f(u.uTint, cc.tint)
+    }
+    // Identity / absent curves skip the LUT entirely: neutral stays byte-identical.
+    const curveTex = effects.curves ? this.curvesTexture(effects.curves) : null
+    gl.uniform1i(u.uCurvesOn, curveTex ? 1 : 0)
+    if (curveTex) {
+      gl.activeTexture(gl.TEXTURE1)
+      gl.bindTexture(gl.TEXTURE_2D, curveTex)
+      gl.activeTexture(gl.TEXTURE0) // uploads elsewhere bind on the active unit
     }
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
   }
@@ -737,6 +802,7 @@ export class Compositor {
     this.images.clear()
     this.canvasCache.clear()
     this.videoTextures.clear()
+    this.curveTextures.clear()
     this.cacheOrder = []
   }
 
@@ -757,6 +823,8 @@ export class Compositor {
     for (const e of this.images.values()) if (e.tex) gl.deleteTexture(e.tex)
     for (const e of this.canvasCache.values()) gl.deleteTexture(e.tex)
     for (const tex of this.videoTextures.values()) gl.deleteTexture(tex)
+    for (const tex of this.curveTextures.values()) if (tex) gl.deleteTexture(tex)
+    this.curveTextures.clear()
     this.images.clear()
     this.canvasCache.clear()
     this.videoTextures.clear()

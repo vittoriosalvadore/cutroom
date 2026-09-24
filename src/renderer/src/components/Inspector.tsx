@@ -17,6 +17,7 @@ import { SLIDER_KEYS } from '../lib/transport'
 import { normalizeGainDb } from '../lib/normalize'
 import { canRemoveTrack, MAX_TRACK_HEIGHT, MIN_TRACK_HEIGHT } from '../lib/tracks'
 import { removeTrackWithConfirm } from '../lib/trackActions'
+import CurvesEditor from './CurvesEditor'
 import { denoiseCacheVersion, ensureDenoised, getDenoiseEntry, subscribeDenoiseCache } from '../lib/denoiseCache'
 import type { AnimProp, Marker, TextAlign, Track, TrackGate, TrackDuck, TrackEQ, TrackComp, TrackReverb } from '../types'
 
@@ -1139,6 +1140,26 @@ export default function Inspector() {
                     : t('Magenta {n}', { n: Math.round(v * 100) })
               }
             />
+          </section>
+        )}
+
+        {isVisual && (
+          <section className="insp-section">
+            <h4>
+              {t('Curves')}
+              <button
+                className="btn small"
+                title={t('Reset all curves')}
+                disabled={!eff.curves}
+                onClick={() => useEditor.getState().resetCurves(id)}
+              >
+                {t('Reset all')}
+              </button>
+            </h4>
+            <CurvesEditor clipId={id} curves={eff.curves} />
+            <p className="insp-note">
+              {t('Click to add a point, drag to move, double-click or right-click to remove. Applied after the color grade.')}
+            </p>
           </section>
         )}
 

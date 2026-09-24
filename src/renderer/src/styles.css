@@ -596,8 +596,15 @@ input[type='color']:hover {
 }
 .preview-canvas {
   display: block;
+  /* Fill the monitor box (whose height may come from max-height, which a
+     percentage height can't resolve against) and letterbox instead of
+     cropping/stretching when the box isn't the project's aspect — a vertical
+     project, or a monitor squeezed by the scopes panel. */
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
+  object-fit: contain;
 }
 .monitor-overlay {
   position: absolute;
@@ -624,6 +631,74 @@ input[type='color']:hover {
   font-size: var(--fs-12);
   pointer-events: auto;
 }
+/* Scopes toggle, top-right of the monitor. */
+.monitor-scopes-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  opacity: 0.75;
+}
+.monitor-scopes-btn:hover,
+.monitor-scopes-btn.active {
+  opacity: 1;
+}
+.monitor-scopes-btn.active {
+  color: var(--accent);
+}
+
+/* ---- scopes panel (under the monitor) ---- */
+.preview.with-scopes {
+  grid-template-rows: minmax(0, 1fr) auto;
+  gap: var(--sp-5);
+}
+.scopes {
+  position: relative;
+  display: flex;
+  gap: var(--sp-5);
+  justify-content: center;
+  max-width: 100%;
+}
+.scope {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.scope figcaption {
+  font-size: var(--fs-11);
+  color: var(--muted);
+  letter-spacing: var(--tracking-cap);
+  text-transform: uppercase;
+}
+.scope canvas {
+  display: block;
+  height: 132px;
+  max-width: 100%;
+  background: #0b0c10;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+}
+.scope-hist {
+  width: 220px;
+}
+.scope-wave {
+  width: 236px;
+}
+.scope-vec {
+  width: 132px;
+}
+.scopes-paused {
+  position: absolute;
+  inset: 18px 0 0;
+  display: grid;
+  place-items: center;
+  font-size: var(--fs-12);
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: var(--r-sm);
+}
+
 .ph-frame {
   text-align: center;
 }
@@ -959,6 +1034,50 @@ input[type='color']:hover {
 }
 .insp-switch input[type='checkbox'] {
   accent-color: var(--accent);
+}
+/* RGB curves widget */
+.curves-bar {
+  justify-content: space-between;
+  margin-top: 0;
+}
+.curves-svg {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1;
+  background: var(--sunken);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  cursor: crosshair;
+  touch-action: none;
+  overflow: visible;
+}
+.curves-grid line,
+.curves-diag {
+  stroke: var(--line-strong);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.curves-diag {
+  stroke-dasharray: 3 3;
+}
+.curves-line {
+  fill: none;
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+.curves-line.faint {
+  opacity: 0.35;
+  stroke-width: 1.25;
+}
+.curves-pt {
+  fill: var(--panel);
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+  cursor: grab;
+}
+.curves-pt.active {
+  fill: currentColor;
+  color: var(--accent);
 }
 .insp-note {
   font-size: var(--fs-11);
