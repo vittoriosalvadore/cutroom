@@ -141,10 +141,10 @@ function createWindow(): void {
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       // contextIsolation keeps renderer code from reaching Node directly; the
-      // preload bridge is the only door. sandbox:false lets the preload use
-      // CommonJS require, which electron-vite emits.
+      // preload bridge is the only door. The preload only needs contextBridge,
+      // ipcRenderer and webUtils, all available to a sandboxed preload.
       contextIsolation: true,
-      sandbox: false,
+      sandbox: true,
       nodeIntegration: false
     }
   })

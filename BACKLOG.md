@@ -29,15 +29,6 @@ candidate features. Ordered roughly by how much they came up. Update as we go.
 - **Ducking has no attenuation floor** — `sidechaincompress` has no range param
   and caps ratio at 20, so very deep ducking isn't possible (preview matches, no
   floor). A parallel-bus emulation could add a floor later if wanted.
-- **Overlapping clips of the same source share one decoder** — the video pool is
-  keyed by media id, so two clips of one file visible at once (split + overlap
-  for PiP/crossfade) show the same frame. Fix: key pool entries by clip id.
-- **Hidden video tracks are silent in preview** — their `<video>` element isn't
-  driven (and is evicted after 10 s idle), so their audio doesn't play.
-- **Renderer sandbox / CSP** — `sandbox:false` and no production CSP. The main
-  process now validates every path it receives, but turning on the sandbox
-  (preload only needs `contextBridge`/`ipcRenderer`/`webUtils`) and adding a CSP
-  that allows transformers.js WASM would harden it further. Needs an app run.
 - **Gate/duck apply to audio tracks only** — video-track audio bypasses the
   per-track dynamics chain in preview. Revisit if video-track gating is needed.
 
