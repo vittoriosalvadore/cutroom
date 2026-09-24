@@ -7,6 +7,8 @@ import type {
   Effects,
   ChromaKey,
   ColorCorrection,
+  CurveChannel,
+  CurvePoint,
   MediaItem,
   MediaKind,
   Project,
@@ -15,7 +17,8 @@ import type {
   TrackGate,
   TrackDuck,
   TrackEQ,
-  TrackComp
+  TrackComp,
+  TrackReverb
 } from '../types'
 import {
   clampSpeed,
@@ -29,10 +32,21 @@ import {
   defaultTrackGate,
   defaultTrackDuck,
   defaultTrackEQ,
-  defaultTrackComp
+  defaultTrackComp,
+  defaultTrackReverb
 } from '../types'
-import { computeCrossfade, MIN_CLIP_SEC, rippleShift, rippleShiftMarkers, splitClipAt } from '../lib/editing'
+import {
+  computeCrossfade,
+  mergeRemovedRanges,
+  MIN_CLIP_SEC,
+  rippleShift,
+  rippleShiftMarkers,
+  shiftTimeForRanges,
+  splitClipAt
+} from '../lib/editing'
 import { clampFades } from '../lib/fades'
+import { CURVE_CHANNELS, identityCurves, identityPoints, isDefaultChannel } from '../lib/curves'
+import { canRemoveTrack, clampTrackHeight, moveTrackTo, newVideoTrackIndex, nextTrackName } from '../lib/tracks'
 import { clampProp, keyIndexAt, KEY_EPS, rebaseTracks, sortKeys, splitTracksAt, withTransformProp } from '../lib/keyframes'
 import { useSettings } from './settings'
 
@@ -144,6 +158,10 @@ interface EditorState {
   project: Project
   playheadSec: number
   isPlaying: boolean
+  /** Signed J/K/L shuttle rate while playing: 1 = normal, ±2/±4 fast, <0 reverse (see lib/transport). */
+  shuttleRate: number
+  /** True while the playhead is being dragged on the ruler (drives audio scrubbing, lib/scrub). */
+  scrubbing: boolean
   /** Timeline zoom: horizontal pixels per second. */
   pxPerSec: number
   /** The PRIMARY selected clip (Inspector target). Always a member of selectedClipIds, null iff empty. */
@@ -163,7 +181,14 @@ interface EditorState {
   // --- clips ---
   addClipFromMedia: (mediaId: string, trackId: string, startSec: number) => void
   moveClip: (clipId: string, startSec: number, trackId?: string) => void
-  applyTrim: (clipId: string, bounds: { startSec: number; durationSec: number; inSec: number }) => void
+  /** Set a clip's trimmed bounds. During an edge drag, pass the drag-start clip
+   *  as `origin`: keyframes/fades are then derived from it (once, losslessly)
+   *  rather than re-rebased off the already-trimmed clip on every pointer move. */
+  applyTrim: (
+    clipId: string,
+    bounds: { startSec: number; durationSec: number; inSec: number },
+    origin?: Clip
+  ) => void
   splitAtPlayhead: () => void
   removeClip: (clipId: string) => void
   rippleDelete: (clipId: string) => void
@@ -213,9 +238,16 @@ interface EditorState {
   updateChroma: (clipId: string, patch: Partial<ChromaKey>) => void
   updateColor: (clipId: string, patch: Partial<ColorCorrection>) => void
   resetColor: (clipId: string) => void
+  /** Replace one curve channel's points (already sorted; the widget keeps them so). */
+  setCurvePoints: (clipId: string, channel: CurveChannel, points: CurvePoint[]) => void
+  /** Reset one curve channel, or all of them when `channel` is omitted. */
+  resetCurves: (clipId: string, channel?: CurveChannel) => void
 
   // --- subtitles ---
-  importSubtitles: (cues: SubtitleCue[]) => void
+  /** Add cues to the subtitle lane. One recorded undo step by default; pass
+   *  `{ recordHistory: false }` for follow-up batches of a streamed import
+   *  (e.g. transcription) whose first batch already recorded the step. */
+  importSubtitles: (cues: SubtitleCue[], opts?: { recordHistory?: boolean }) => void
 
   // --- audio ---
   updateAudio: (
@@ -225,12 +257,23 @@ interface EditorState {
   setDenoiseEnabled: (clipId: string, enabled: boolean) => void
   toggleTrackMute: (trackId: string, muted: boolean) => void
   addAudioTrack: (name?: string) => void
+  /** Add a video track above the topmost video track (under the subtitle lane). */
+  addVideoTrack: (name?: string) => void
+  /** Delete a track and every clip on it (one undo step). No-op for the last
+   *  video / audio track (see canRemoveTrack). */
+  removeTrack: (trackId: string) => void
+  /** Reorder: move a track to its final index in Project.tracks (= stacking
+   *  order: index 0 composites on top). One undo step. */
+  moveTrack: (trackId: string, toIndex: number) => void
+  /** Set a lane's height (clamped). No internal history; the resize drag snapshots. */
+  setTrackHeight: (trackId: string, height: number) => void
   selectTrack: (trackId: string | null) => void
   updateTrack: (trackId: string, patch: { audioGain?: number; pan?: number; name?: string }) => void
   updateTrackGate: (trackId: string, patch: Partial<TrackGate>) => void
   updateTrackDuck: (trackId: string, patch: Partial<TrackDuck>) => void
   updateTrackEQ: (trackId: string, patch: Partial<TrackEQ>) => void
   updateTrackComp: (trackId: string, patch: Partial<TrackComp>) => void
+  updateTrackReverb: (trackId: string, patch: Partial<TrackReverb>) => void
 
   // --- transform / keyframes ---
   /** Set the STATIC value of an animatable property (when its track is disarmed). */
@@ -252,7 +295,12 @@ interface EditorState {
 
   // --- transport / view ---
   setPlayhead: (sec: number) => void
+  /** Play/pause at normal speed (resets any shuttle rate). */
   setPlaying: (playing: boolean) => void
+  /** Play at a signed shuttle rate (J/K/L); see lib/transport. */
+  setShuttle: (rate: number) => void
+  /** Ruler playhead drag started / ended (see `scrubbing`). */
+  setScrubbing: (scrubbing: boolean) => void
   setZoom: (pxPerSec: number) => void
 
   // --- history (undo/redo) ---
@@ -277,9 +325,13 @@ interface EditorState {
   projectFilePath: string | null
   /** The project as of the last save/load — used to derive "dirty". */
   savedProject: Project
-  loadProject: (project: Project, filePath: string | null) => void
+  /** Replace the document. `dirty: true` (crash recovery) keeps it flagged as
+   *  unsaved so closing still prompts, instead of treating it as on-disk state. */
+  loadProject: (project: Project, filePath: string | null, opts?: { dirty?: boolean }) => void
   newProject: () => void
-  markSaved: (filePath: string) => void
+  /** Record a completed save. `project` is the exact state that was written
+   *  (captured before the async write); defaults to the current project. */
+  markSaved: (filePath: string, project?: Project) => void
 
   // --- export ---
   exportOpen: boolean
@@ -387,16 +439,33 @@ function pruneSelection(
   return { selectedClipId: primary, selectedClipIds: ids }
 }
 
+/** Ids present in `before` but gone from `after` (e.g. pieces a cut deleted). */
+function removedIds(before: Record<string, Clip>, after: Record<string, Clip>): Set<string> {
+  return new Set(Object.keys(before).filter((id) => !after[id]))
+}
+
 /** After undo/redo swaps the project, keep only selections that still exist. */
 function pruneToProject(
   s: EditorState,
   project: Project
-): { selectedClipId: string | null; selectedClipIds: Set<string>; selectedMarkerId: string | null } {
+): {
+  selectedClipId: string | null
+  selectedClipIds: Set<string>
+  selectedMarkerId: string | null
+  selectedTrackId: string | null
+} {
   const ids = new Set([...s.selectedClipIds].filter((id) => project.clips[id]))
   const primary =
     s.selectedClipId && project.clips[s.selectedClipId] ? s.selectedClipId : ids.size > 0 ? [...ids][0] : null
   const markerOk = !!s.selectedMarkerId && (project.markers ?? []).some((m) => m.id === s.selectedMarkerId)
-  return { selectedClipId: primary, selectedClipIds: ids, selectedMarkerId: markerOk ? s.selectedMarkerId : null }
+  // Undoing an "add track" (or redoing a delete) can remove the selected track.
+  const trackOk = !!s.selectedTrackId && project.tracks.some((t) => t.id === s.selectedTrackId)
+  return {
+    selectedClipId: primary,
+    selectedClipIds: ids,
+    selectedMarkerId: markerOk ? s.selectedMarkerId : null,
+    selectedTrackId: trackOk ? s.selectedTrackId : null
+  }
 }
 
 /** A single-clip selection set + that clip as primary (the common case). */
@@ -441,6 +510,8 @@ export const useEditor = create<EditorState>((set) => {
   projectFilePath: null,
   playheadSec: 0,
   isPlaying: false,
+  shuttleRate: 1,
+  scrubbing: false,
   pxPerSec: 80,
   selectedClipId: null,
   selectedClipIds: new Set<string>(),
@@ -470,20 +541,35 @@ export const useEditor = create<EditorState>((set) => {
     set((s) => {
       const m = s.project.media[mediaId]
       if (!m) return {}
+      // Re-probing on project open reports what the file already records; a new
+      // project object here would flag a freshly-opened project as dirty.
+      const same = (Object.keys(info) as (keyof typeof info)[]).every((k) => info[k] === m[k])
+      if (same) return {}
       const media = { ...s.project.media, [mediaId]: { ...m, ...info } }
 
       // When audio gets its first real duration (was 0 before probe), extend any
       // clips that were placed with the 5 s pre-probe fallback duration and have
       // not been trimmed yet (inSec===0). Clips the user already trimmed are left
-      // alone since durationSec would differ from the 5 s sentinel.
+      // alone since durationSec would differ from the 5 s sentinel. Growth stops
+      // at the next clip on the same lane so the extension never overlaps it.
       let clips = s.project.clips
-      if (m.durationSec === 0 && info.durationSec && info.durationSec > 0) {
+      const realDur = info.durationSec
+      if (m.durationSec === 0 && realDur && realDur > 0) {
         const next: typeof clips = {}
         for (const [id, c] of Object.entries(clips)) {
-          next[id] =
-            c.mediaId === mediaId && c.durationSec === 5 && c.inSec === 0
-              ? { ...c, durationSec: info.durationSec }
-              : c
+          if (c.mediaId !== mediaId || c.durationSec !== 5 || c.inSec !== 0) {
+            next[id] = c
+            continue
+          }
+          let room = Infinity
+          for (const o of Object.values(clips)) {
+            if (o.id !== c.id && o.trackId === c.trackId && o.startSec > c.startSec + 1e-6) {
+              room = Math.min(room, o.startSec - c.startSec)
+            }
+          }
+          // Never shorter than the real source; never shrink below the current
+          // placeholder length just because a neighbour already overlaps it.
+          next[id] = { ...c, durationSec: Math.min(realDur, Math.max(c.durationSec, room)) }
         }
         clips = next
       }
@@ -524,19 +610,24 @@ export const useEditor = create<EditorState>((set) => {
       return { project: { ...s.project, clips: { ...s.project.clips, [clipId]: next } } }
     }),
 
-  applyTrim: (clipId, bounds) =>
+  applyTrim: (clipId, bounds, origin) =>
     set((s) => {
       const clip = s.project.clips[clipId]
       if (!clip) return {}
+      // Derive keyframes/fades from the drag-start clip when given: rebasing is
+      // lossy for head trims IN (keys before the cut are dropped) and fades get
+      // clamped, so re-applying per pointer move off the already-trimmed clip
+      // would compound — a drag that goes in and back out couldn't restore them.
+      const base = origin ?? clip
       // A head (left-edge) trim moves the clip-relative origin, so keyframe times
       // must rebase by the same delta or the animation drifts (mirrors the split).
-      const delta = bounds.startSec - clip.startSec
-      const keyframes = clip.keyframes ? rebaseTracks(clip.keyframes, delta) : clip.keyframes
+      const delta = bounds.startSec - base.startSec
+      const keyframes = base.keyframes ? rebaseTracks(base.keyframes, delta) : base.keyframes
       // Trimming can shorten the clip below its current fade lengths. Playback/
       // export already rescale via clampFades at read time, but the STORED value
       // should match reality too (e.g. the Inspector fade slider shouldn't show
       // an 8s fade-out on a clip that's now only 3s long).
-      const { fadeInSec, fadeOutSec } = clampFades(clip.fadeInSec ?? 0, clip.fadeOutSec ?? 0, bounds.durationSec)
+      const { fadeInSec, fadeOutSec } = clampFades(base.fadeInSec ?? 0, base.fadeOutSec ?? 0, bounds.durationSec)
       const next: Clip = {
         ...clip,
         startSec: bounds.startSec,
@@ -624,7 +715,11 @@ export const useEditor = create<EditorState>((set) => {
     set((s) => {
       const cut = applyOneSilenceCut(s.project.clips, s.project.markers ?? [], clipId, range)
       if (!cut) return {}
-      return { ...recordHistory(s), project: { ...s.project, clips: cut.clips, markers: cut.markers } }
+      return {
+        ...recordHistory(s),
+        project: { ...s.project, clips: cut.clips, markers: cut.markers },
+        ...pruneSelection(s, removedIds(s.project.clips, cut.clips))
+      }
     }),
 
   applySilenceCuts: (clipId, ranges) =>
@@ -656,7 +751,12 @@ export const useEditor = create<EditorState>((set) => {
         removed += r.endSec - r.startSec
       }
       if (clips === s.project.clips) return {} // nothing was actually cut
-      return { ...recordHistory(s), project: { ...s.project, clips, markers } }
+      return {
+        ...recordHistory(s),
+        project: { ...s.project, clips, markers },
+        // A range starting at a clip's head deletes that clip id outright.
+        ...pruneSelection(s, removedIds(s.project.clips, clips))
+      }
     }),
 
   crossfadeWithNeighbor: (clipId) =>
@@ -780,19 +880,16 @@ export const useEditor = create<EditorState>((set) => {
         if (shift > 0) clips[c.id] = { ...c, startSec: Math.max(0, c.startSec - shift) }
       }
       // Markers must ripple too, or they silently drift out of sync with the footage.
-      // Same one-pass "sum against the ORIGINAL position" pattern as the clip-shift
-      // above — sequentially re-shifting per range would be order-dependent (an
-      // earlier shift could move a marker below a later range's own start
-      // threshold, silently skipping it depending on iteration order).
-      const shiftFor = (t: number): number => {
-        let total = 0
-        for (const d of delRanges) if (d.startSec <= t + 1e-6) total += d.durationSec
-        return total
-      }
+      // Markers sit on the shared timeline, so the per-track ranges are first
+      // unioned (parallel deletions on V1 + A1 remove that time once, not twice),
+      // then applied in one pass against the ORIGINAL positions — sequentially
+      // re-shifting per range would be order-dependent. A marker inside a
+      // removed span collapses onto its start.
+      const spans = mergeRemovedRanges(delRanges)
       const markers = (s.project.markers ?? []).map((m) => ({
         ...m,
-        timeSec: Math.max(0, m.timeSec - shiftFor(m.timeSec)),
-        endSec: m.endSec != null ? Math.max(0, m.endSec - shiftFor(m.endSec)) : m.endSec
+        timeSec: shiftTimeForRanges(m.timeSec, spans),
+        endSec: m.endSec != null ? shiftTimeForRanges(m.endSec, spans) : m.endSec
       }))
       return {
         ...recordHistory(s),
@@ -953,7 +1050,31 @@ export const useEditor = create<EditorState>((set) => {
       return { project: patchClip(s.project, clipId, { effects }) }
     }),
 
-  importSubtitles: (cues) =>
+  setCurvePoints: (clipId, channel, points) =>
+    set((s) => {
+      const c = s.project.clips[clipId]
+      if (!c) return {}
+      const base = c.effects ?? defaultEffects()
+      const curves = { ...(base.curves ?? identityCurves()), [channel]: points }
+      // Only the exact default diagonal on every channel drops the field. A curve
+      // that merely *renders* as identity (points dragged onto the diagonal)
+      // keeps its points so an in-progress drag doesn't lose its handle; the
+      // compositor still skips the LUT for it.
+      const effects: Effects = { ...base, curves: CURVE_CHANNELS.every((ch) => isDefaultChannel(curves[ch])) ? undefined : curves }
+      return { project: patchClip(s.project, clipId, { effects }) }
+    }),
+
+  resetCurves: (clipId, channel) =>
+    set((s) => {
+      const c = s.project.clips[clipId]
+      if (!c?.effects?.curves) return {}
+      const curves = channel ? { ...c.effects.curves, [channel]: identityPoints() } : undefined
+      const keep = curves && !CURVE_CHANNELS.every((ch) => isDefaultChannel(curves[ch]))
+      const effects: Effects = { ...c.effects, curves: keep ? curves : undefined }
+      return { project: patchClip(s.project, clipId, { effects }) }
+    }),
+
+  importSubtitles: (cues, opts) =>
     set((s) => {
       if (cues.length === 0) return {}
       const { tracks, trackId } = subtitleTrack(s.project.tracks)
@@ -972,7 +1093,8 @@ export const useEditor = create<EditorState>((set) => {
           effects: defaultEffects()
         }
       }
-      return { ...recordHistory(s), project: { ...s.project, tracks, clips } }
+      const history = opts?.recordHistory === false ? {} : recordHistory(s)
+      return { ...history, project: { ...s.project, tracks, clips } }
     }),
 
   updateAudio: (clipId, patch) =>
@@ -1007,6 +1129,60 @@ export const useEditor = create<EditorState>((set) => {
         hidden: false
       }
       return { ...recordHistory(s), project: { ...s.project, tracks: [...s.project.tracks, track] } }
+    }),
+
+  addVideoTrack: (name) =>
+    set((s) => {
+      const track: Track = {
+        id: uid('t'),
+        kind: 'video',
+        name: name ?? nextTrackName(s.project.tracks, 'video'),
+        height: 68,
+        muted: false,
+        hidden: false
+      }
+      const tracks = [...s.project.tracks]
+      tracks.splice(newVideoTrackIndex(tracks), 0, track)
+      return { ...recordHistory(s), project: { ...s.project, tracks } }
+    }),
+
+  removeTrack: (trackId) =>
+    set((s) => {
+      if (!canRemoveTrack(s.project.tracks, trackId)) return {}
+      const clips = { ...s.project.clips }
+      const removed = new Set<string>()
+      for (const c of Object.values(s.project.clips)) {
+        if (c.trackId === trackId) {
+          delete clips[c.id]
+          removed.add(c.id)
+        }
+      }
+      // A ducker keyed off the deleted track would reference a dangling id.
+      const tracks = s.project.tracks
+        .filter((t) => t.id !== trackId)
+        .map((t) => (t.duck?.triggerTrackId === trackId ? { ...t, duck: { ...t.duck, triggerTrackId: null } } : t))
+      return {
+        ...recordHistory(s),
+        project: { ...s.project, tracks, clips },
+        ...pruneSelection(s, removed),
+        selectedTrackId: s.selectedTrackId === trackId ? null : s.selectedTrackId
+      }
+    }),
+
+  moveTrack: (trackId, toIndex) =>
+    set((s) => {
+      const tracks = moveTrackTo(s.project.tracks, trackId, toIndex)
+      if (tracks === s.project.tracks) return {}
+      return { ...recordHistory(s), project: { ...s.project, tracks } }
+    }),
+
+  setTrackHeight: (trackId, height) =>
+    set((s) => {
+      const h = clampTrackHeight(height)
+      const cur = s.project.tracks.find((t) => t.id === trackId)
+      if (!cur || cur.height === h) return {}
+      const tracks = s.project.tracks.map((t) => (t.id === trackId ? { ...t, height: h } : t))
+      return { project: { ...s.project, tracks } }
     }),
 
   selectTrack: (trackId) =>
@@ -1046,6 +1222,14 @@ export const useEditor = create<EditorState>((set) => {
     set((s) => {
       const tracks = s.project.tracks.map((t) =>
         t.id === trackId ? { ...t, comp: { ...(t.comp ?? defaultTrackComp()), ...patch } } : t
+      )
+      return { project: { ...s.project, tracks } }
+    }),
+
+  updateTrackReverb: (trackId, patch) =>
+    set((s) => {
+      const tracks = s.project.tracks.map((t) =>
+        t.id === trackId ? { ...t, reverb: { ...(t.reverb ?? defaultTrackReverb()), ...patch } } : t
       )
       return { project: { ...s.project, tracks } }
     }),
@@ -1169,7 +1353,9 @@ export const useEditor = create<EditorState>((set) => {
     }),
 
   setPlayhead: (sec) => set({ playheadSec: Math.max(0, sec) }),
-  setPlaying: (playing) => set({ isPlaying: playing }),
+  setPlaying: (playing) => set({ isPlaying: playing, shuttleRate: 1 }),
+  setShuttle: (rate) => set({ isPlaying: true, shuttleRate: rate }),
+  setScrubbing: (scrubbing) => set({ scrubbing }),
   setZoom: (pxPerSec) => set({ pxPerSec: Math.min(600, Math.max(10, pxPerSec)) }),
 
   snapshot: () =>
@@ -1203,7 +1389,9 @@ export const useEditor = create<EditorState>((set) => {
       if (s.past.length === 0) return {}
       const prev = s.past[s.past.length - 1]
       // Keep the current media bin (probes/imports are not part of undo history).
-      const project: Project = { ...prev, media: s.project.media }
+      // Reuse the stored object when media is unchanged so undoing back to the
+      // saved state compares equal to savedProject (i.e. reads as clean again).
+      const project: Project = prev.media === s.project.media ? prev : { ...prev, media: s.project.media }
       return {
         project,
         past: s.past.slice(0, -1),
@@ -1216,7 +1404,7 @@ export const useEditor = create<EditorState>((set) => {
     set((s) => {
       if (s.future.length === 0) return {}
       const next = s.future[0]
-      const project: Project = { ...next, media: s.project.media }
+      const project: Project = next.media === s.project.media ? next : { ...next, media: s.project.media }
       return {
         project,
         past: [...s.past, s.project].slice(-HISTORY_LIMIT),
@@ -1225,11 +1413,13 @@ export const useEditor = create<EditorState>((set) => {
       }
     }),
 
-  loadProject: (project, filePath) => {
+  loadProject: (project, filePath, opts) => {
     clipboard = [] // don't leak clips across documents
     set({
       project,
-      savedProject: project,
+      // A recovered project is NOT what's on disk: give savedProject a distinct
+      // object so it reads dirty and closing without saving still prompts.
+      savedProject: opts?.dirty ? { ...project } : project,
       projectFilePath: filePath,
       past: [],
       future: [],
@@ -1239,7 +1429,8 @@ export const useEditor = create<EditorState>((set) => {
       selectedMarkerId: null,
       selectedTrackId: null,
       playheadSec: 0,
-      isPlaying: false
+      isPlaying: false,
+      shuttleRate: 1
     })
   },
 
@@ -1258,14 +1449,18 @@ export const useEditor = create<EditorState>((set) => {
       selectedMarkerId: null,
       selectedTrackId: null,
       playheadSec: 0,
-      isPlaying: false
+      isPlaying: false,
+      shuttleRate: 1
     })
   },
 
-  markSaved: (filePath) =>
+  markSaved: (filePath, project) =>
     set((s) => {
-      void window.cutroom?.clearRecoveryRing()
-      return { savedProject: s.project, projectFilePath: filePath }
+      const saved = project ?? s.project
+      // Only drop the recovery ring when nothing changed during the write;
+      // otherwise it may hold edits newer than what just reached disk.
+      if (saved === s.project) void window.cutroom?.clearRecoveryRing()
+      return { savedProject: saved, projectFilePath: filePath }
     }),
 
   exportOpen: false,

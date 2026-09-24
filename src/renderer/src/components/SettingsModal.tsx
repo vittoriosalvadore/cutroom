@@ -1,7 +1,9 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useEditor } from '../state/store'
 import { useSettings } from '../state/settings'
 import { LANGUAGES, useT } from '../lib/i18n'
+import { clearProxyCache } from '../lib/proxyCache'
+import { formatBytes } from '../lib/proxy'
 
 // Reusable rows -------------------------------------------------------------
 
@@ -82,6 +84,49 @@ function RangeRow(props: {
   )
 }
 
+/** Proxy cache size readout + Clear button (Performance tab). */
+function ProxyCacheRow() {
+  const t = useT()
+  const [info, setInfo] = useState<{ bytes: number; files: number } | null>(null)
+  const [busy, setBusy] = useState(false)
+  const refresh = (): void => {
+    void window.cutroom
+      .proxyCacheInfo()
+      .then(setInfo)
+      .catch(() => setInfo(null))
+  }
+  useEffect(refresh, [])
+  return (
+    <div className="set-row">
+      <div className="set-text">
+        <div className="set-label">
+          {t('Proxy cache')}
+          <em>{info ? formatBytes(info.bytes) : '…'}</em>
+        </div>
+        <div className="set-desc">
+          {t('Proxies are kept in the app data folder and reused across sessions. {n} files.', { n: info?.files ?? 0 })}
+        </div>
+      </div>
+      <div className="set-actions">
+        <button
+          className="btn small"
+          disabled={busy || !info || info.bytes === 0}
+          onClick={async () => {
+            if (!confirm(t('Delete all cached proxies? They can be created again at any time.'))) return
+            setBusy(true)
+            const r = await clearProxyCache()
+            setBusy(false)
+            refresh()
+            if (r.failed !== 0) alert(t('Some proxy files are in use and could not be deleted.'))
+          }}
+        >
+          {t('Clear proxy cache')}
+        </button>
+      </div>
+    </div>
+  )
+}
+
 const ACCENTS = ['#4c8dff', '#4fd6c0', '#8b7bff', '#ff6b8a', '#f4a93c', '#46c98a']
 const TABS = ['Performance', 'Editing', 'Export', 'Appearance'] as const
 type Tab = (typeof TABS)[number]
@@ -113,37 +158,67 @@ export default function SettingsModal() {
             {tab === 'Performance' && (
               <>
                 <Toggle
-                  label="Hardware acceleration"
-                  desc="Use the GPU for decoding & compositing. Requires a restart to take effect."
+                  label={t('Hardware acceleration')}
+                  desc={t('Use the GPU for decoding & compositing. Requires a restart to take effect.')}
                   checked={s.hardwareAcceleration}
                   onChange={(v) => s.set({ hardwareAcceleration: v })}
                 />
                 <Toggle
-                  label="Show placeholders in preview"
-                  desc="Display a card for clips that can't be decoded yet (e.g. while a video buffers)."
+                  label={t('Show placeholders in preview')}
+                  desc={t("Display a card for clips that can't be decoded yet (e.g. while a video buffers).")}
                   checked={s.showPlaceholders}
                   onChange={(v) => s.set({ showPlaceholders: v })}
                 />
+                <Segmented
+                  label={t('Preview quality')}
+                  desc={t('Render the preview at a lower resolution for smoother playback. Export always renders at full resolution.')}
+                  value={s.previewQuality}
+                  options={[
+                    { value: 'full', label: t('Full') },
+                    { value: 'half', label: t('Half') },
+                    { value: 'quarter', label: t('Quarter') }
+                  ]}
+                  onChange={(v) => s.set({ previewQuality: v })}
+                />
+                <Toggle
+                  label={t('Use proxies for preview')}
+                  desc={t('Decode lightweight proxy copies in the preview when they exist. Export always uses the original media.')}
+                  checked={s.useProxies}
+                  onChange={(v) => s.set({ useProxies: v })}
+                />
+                <Toggle
+                  label={t('Create proxies automatically for video larger than 1080p')}
+                  desc={t('Transcodes in the background, one file at a time, when such video is imported.')}
+                  checked={s.autoProxy}
+                  onChange={(v) => s.set({ autoProxy: v })}
+                />
+                <ProxyCacheRow />
               </>
             )}
 
             {tab === 'Editing' && (
               <>
                 <Toggle
-                  label="Snapping"
-                  desc="Snap clip edges to other clips and the playhead while dragging."
+                  label={t('Snapping')}
+                  desc={t('Snap clip edges to other clips and the playhead while dragging.')}
                   checked={s.snapping}
                   onChange={(v) => s.set({ snapping: v })}
                 />
                 <Toggle
-                  label="Show waveforms"
-                  desc="Draw audio waveforms on timeline clips."
+                  label={t('Show waveforms')}
+                  desc={t('Draw audio waveforms on timeline clips.')}
                   checked={s.showWaveforms}
                   onChange={(v) => s.set({ showWaveforms: v })}
                 />
+                <Toggle
+                  label={t('Audio scrubbing')}
+                  desc={t('Play short audio snippets while dragging the playhead or shuttling with J/L.')}
+                  checked={s.audioScrub}
+                  onChange={(v) => s.set({ audioScrub: v })}
+                />
                 <RangeRow
-                  label="Default fade length"
-                  desc="Used for the X crossfade and new fades."
+                  label={t('Default fade length')}
+                  desc={t('Used for the X crossfade and new fades.')}
                   value={s.defaultFadeSec}
                   min={0.1}
                   max={2}
@@ -157,19 +232,19 @@ export default function SettingsModal() {
             {tab === 'Export' && (
               <>
                 <Segmented
-                  label="Encoder speed"
-                  desc="Faster encodes are larger; slower encodes are smaller at the same quality."
+                  label={t('Encoder speed')}
+                  desc={t('Faster encodes are larger; slower encodes are smaller at the same quality.')}
                   value={s.exportPreset}
                   options={[
-                    { value: 'veryfast', label: 'Faster' },
-                    { value: 'medium', label: 'Balanced' },
-                    { value: 'slow', label: 'Best' }
+                    { value: 'veryfast', label: t('Faster') },
+                    { value: 'medium', label: t('Balanced') },
+                    { value: 'slow', label: t('Best') }
                   ]}
                   onChange={(v) => s.set({ exportPreset: v })}
                 />
                 <RangeRow
-                  label="Quality"
-                  desc="Lower CRF = higher quality & bigger file. 20 is a good default."
+                  label={t('Quality')}
+                  desc={t('Lower CRF = higher quality & bigger file. 20 is a good default.')}
                   value={s.exportCrf}
                   min={14}
                   max={28}
@@ -186,17 +261,17 @@ export default function SettingsModal() {
                   label={t('Theme')}
                   value={s.theme}
                   options={[
-                    { value: 'graphite', label: 'Graphite' },
-                    { value: 'midnight', label: 'Midnight' },
-                    { value: 'slate', label: 'Slate' },
-                    { value: 'contrast', label: 'Contrast' }
+                    { value: 'graphite', label: t('Graphite') },
+                    { value: 'midnight', label: t('Midnight') },
+                    { value: 'slate', label: t('Slate') },
+                    { value: 'contrast', label: t('Contrast') }
                   ]}
                   onChange={(v) => s.set({ theme: v })}
                 />
                 <div className="set-row">
                   <div className="set-text">
-                    <div className="set-label">Accent colour</div>
-                    <div className="set-desc">Drives primary buttons and selection.</div>
+                    <div className="set-label">{t('Accent colour')}</div>
+                    <div className="set-desc">{t('Drives primary buttons and selection.')}</div>
                   </div>
                   <div className="set-accents">
                     {ACCENTS.map((c) => (
@@ -208,7 +283,7 @@ export default function SettingsModal() {
                         onClick={() => s.set({ accent: c })}
                       />
                     ))}
-                    <label className="set-swatch set-swatch-custom" title="Custom colour">
+                    <label className="set-swatch set-swatch-custom" title={t('Custom colour')}>
                       <input type="color" value={s.accent} onChange={(e) => s.set({ accent: e.target.value })} />
                     </label>
                   </div>
@@ -217,14 +292,14 @@ export default function SettingsModal() {
                   label={t('Density')}
                   value={s.density}
                   options={[
-                    { value: 'comfortable', label: 'Comfortable' },
-                    { value: 'compact', label: 'Compact' }
+                    { value: 'comfortable', label: t('Comfortable') },
+                    { value: 'compact', label: t('Compact') }
                   ]}
                   onChange={(v) => s.set({ density: v })}
                 />
                 <Toggle
                   label={t('Reduce motion')}
-                  desc="Disable UI transitions and animations."
+                  desc={t('Disable UI transitions and animations.')}
                   checked={s.reduceMotion}
                   onChange={(v) => s.set({ reduceMotion: v })}
                 />
@@ -242,7 +317,7 @@ export default function SettingsModal() {
           <button
             className="btn"
             onClick={() => {
-              if (confirm('Reset all options to their defaults?')) s.reset()
+              if (confirm(t('Reset all options to their defaults?'))) s.reset()
             }}
           >
             {t('Reset to defaults')}

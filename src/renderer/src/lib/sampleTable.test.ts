@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest'
-import { findKeyframeBefore, findSampleAtOrBefore, sampleByteSpan, type SampleEntry } from './sampleTable'
+import {
+  findKeyframeBefore,
+  findSampleAtOrBefore,
+  parseContentRangeTotal,
+  presentationOffsetSec,
+  sampleByteSpan,
+  type SampleEntry
+} from './sampleTable'
 
 // A toy sample table: keyframes at samples 0 and 10 (each sample = 1/30s).
 const samples: SampleEntry[] = Array.from({ length: 25 }, (_, i) => ({
@@ -59,6 +66,51 @@ describe('findSampleAtOrBefore', () => {
     expect(findSampleAtOrBefore(BFRAMES, 3.5)).toBe(1)
     // t=4.2 -> presented frame is cts 4, decode index 5.
     expect(findSampleAtOrBefore(BFRAMES, 4.2)).toBe(5)
+  })
+  it('tolerates float error when the request lands on a frame boundary', () => {
+    const tenths: SampleEntry[] = Array.from({ length: 20 }, (_, i) => s(i / 10, i === 0))
+    // 1.2 - 1.1 = 0.09999999999999987 must still resolve to the frame at 0.1s.
+    expect(findSampleAtOrBefore(tenths, 1.2 - 1.1)).toBe(1)
+    // Export's srcTime = inSec + (t - startSec) * speed for a clip starting at
+    // 1.1s: every output frame must hit its own source frame, never the previous.
+    for (let k = 0; k < 25; k++) {
+      expect(findSampleAtOrBefore(samples, 0 + (1.1 + k / 30 - 1.1) * 1)).toBe(k)
+    }
+  })
+  it('does not select the next frame just because it is close', () => {
+    expect(findSampleAtOrBefore(samples, 11 / 30 - 0.001)).toBe(10)
+  })
+})
+
+describe('presentationOffsetSec', () => {
+  it('uses the edit list media_time (B-frame delay) when present', () => {
+    // 15360 timescale, first cts 1024 (2 frames at 30fps), elst media_time 1024.
+    expect(presentationOffsetSec([{ segment_duration: 10000, media_time: 1024 }], 1024, 15360, 1000)).toBeCloseTo(
+      1024 / 15360
+    )
+  })
+  it('subtracts leading empty edits (a presentation delay)', () => {
+    const edits = [
+      { segment_duration: 500, media_time: -1 }, // 0.5s empty, movie timescale 1000
+      { segment_duration: 10000, media_time: 0 }
+    ]
+    expect(presentationOffsetSec(edits, 0, 90000, 1000)).toBeCloseTo(-0.5)
+  })
+  it('falls back to the minimum cts without an edit list', () => {
+    expect(presentationOffsetSec(undefined, 3000, 30000, 1000)).toBeCloseTo(0.1)
+    expect(presentationOffsetSec([], 0, 30000, 1000)).toBe(0)
+    expect(presentationOffsetSec([{ segment_duration: 5, media_time: -1 }], 600, 600, 600)).toBe(1)
+  })
+})
+
+describe('parseContentRangeTotal', () => {
+  it('reads the total from 206 and 416 forms', () => {
+    expect(parseContentRangeTotal('bytes 0-1048575/5000000')).toBe(5000000)
+    expect(parseContentRangeTotal('bytes */1234')).toBe(1234)
+  })
+  it('returns null when absent or unknown', () => {
+    expect(parseContentRangeTotal(null)).toBeNull()
+    expect(parseContentRangeTotal('bytes 0-99/*')).toBeNull()
   })
 })
 

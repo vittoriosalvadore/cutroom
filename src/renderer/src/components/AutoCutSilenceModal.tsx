@@ -1,6 +1,7 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useEditor } from '../state/store'
 import { detectSilenceRanges, totalRemovedSec, type SilenceCutRange } from '../lib/autoCutSilence'
+import { interpolateParts, useT } from '../lib/i18n'
 
 type Status = 'idle' | 'detecting' | 'preview' | 'error'
 
@@ -18,16 +19,34 @@ export default function AutoCutSilenceModal() {
   const [minSilenceSec, setMinSilenceSec] = useState(0.4)
   const [paddingSec, setPaddingSec] = useState(0.12)
   const [status, setStatus] = useState<Status>('idle')
-  const [ranges, setRanges] = useState<SilenceCutRange[]>([])
+  // Detected ranges are tied to the clip they were computed for, so Apply cuts
+  // THAT clip even if the selection changed since.
+  const [result, setResult] = useState<{ clipId: string; ranges: SilenceCutRange[] } | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // Bumped whenever a run is superseded (close / back / new run); a detection
+  // that resolves with a stale token is dropped instead of landing in the UI.
+  const runToken = useRef(0)
+  const t = useT()
+
+  // Opening or closing (from anywhere) invalidates any in-flight detection and
+  // starts from a clean slate, so a reopen never shows another clip's ranges.
+  useEffect(() => {
+    runToken.current++
+    setStatus('idle')
+    setResult(null)
+    setError(null)
+  }, [open])
 
   if (!open) return null
+  const ranges = result?.ranges ?? []
 
   const analyzable = !!clip && !!media && (media.kind === 'audio' || media.kind === 'video')
   const detecting = status === 'detecting'
 
   const detect = async (): Promise<void> => {
     if (!clip) return
+    const token = ++runToken.current
+    const clipId = clip.id
     setStatus('detecting')
     setError(null)
     try {
@@ -36,31 +55,36 @@ export default function AutoCutSilenceModal() {
         minSilenceSec,
         paddingSec
       })
-      setRanges(found)
+      if (token !== runToken.current) return // cancelled / superseded
+      setResult({ clipId, ranges: found })
       setStatus('preview')
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Silence detection failed.')
+      if (token !== runToken.current) return
+      setError(e instanceof Error ? e.message : t('Silence detection failed.'))
       setStatus('error')
     }
   }
 
   const apply = (): void => {
-    if (!clip) return
-    applySilenceCuts(clip.id, ranges)
+    if (!result) return
+    applySilenceCuts(result.clipId, result.ranges)
+    runToken.current++
     setStatus('idle')
-    setRanges([])
+    setResult(null)
     setOpen(false)
   }
 
   const back = (): void => {
+    runToken.current++
     setStatus('idle')
-    setRanges([])
+    setResult(null)
     setError(null)
   }
 
   const close = (): void => {
+    runToken.current++
     setStatus('idle')
-    setRanges([])
+    setResult(null)
     setError(null)
     setOpen(false)
   }
@@ -70,30 +94,45 @@ export default function AutoCutSilenceModal() {
   return (
     <div className="modal-backdrop" onClick={close}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <div className="modal-head">Auto-Cut Silence</div>
+        <div className="modal-head">{t('Auto-Cut Silence')}</div>
         <div className="modal-body">
           {!analyzable ? (
-            <p className="modal-error">Select an audio or video clip first.</p>
+            <p className="modal-error">{t('Select an audio or video clip first.')}</p>
           ) : status === 'preview' ? (
             <>
               <p className="modal-note">
-                Found <strong>{ranges.length}</strong> silent range{ranges.length === 1 ? '' : 's'} in{' '}
-                <strong>{media?.name}</strong>, totalling <strong>{removedSec.toFixed(1)}s</strong>. Nothing has
-                been changed yet — Apply commits the cut as one undo step.
+                {interpolateParts(
+                  ranges.length === 1
+                    ? t('Found {n} silent range in {name}, totalling {total}.')
+                    : t('Found {n} silent ranges in {name}, totalling {total}.'),
+                  {
+                    n: <strong key="n">{ranges.length}</strong>,
+                    name: <strong key="name">{media?.name}</strong>,
+                    total: <strong key="total">{removedSec.toFixed(1)}s</strong>
+                  }
+                )}{' '}
+                {t('Nothing has been changed yet — Apply commits the cut as one undo step.')}
               </p>
               {ranges.length === 0 && (
-                <p className="modal-note">Nothing under the threshold — try a higher threshold or shorter minimum.</p>
+                <p className="modal-note">
+                  {t('Nothing under the threshold — try a higher threshold or shorter minimum.')}
+                </p>
               )}
             </>
           ) : (
             <>
               <p className="modal-note">
-                Detects quiet ranges in <strong>{media?.name}</strong>'s audio and ripple-deletes them. Runs
-                entirely on your machine — nothing is applied until you review and confirm.
+                {interpolateParts(
+                  t(
+                    "Detects quiet ranges in {name}'s audio and ripple-deletes them. Runs entirely on your machine — nothing is applied until you review and confirm."
+                  ),
+                  { name: <strong key="name">{media?.name}</strong> }
+                )}
               </p>
               <label className="insp-field">
                 <span className="insp-label">
-                  Threshold<em>{thresholdDb} dB</em>
+                  {t('Threshold')}
+                  <em>{thresholdDb} dB</em>
                 </span>
                 <input
                   type="range"
@@ -107,7 +146,8 @@ export default function AutoCutSilenceModal() {
               </label>
               <label className="insp-field">
                 <span className="insp-label">
-                  Min silence<em>{Math.round(minSilenceSec * 1000)}ms</em>
+                  {t('Min silence')}
+                  <em>{Math.round(minSilenceSec * 1000)}ms</em>
                 </span>
                 <input
                   type="range"
@@ -121,7 +161,8 @@ export default function AutoCutSilenceModal() {
               </label>
               <label className="insp-field">
                 <span className="insp-label">
-                  Padding<em>{Math.round(paddingSec * 1000)}ms</em>
+                  {t('Padding')}
+                  <em>{Math.round(paddingSec * 1000)}ms</em>
                 </span>
                 <input
                   type="range"
@@ -133,7 +174,7 @@ export default function AutoCutSilenceModal() {
                   onChange={(e) => setPaddingSec(Number(e.target.value))}
                 />
               </label>
-              {detecting && <p className="modal-note">Analyzing audio…</p>}
+              {detecting && <p className="modal-note">{t('Analyzing audio…')}</p>}
               {status === 'error' && error && <p className="modal-error">{error}</p>}
             </>
           )}
@@ -142,20 +183,20 @@ export default function AutoCutSilenceModal() {
           {status === 'preview' ? (
             <>
               <button className="btn" onClick={back}>
-                Back
+                {t('Back')}
               </button>
               <button className="btn primary" onClick={apply} disabled={ranges.length === 0}>
-                Apply
+                {t('Apply')}
               </button>
             </>
           ) : (
             <>
               <button className="btn" onClick={close}>
-                Cancel
+                {t('Cancel')}
               </button>
               {analyzable && (
                 <button className="btn primary" onClick={detect} disabled={detecting}>
-                  {status === 'error' ? 'Retry' : 'Detect'}
+                  {status === 'error' ? t('Retry') : t('Detect')}
                 </button>
               )}
             </>

@@ -5,8 +5,11 @@ import { getAudioEntry, type AudioEntry } from './audioCache'
 import { getDenoiseEntry, type DenoiseEntry } from './denoiseCache'
 import { computeFadeSchedule, fadeGainAt } from './fades'
 import { setMeterAnalyser } from './audioMeter'
-import { resolveDuck } from '../state/selectors'
+import { resolveDuck, resolveReverb } from '../state/selectors'
+import { generateReverbIR, reverbMixGains, reverbShapeKey, type ReverbShape } from '../../../shared/reverb'
 import type { VideoPool } from './videoPool'
+import { getScrubAudio } from './scrubAudioCache'
+import { grainEnvelope, grainSpan, reverseInto, scrubTargets, shouldGrain, type ScrubThrottle } from './scrub'
 
 /**
  * Which AudioBuffer (if any) should back a clip's preview playback this
@@ -56,6 +59,26 @@ function ensureDynamicsWorklet(ctx: AudioContext): void {
     })
 }
 
+/**
+ * Node options for the per-track dynamics worklet. channelCount 2 +
+ * 'explicit' makes WebAudio down-mix any source (5.1 → stereo) BEFORE the
+ * processor: its per-channel filter state is stereo-sized, and a 6-channel
+ * input would turn the biquads to NaN and silence the track for good.
+ * Exported so the test can pin this down.
+ */
+export const DYNAMICS_NODE_OPTIONS: AudioWorkletNodeOptions = {
+  numberOfInputs: 2,
+  numberOfOutputs: 1,
+  outputChannelCount: [2],
+  channelCount: 2,
+  channelCountMode: 'explicit',
+  channelInterpretation: 'speakers'
+}
+
+/** Message that makes the dynamics processor return false from process(),
+ *  so the audio thread can release it once the node is disconnected. */
+export const DYNAMICS_DISPOSE_MESSAGE = 'dispose'
+
 // ---------------------------------------------------------------------------
 // Realtime preview audio. The rAF playhead is the sole clock; this engine is a
 // one-way follower. sync() is the audio analogue of compositor.render.
@@ -78,26 +101,83 @@ interface LiveSource {
 }
 
 interface VideoAudio {
+  /** The element this tap was made from; the video pool may dispose and
+   *  recreate a clip's element (idle eviction), making the tap stale. */
+  el: HTMLVideoElement
   source: MediaElementAudioSourceNode
   gain: GainNode
   wanted: boolean
 }
 
 const DRIFT_TOLERANCE = 0.05
+/** A changed reverb shape must hold this long before its IR is rebuilt:
+ *  generating the IR (+ the convolver's own preprocessing) costs tens of ms
+ *  on the main thread, so rebuilding mid-drag would stutter playback. */
+const REVERB_SETTLE_MS = 250
+/** Let the wet gain fade out before the convolver is unhooked (saves CPU). */
+const REVERB_UNHOOK_MS = 200
+/** Safety cap on scrub grains in flight (they normally number 1–2 per clip). */
+const MAX_GRAINS = 24
+
+/**
+ * Build the ConvolverNode buffer for a reverb shape: the SAME samples the export
+ * writes to its afir IR WAV (src/shared/reverb.ts), at the context's rate.
+ */
+export function buildReverbBuffer(ctx: BaseAudioContext, shape: ReverbShape): AudioBuffer {
+  const [l, r] = generateReverbIR(shape, ctx.sampleRate)
+  const buf = ctx.createBuffer(2, l.length, ctx.sampleRate)
+  buf.getChannelData(0).set(l)
+  buf.getChannelData(1).set(r)
+  return buf
+}
+
+/**
+ * A track's reverb send: tap -> convolver -> wet -> its own panner -> master.
+ * A separate panner (not the dry one) keeps the dry path's channel count, and
+ * so its pan law, exactly what it is without reverb; the export mirrors it by
+ * panning its dry and wet branches separately. The convolver runs with
+ * normalize = false: the IR is already level-normalized, and afir on export
+ * applies no auto-gain either (irnorm=-1), so wet levels match.
+ */
+interface ReverbSend {
+  convolver: ConvolverNode | null
+  wet: GainNode
+  panner: StereoPannerNode
+  /** reverbShapeKey of the loaded IR. */
+  key: string
+  /** Latest requested shape key and when it was first seen (settle timer). */
+  pendingKey: string
+  pendingSince: number
+  /** Whether tap -> convolver is connected. */
+  hooked: boolean
+  unhookTimer: number
+}
+
+interface TrackChain {
+  input: GainNode
+  dynamics: AudioWorkletNode | null
+  /** Unity node after [dynamics]: the dry/wet split point. */
+  tap: GainNode
+  dry: GainNode
+  panner: StereoPannerNode
+  reverb: ReverbSend | null
+}
 
 export class AudioPool {
   private ctx: AudioContext
   private master: DynamicsCompressorNode
   private analyser: AnalyserNode
-  private trackChains = new Map<
-    string,
-    { input: GainNode; dynamics: AudioWorkletNode | null; panner: StereoPannerNode }
-  >()
+  private trackChains = new Map<string, TrackChain>()
   private trackMuted = new Map<string, boolean>()
   // trackId -> the trigger track currently wired into its duck sidechain input.
   private duckEdges = new Map<string, string>()
   private live = new Map<string, LiveSource>()
+  /** Keyed by clip id, like the video pool: overlapping clips of one file each
+   *  get their own element and gain. */
   private videoAudio = new Map<string, VideoAudio>()
+  /** Scrub grains in flight: short one-shots that disconnect themselves on end. */
+  private grains = new Map<AudioBufferSourceNode, GainNode>()
+  private scrubThrottle: ScrubThrottle | null = null
 
   constructor() {
     this.ctx = getAudioContext()
@@ -117,10 +197,23 @@ export class AudioPool {
     setMeterAnalyser(this.analyser)
   }
 
+  /** Disconnect and forget a clip's element tap. */
+  private dropVideoAudio(clipId: string, v: VideoAudio): void {
+    try {
+      v.source.disconnect()
+      v.gain.disconnect()
+    } catch {
+      /* already gone */
+    }
+    this.videoAudio.delete(clipId)
+  }
+
   /** Lazily route a <video> element's audio through WebAudio. Returns its gain. */
-  private ensureVideoAudio(mediaId: string, el: HTMLVideoElement): VideoAudio | null {
-    const existing = this.videoAudio.get(mediaId)
-    if (existing) return existing
+  private ensureVideoAudio(clipId: string, el: HTMLVideoElement): VideoAudio | null {
+    const existing = this.videoAudio.get(clipId)
+    if (existing && existing.el === el) return existing
+    // The pool replaced the element: drop the dead tap and tap the new one.
+    if (existing) this.dropVideoAudio(clipId, existing)
     try {
       const source = this.ctx.createMediaElementSource(el)
       const gain = this.ctx.createGain()
@@ -128,8 +221,8 @@ export class AudioPool {
       source.connect(gain)
       gain.connect(this.master)
       el.muted = false // audio now flows through WebAudio; controlled by `gain`
-      const entry: VideoAudio = { source, gain, wanted: true }
-      this.videoAudio.set(mediaId, entry)
+      const entry: VideoAudio = { el, source, gain, wanted: true }
+      this.videoAudio.set(clipId, entry)
       return entry
     } catch {
       // createMediaElementSource throws if the element was already tapped.
@@ -139,18 +232,24 @@ export class AudioPool {
 
   /**
    * Per-track input node. Chain: gain (mute + audioGain dB) -> [dynamics] ->
-   * stereo panner -> master. The dynamics worklet (gate/duck) is inserted ONCE,
+   * tap -> dry -> stereo panner -> master, plus an optional reverb send off the
+   * tap (see ReverbSend). The dynamics worklet (gate/duck) is inserted ONCE,
    * the first time a track needs it and the module is ready; thereafter it stays
    * and just runs passthrough when gate/duck are off, so toggling never reclicks.
+   * tap and dry are unity gains when reverb is off, so the dry path is unchanged.
    */
   private trackInput(track: Track, project: Project): GainNode {
     let chain = this.trackChains.get(track.id)
     if (!chain) {
       const input = this.ctx.createGain()
+      const tap = this.ctx.createGain()
+      const dry = this.ctx.createGain()
       const panner = this.ctx.createStereoPanner()
-      input.connect(panner)
+      input.connect(tap)
+      tap.connect(dry)
+      dry.connect(panner)
       panner.connect(this.master)
-      chain = { input, dynamics: null, panner }
+      chain = { input, dynamics: null, tap, dry, panner, reverb: null }
       this.trackChains.set(track.id, chain)
     }
     const muted = !!track.muted
@@ -171,17 +270,13 @@ export class AudioPool {
       !!track.gate?.enabled || !!track.eq?.enabled || !!track.comp?.enabled || resolved != null
     if (needsFx && !chain.dynamics && workletReady && !workletFailed) {
       try {
-        const node = new AudioWorkletNode(this.ctx, 'cutroom-dynamics', {
-          numberOfInputs: 2,
-          numberOfOutputs: 1,
-          outputChannelCount: [2]
-        })
+        const node = new AudioWorkletNode(this.ctx, 'cutroom-dynamics', DYNAMICS_NODE_OPTIONS)
         // The worklet starts passthrough (gain 1), so swapping it in is
-        // sample-continuous. Disconnect ONLY the input->panner edge so any
+        // sample-continuous. Disconnect ONLY the input->tap edge so any
         // sidechain taps from this input (it may be a duck trigger) survive.
-        chain.input.disconnect(chain.panner)
+        chain.input.disconnect(chain.tap)
         chain.input.connect(node)
-        node.connect(chain.panner)
+        node.connect(chain.tap)
         chain.dynamics = node
       } catch (e) {
         workletFailed = true
@@ -220,7 +315,83 @@ export class AudioPool {
       set('duckAttackMs', resolved?.attackMs ?? 15)
       set('duckReleaseMs', resolved?.releaseMs ?? 250)
     }
+    this.syncReverb(track, chain)
     return chain.input
+  }
+
+  /**
+   * Reconcile a track's reverb send with its settings. The ConvolverNode is
+   * created on first use and rebuilt (a fresh node, swapped in) only when the
+   * IR shape changes — throttled so dragging the decay slider doesn't
+   * regenerate a multi-second IR every frame. Turning reverb off fades the wet
+   * gain, then unhooks the convolver so an idle reverb costs no CPU.
+   */
+  private syncReverb(track: Track, chain: TrackChain): void {
+    const rv = resolveReverb(track)
+    const now = this.ctx.currentTime
+    const { dry, wet } = reverbMixGains(rv ? rv.mix : 0)
+    chain.dry.gain.setTargetAtTime(dry, now, 0.01)
+    let send = chain.reverb
+    if (!rv) {
+      if (send?.hooked && !send.unhookTimer) {
+        send.wet.gain.setTargetAtTime(0, now, 0.01)
+        const s = send
+        s.unhookTimer = window.setTimeout(() => {
+          s.unhookTimer = 0
+          if (s.convolver && s.hooked) {
+            try {
+              chain.tap.disconnect(s.convolver)
+            } catch {
+              /* already gone */
+            }
+          }
+          s.hooked = false
+        }, REVERB_UNHOOK_MS)
+      }
+      return
+    }
+    if (!send) {
+      const wetGain = this.ctx.createGain()
+      wetGain.gain.value = 0
+      const panner = this.ctx.createStereoPanner()
+      wetGain.connect(panner)
+      panner.connect(this.master)
+      send = { convolver: null, wet: wetGain, panner, key: '', pendingKey: '', pendingSince: 0, hooked: false, unhookTimer: 0 }
+      chain.reverb = send
+    }
+    if (send.unhookTimer) {
+      window.clearTimeout(send.unhookTimer)
+      send.unhookTimer = 0
+    }
+    const key = reverbShapeKey(rv, this.ctx.sampleRate)
+    const wall = performance.now()
+    if (send.key !== key && send.pendingKey !== key) {
+      send.pendingKey = key
+      send.pendingSince = wall
+    }
+    if (send.key !== key && (!send.convolver || wall - send.pendingSince >= REVERB_SETTLE_MS)) {
+      try {
+        const conv = this.ctx.createConvolver()
+        conv.normalize = false // must be set before the buffer to take effect
+        conv.buffer = buildReverbBuffer(this.ctx, rv)
+        conv.connect(send.wet)
+        if (send.convolver) {
+          if (send.hooked) chain.tap.disconnect(send.convolver)
+          send.convolver.disconnect()
+        }
+        send.convolver = conv
+        send.hooked = false
+        send.key = key
+      } catch (e) {
+        console.warn('[cutroom] could not build reverb', e)
+      }
+    }
+    if (send.convolver && !send.hooked) {
+      chain.tap.connect(send.convolver)
+      send.hooked = true
+    }
+    send.wet.gain.setTargetAtTime(wet, now, 0.01)
+    send.panner.pan.setTargetAtTime(Math.max(-1, Math.min(1, track.pan ?? 0)), now, 0.01)
   }
 
   /**
@@ -345,6 +516,7 @@ export class AudioPool {
   /** Reconcile playing sources to the playhead. Call after each render. */
   sync(project: Project, playhead: number, playing: boolean, videoPool?: VideoPool): void {
     const now = this.ctx.currentTime
+    this.pruneTrackChains(project)
     if (!playing) {
       for (const id of [...this.live.keys()]) this.stopClip(id)
       for (const v of this.videoAudio.values()) v.gain.gain.setTargetAtTime(0, now, 0.01)
@@ -387,9 +559,9 @@ export class AudioPool {
       } else if (track.kind === 'video' && videoPool && clip.mediaId) {
         const media = project.media[clip.mediaId]
         if (!media || media.kind !== 'video' || !media.path) continue
-        const el = videoPool.getElement(clip.mediaId)
+        const el = videoPool.getElement(clip.id)
         if (!el) continue
-        const va = this.ensureVideoAudio(clip.mediaId, el)
+        const va = this.ensureVideoAudio(clip.id, el)
         if (!va) continue
         va.wanted = true
         const env = fadeGainAt(playhead - clip.startSec, {
@@ -409,32 +581,150 @@ export class AudioPool {
     for (const [id, ls] of [...this.live.entries()]) {
       if (!ls.wanted) this.stopClip(id)
     }
-    for (const v of this.videoAudio.values()) {
-      if (!v.wanted) v.gain.gain.setTargetAtTime(0, now, 0.01)
+    for (const [id, v] of [...this.videoAudio.entries()]) {
+      if (v.wanted) continue
+      // The pool evicted this clip's element (or the clip is gone): drop the
+      // tap so per-clip keys (new ids on every split) don't pile up.
+      if (videoPool && videoPool.getElement(id) !== v.el) this.dropVideoAudio(id, v)
+      else v.gain.gain.setTargetAtTime(0, now, 0.01)
     }
   }
 
+  /** Disconnect a track chain and release its worklet processor. */
+  private disposeChain(chain: TrackChain): void {
+    try {
+      chain.input.disconnect()
+      chain.dynamics?.port.postMessage(DYNAMICS_DISPOSE_MESSAGE)
+      chain.dynamics?.disconnect()
+      chain.tap.disconnect()
+      chain.dry.disconnect()
+      chain.panner.disconnect()
+      if (chain.reverb) {
+        window.clearTimeout(chain.reverb.unhookTimer)
+        chain.reverb.convolver?.disconnect()
+        chain.reverb.wet.disconnect()
+        chain.reverb.panner.disconnect()
+      }
+    } catch {
+      /* already gone */
+    }
+  }
+
+  /**
+   * Tear down chains of tracks that no longer exist (deleted, or undone past
+   * their creation) so their nodes and dynamics worklet don't run forever.
+   * An undo that brings the track back simply rebuilds it via trackInput.
+   */
+  private pruneTrackChains(project: Project): void {
+    if (this.trackChains.size === 0) return
+    const ids = new Set(project.tracks.map((t) => t.id))
+    for (const [id, chain] of [...this.trackChains.entries()]) {
+      if (ids.has(id)) continue
+      this.disposeChain(chain)
+      this.trackChains.delete(id)
+      this.trackMuted.delete(id)
+      this.duckEdges.delete(id)
+      // Its input fed other tracks' sidechains; disconnect() above cut those edges.
+      for (const [ducked, trigger] of [...this.duckEdges.entries()]) {
+        if (trigger === id) this.duckEdges.delete(ducked)
+      }
+    }
+  }
+
+  /**
+   * Audio scrubbing (see lib/scrub): play one short windowed grain of every
+   * buffer-backed clip under timeline time `timeSec`, through its track chain
+   * (so mute / gain / pan / FX / reverb all apply). `direction` -1 plays the
+   * audio just before the playhead, reversed. Throttled internally, so it is
+   * safe to call on every playhead change while scrubbing or shuttling.
+   * Returns the number of grains started (0 when throttled or nothing to play).
+   */
+  scrub(project: Project, timeSec: number, direction: 1 | -1): number {
+    const nowMs = performance.now()
+    if (!shouldGrain(this.scrubThrottle, nowMs, timeSec)) return 0
+    this.scrubThrottle = { lastMs: nowMs, lastTime: timeSec }
+    if (this.grains.size >= MAX_GRAINS) return 0
+    const targets = scrubTargets(
+      project,
+      timeSec,
+      (clip, track) =>
+        resolvePreviewBuffer(
+          clip,
+          track,
+          clip.mediaId ? getAudioEntry(clip.mediaId) : undefined,
+          clip.mediaId ? getDenoiseEntry(clip.mediaId) : undefined
+        ) ??
+        // Plain video clips play through their <video> element, which can't do
+        // grains — scrub from the light copy of their audio instead.
+        (track.kind === 'video' && clip.mediaId ? getScrubAudio(clip.mediaId) : null)
+    )
+    if (targets.length === 0) return 0
+    resumeAudioContext()
+    const ctx = this.ctx
+    const t0 = ctx.currentTime
+    let started = 0
+    for (const { clip, track, buffer, srcOffset, gain } of targets) {
+      const span = grainSpan(srcOffset, clip, direction, buffer.duration)
+      if (!span) continue
+      const speed = clip.speed && clip.speed > 0 ? clip.speed : 1
+      const source = ctx.createBufferSource()
+      if (direction < 0) {
+        // A fresh little buffer holding the span backwards (~3.4k frames/ch).
+        const s0 = Math.floor(span.start * buffer.sampleRate)
+        const n = Math.max(1, Math.min(buffer.length - s0, Math.round(span.dur * buffer.sampleRate)))
+        const rev = ctx.createBuffer(buffer.numberOfChannels, n, buffer.sampleRate)
+        for (let c = 0; c < buffer.numberOfChannels; c++) {
+          reverseInto(buffer.getChannelData(c), s0, n, rev.getChannelData(c))
+        }
+        source.buffer = rev
+      } else {
+        source.buffer = buffer
+      }
+      source.playbackRate.value = speed // same pitch as 1× playback
+      const g = ctx.createGain()
+      const wallDur = span.dur / speed
+      g.gain.cancelScheduledValues(t0)
+      for (const op of grainEnvelope(gain, wallDur)) {
+        if (op.kind === 'set') g.gain.setValueAtTime(op.value, t0 + op.atOffset)
+        else g.gain.linearRampToValueAtTime(op.value, t0 + op.atOffset)
+      }
+      source.connect(g)
+      g.connect(this.trackInput(track, project))
+      if (direction < 0) source.start(t0, 0, span.dur)
+      else source.start(t0, span.start, span.dur)
+      source.onended = (): void => {
+        try {
+          source.disconnect()
+          g.disconnect()
+        } catch {
+          /* already gone */
+        }
+        this.grains.delete(source)
+      }
+      this.grains.set(source, g)
+      started += 1
+    }
+    // A ducked track's sidechain may never have been wired if nothing has played yet.
+    if (started) this.syncDuckEdges(project)
+    return started
+  }
+
   dispose(): void {
+    for (const [source, g] of this.grains) {
+      try {
+        source.onended = null
+        source.stop()
+        source.disconnect()
+        g.disconnect()
+      } catch {
+        /* already gone */
+      }
+    }
+    this.grains.clear()
     for (const id of [...this.live.keys()]) this.stopClip(id)
-    for (const v of this.videoAudio.values()) {
-      try {
-        v.source.disconnect()
-        v.gain.disconnect()
-      } catch {
-        /* already gone */
-      }
-    }
-    this.videoAudio.clear()
+    for (const [id, v] of [...this.videoAudio.entries()]) this.dropVideoAudio(id, v)
     this.duckEdges.clear()
-    for (const chain of this.trackChains.values()) {
-      try {
-        chain.input.disconnect()
-        chain.dynamics?.disconnect()
-        chain.panner.disconnect()
-      } catch {
-        /* already gone */
-      }
-    }
+    for (const chain of this.trackChains.values()) this.disposeChain(chain)
     setMeterAnalyser(null)
     try {
       this.analyser.disconnect()

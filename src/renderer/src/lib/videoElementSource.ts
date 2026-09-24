@@ -12,14 +12,22 @@ import { mediaUrl } from './media'
 // While paused, ignore seek requests within this many seconds of the current
 // position so scrubbing doesn't fire a storm of redundant seeks.
 const SEEK_EPSILON = 0.04
-// While playing, only hard-correct the element if it drifts past this.
-const DRIFT_TOLERANCE = 0.3
+// While playing, the element (often just the AUDIO companion of a
+// frame-exact WebCodecs picture) must track the playhead tightly. Small drift
+// is steered out by nudging playbackRate — a hard seek on a playing element
+// takes long enough to re-create the drift and thrash. Only large drift seeks.
+const SYNC_TOLERANCE = 0.06 // start nudging past this (s)
+const SYNC_SETTLED = 0.015 // stop nudging once back within this (s)
+const RATE_NUDGE = 0.05 // ±5% rate while catching up (~0.05s per second)
+const HARD_RESYNC = 0.3 // seek instead past this (s)
 
 export class VideoElementSource implements VideoSource {
   private el: HTMLVideoElement
   private wantedThisFrame = false
   private lastSeek = -1
   private _ready = false
+  /** -1 = slowing down (element ahead), +1 = speeding up (behind), 0 = none. */
+  private nudge = 0
 
   constructor(
     path: string,
@@ -61,26 +69,39 @@ export class VideoElementSource implements VideoSource {
     const el = this.el
     if (el.readyState < 1) return // no metadata/dimensions yet
 
-    if (el.playbackRate !== speed) el.playbackRate = speed
-    el.preservesPitch = false
+    // Speed changes pitch like tape (matches the audio-track path). At 1x the
+    // only rate change is the small sync nudge, which shouldn't warble.
+    el.preservesPitch = speed === 1
 
     const dur = el.duration || 0
     const target = dur > 0 ? Math.min(Math.max(0, srcTime), Math.max(0, dur - 0.05)) : Math.max(0, srcTime)
 
     if (playing) {
       if (el.paused) {
+        this.nudge = 0
         el.currentTime = target
         void el.play().catch(() => undefined)
-      } else if (Math.abs(el.currentTime - target) > DRIFT_TOLERANCE) {
-        el.currentTime = target
+      } else if (!el.seeking) {
+        const drift = el.currentTime - target // > 0: element is ahead
+        if (Math.abs(drift) > HARD_RESYNC) {
+          this.nudge = 0
+          el.currentTime = target
+        } else if (Math.abs(drift) > SYNC_TOLERANCE) {
+          this.nudge = drift > 0 ? -1 : 1
+        } else if (Math.abs(drift) < SYNC_SETTLED) {
+          this.nudge = 0
+        }
       }
     } else {
+      this.nudge = 0
       if (!el.paused) el.pause()
       if (Math.abs(el.currentTime - target) > SEEK_EPSILON && Math.abs(this.lastSeek - target) > 0.001) {
         this.lastSeek = target
         el.currentTime = target
       }
     }
+    const rate = speed * (1 + this.nudge * RATE_NUDGE)
+    if (el.playbackRate !== rate) el.playbackRate = rate
   }
 
   seekTo(srcTime: number): Promise<void> {

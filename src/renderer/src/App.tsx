@@ -3,9 +3,14 @@ import { useEditor } from './state/store'
 import { useSettings } from './state/settings'
 import { probeAudio, probeImage, probeVideo } from './lib/probe'
 import { ensureAudioDecoded } from './lib/audioCache'
+import { ensureScrubAudio } from './lib/scrubAudioCache'
 import { serializeProject } from './lib/projectFile'
+import { timelineDuration } from './lib/exporter'
 import { createNewProject, openProject, saveProject } from './lib/projectIO'
 import { useT } from './lib/i18n'
+import { ensureProxy, getProxyEntry, lookupProxies } from './lib/proxyCache'
+import { shouldAutoProxy } from './lib/proxy'
+import { advancePlayhead, nextShuttleRate, playStartSec, SLIDER_KEYS, stepFrames } from './lib/transport'
 import MediaBin from './components/MediaBin'
 import Preview from './components/Preview'
 import Timeline from './components/Timeline'
@@ -20,7 +25,10 @@ import AutoCutSilenceModal from './components/AutoCutSilenceModal'
 
 /**
  * Drives the playhead while playing. Uses requestAnimationFrame and reads the
- * latest playhead via getState() each tick to avoid stale-closure drift.
+ * latest playhead + shuttle rate via getState() each tick to avoid stale-closure
+ * drift (a J/K/L rate change mid-play doesn't restart the loop). Forward play
+ * stops at the timeline end, reverse at 0; pressing play while parked at (or
+ * past) the end restarts from 0 (lib/transport).
  */
 function usePlaybackClock(): void {
   const isPlaying = useEditor((s) => s.isPlaying)
@@ -29,12 +37,24 @@ function usePlaybackClock(): void {
 
   useEffect(() => {
     if (!isPlaying) return
+    const st0 = useEditor.getState()
+    const start = playStartSec(st0.playheadSec, st0.shuttleRate, timelineDuration(st0.project))
+    if (start === null) {
+      st0.setPlaying(false) // nothing to play
+      return
+    }
+    if (start !== st0.playheadSec) st0.setPlayhead(start)
     last.current = performance.now()
     const tick = (now: number): void => {
       const dt = (now - last.current) / 1000
       last.current = now
       const st = useEditor.getState()
-      st.setPlayhead(st.playheadSec + dt)
+      const next = advancePlayhead(st.playheadSec, dt, st.shuttleRate, timelineDuration(st.project))
+      st.setPlayhead(next.sec)
+      if (next.stop) {
+        st.setPlaying(false)
+        return
+      }
       raf.current = requestAnimationFrame(tick)
     }
     raf.current = requestAnimationFrame(tick)
@@ -60,7 +80,11 @@ function useMediaProbe(): void {
       probed.current.add(m.id)
       if (m.kind === 'video') {
         probeVideo(m.path)
-          .then((r) => setMediaInfo(m.id, r))
+          .then((r) => {
+            setMediaInfo(m.id, r)
+            // Light copy of its audio for audio scrubbing (background, queued in main).
+            ensureScrubAudio(m.id, m.path, r.durationSec)
+          })
           .catch(() => undefined)
       } else if (m.kind === 'image') {
         probeImage(m.path)
@@ -102,6 +126,30 @@ function useAudioProbe(): void {
       }
     }
   }, [media])
+}
+
+/**
+ * Proxy state is derived at runtime, never saved: every video in the project
+ * asks main once whether a proxy already exists in the userData cache (from an
+ * earlier session). With the auto option on, probed video larger than 1080p
+ * gets one queued — once per path per session, so cancelling or clearing the
+ * cache doesn't immediately re-queue it.
+ */
+function useProxyLookup(): void {
+  const media = useEditor((s) => s.project.media)
+  const autoProxy = useSettings((s) => s.autoProxy)
+  const autoQueued = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    const videos = Object.values(media).filter((m) => m.kind === 'video' && m.path)
+    void lookupProxies(videos.map((m) => m.path)).then(() => {
+      if (!autoProxy) return
+      for (const m of videos) {
+        if (!shouldAutoProxy(m) || autoQueued.current.has(m.path) || getProxyEntry(m.path)) continue
+        autoQueued.current.add(m.path)
+        void ensureProxy(m.path, m.durationSec)
+      }
+    })
+  }, [media, autoProxy])
 }
 
 /** Debounced autosave to the crash-recovery file whenever the project changes. */
@@ -167,11 +215,68 @@ function useDocumentTitle(): void {
   }, [name, dirty])
 }
 
-/** Global keyboard shortcuts. Ignored while typing in an input. */
+/**
+ * Prompt before the window closes/reloads with unsaved changes. The renderer
+ * only vetoes the unload; the main process turns that veto into a native
+ * confirm dialog via 'will-prevent-unload'. (A dev HMR full reload of a dirty
+ * project prompts too, which is harmless.)
+ */
+function useUnsavedGuard(): void {
+  useEffect(() => {
+    const onBeforeUnload = (e: BeforeUnloadEvent): void => {
+      const st = useEditor.getState()
+      if (st.project === st.savedProject) return
+      e.preventDefault()
+      e.returnValue = '' // legacy requirement for Chromium to honour the veto
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [])
+}
+
+// <input> types that take typed text — shortcuts must not steal their keys.
+// Range/checkbox/color/radio/button inputs are deliberately NOT here: after
+// dragging a slider focus stays on it, and Space/Ctrl+Z should still work.
+const TEXT_INPUT_TYPES = new Set([
+  'text',
+  'number',
+  'search',
+  'email',
+  'password',
+  'url',
+  'tel',
+  'date',
+  'datetime-local',
+  'month',
+  'time',
+  'week'
+])
+
+/** True when keystrokes on `el` belong to a text-editing control. */
+function isTextEditingTarget(el: EventTarget | null): boolean {
+  if (!(el instanceof HTMLElement)) return false
+  if (el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) return true
+  if (el instanceof HTMLInputElement) return TEXT_INPUT_TYPES.has(el.type)
+  return el.isContentEditable
+}
+
+/** True while any modal dialog is up (store-driven or self-managed). */
+function isModalOpen(): boolean {
+  const st = useEditor.getState()
+  if (st.exportOpen || st.transcribeOpen || st.settingsOpen || st.reframeOpen || st.autoCutSilenceOpen) return true
+  // Self-managed modals (e.g. RecoveryModal) keep their open state locally;
+  // every modal renders a .modal-backdrop, so the DOM is the catch-all.
+  return document.querySelector('.modal-backdrop') !== null
+}
+
+/** Global keyboard shortcuts. Ignored while typing in a text control or while a modal is open. */
 function useShortcuts(): void {
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
+      if (isTextEditingTarget(e.target) || isModalOpen()) return
+      // A focused slider owns its navigation keys (←/→ nudge it, Home/End jump);
+      // other shortcuts (Space, Ctrl+Z, S…) still apply after touching one.
+      if (e.target instanceof HTMLInputElement && e.target.type === 'range' && SLIDER_KEYS.has(e.key)) return
       const st = useEditor.getState()
       const meta = e.ctrlKey || e.metaKey
 
@@ -229,6 +334,21 @@ function useShortcuts(): void {
       if (e.code === 'Space') {
         e.preventDefault()
         st.setPlaying(!st.isPlaying)
+      } else if (e.key === 'l' || e.key === 'L') {
+        // L / J: shuttle forward / reverse; repeat presses double up to 4×.
+        st.setShuttle(nextShuttleRate(st.shuttleRate, st.isPlaying, 1))
+      } else if (e.key === 'j' || e.key === 'J') {
+        st.setShuttle(nextShuttleRate(st.shuttleRate, st.isPlaying, -1))
+      } else if (e.key === 'k' || e.key === 'K') {
+        st.setPlaying(false)
+      } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        // Frame step (Shift = one second), always from a paused playhead.
+        e.preventDefault()
+        const dir = e.key === 'ArrowRight' ? 1 : -1
+        const fps = st.project.fps
+        const frames = e.shiftKey ? Math.max(1, Math.round(fps)) : 1
+        if (st.isPlaying) st.setPlaying(false)
+        st.setPlayhead(stepFrames(useEditor.getState().playheadSec, fps, dir * frames))
       } else if (e.key === 's' || e.key === 'S') {
         st.splitAtPlayhead()
       } else if (e.key === 'm' || e.key === 'M') {
@@ -268,9 +388,11 @@ export default function App() {
   useShortcuts()
   useMediaProbe()
   useAudioProbe()
+  useProxyLookup()
   useAutosave()
   useDocumentTitle()
   useLastResortCrashNet()
+  useUnsavedGuard()
   const dirty = useEditor((s) => s.project !== s.savedProject)
   const setSettingsOpen = useEditor((s) => s.setSettingsOpen)
   const importMedia = useEditor((s) => s.importMedia)
@@ -293,8 +415,11 @@ export default function App() {
   const onDrop = (e: React.DragEvent<HTMLDivElement>): void => {
     e.preventDefault()
     setDraggingOver(false)
+    // File.path was removed in Electron 32; resolve paths through the preload.
+    const getPath = window.cutroom?.getPathForFile
+    if (!getPath) return
     const paths = Array.from(e.dataTransfer.files)
-      .map((f) => (f as File & { path: string }).path)
+      .map((f) => getPath(f))
       .filter((p) => p && MEDIA_EXT.test(p))
     if (paths.length) importMedia(paths)
   }
@@ -324,15 +449,15 @@ export default function App() {
           Cutroom<span className="badge">MVP</span>
         </div>
         <div className="filebar">
-          <button className="btn small" title="New project (Ctrl+N)" onClick={() => createNewProject()}>
+          <button className="btn small" title={`${t('New project')} (Ctrl+N)`} onClick={() => createNewProject()}>
             {t('New')}
           </button>
-          <button className="btn small" title="Open project (Ctrl+O)" onClick={() => void openProject()}>
+          <button className="btn small" title={`${t('Open project')} (Ctrl+O)`} onClick={() => void openProject()}>
             {t('Open')}
           </button>
           <button
             className={`btn small ${dirty ? 'active' : ''}`}
-            title="Save (Ctrl+S) · Save As (Ctrl+Shift+S)"
+            title={`${t('Save')} (Ctrl+S) · ${t('Save As')} (Ctrl+Shift+S)`}
             onClick={() => void saveProject()}
           >
             {dirty ? `${t('Save')} •` : t('Save')}

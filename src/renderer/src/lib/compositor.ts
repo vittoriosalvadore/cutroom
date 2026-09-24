@@ -1,10 +1,13 @@
-import type { Clip, ClipTransform, Effects, MediaItem, Project, TextProps } from '../types'
+import type { Clip, ClipTransform, ColorCurves, Effects, MediaItem, Project, TextProps } from '../types'
 import { defaultEffects, isNeutralColor } from '../types'
 import { sampleOpacity, sampleTransform } from './keyframes'
 import { mediaUrl } from './media'
 import { VideoPool } from './videoPool'
 import { roundRectPath } from './canvas'
+import { buildCurvesLut, isIdentityLut, LUT_SIZE } from './curves'
 import { RestoreMachine } from './webglRestore'
+import { scaledCanvasSize } from './previewScale'
+import { frameLayoutSize } from './proxy'
 import type { FrameSource } from './videoSource'
 
 // ---------------------------------------------------------------------------
@@ -67,6 +70,8 @@ uniform float uContrast;
 uniform float uSaturation;
 uniform float uTemp;
 uniform float uTint;
+uniform int uCurvesOn;
+uniform sampler2D uCurves; // 256x1 RGBA LUT: R/G/B = composed master+channel curve
 
 // Project to the chroma plane (Cb/Cr-ish) so the key ignores brightness.
 vec2 chromaCoords(vec3 c) {
@@ -100,6 +105,21 @@ void main() {
     float gl = dot(rgb, vec3(0.299, 0.587, 0.114));
     rgb = mix(vec3(gl), rgb, uSaturation);
     rgb = clamp(rgb, 0.0, 1.0);
+  }
+
+  // RGB curves, LAST: they shape the display-referred 0..1 result of the
+  // primary grade (what the scopes show), so exposure/WB move the signal and
+  // the curve then sets the final tone — a curve point means the same output
+  // level whatever the primaries are. Texel k's centre is (k + 0.5) / 256, so
+  // an 8-bit input k/255 lands exactly on LUT entry k; LINEAR filtering
+  // interpolates in-between (graded, non-8-bit) values.
+  if (uCurvesOn == 1) {
+    vec3 cu = clamp(rgb, 0.0, 1.0) * (255.0 / 256.0) + (0.5 / 256.0);
+    rgb = vec3(
+      texture2D(uCurves, vec2(cu.r, 0.5)).r,
+      texture2D(uCurves, vec2(cu.g, 0.5)).g,
+      texture2D(uCurves, vec2(cu.b, 0.5)).b
+    );
   }
 
   gl_FragColor = vec4(rgb, a * uOpacity);
@@ -226,16 +246,32 @@ export class Compositor {
   private aPos = 0
   private u: Record<string, WebGLUniformLocation | null> = {}
 
+  /** Backing-canvas size in pixels (the project size x the render scale). */
   private W = 1920
   private H = 1080
+  /** Logical frame size (the project's). Aspect math uses this, so a scaled
+   *  preview whose pixel size rounds keeps the exact project geometry. */
+  private LW = 1920
+  private LH = 1080
 
   private images = new Map<string, ImageEntry>()
   private canvasCache = new Map<string, CachedTex>()
   private cacheOrder: string[] = []
   private videos: VideoPool
+  /** Keyed by clip id, like the video pool (two clips of one file = two textures). */
   private videoTextures = new Map<string, WebGLTexture>()
   private playing = false
   private hidePlaceholders = false
+  /** Re-entrancy guard: a source signalling "frame ready" synchronously from
+   *  inside render() must not start a nested render (layers drawn twice). */
+  private rendering = false
+  private renderRequested = false
+  /** Preview-only path substitution (proxies). Absent on the export
+   *  compositor, so export decodes the originals. */
+  private resolvePreviewPath: ((media: MediaItem) => string) | null
+  /** True while renderExact() draws: always the original media, even on a
+   *  compositor that has a preview resolver (belt and braces for export). */
+  private exactPass = false
 
   // render()/renderExact() re-group clips by trackId on every call (every
   // animation frame during playback). project.clips is replaced wholesale on
@@ -285,6 +321,43 @@ export class Compositor {
     return key
   }
 
+  // Curve LUT textures, keyed by the clip's ColorCurves object. The store
+  // replaces that object on every edit (immutable updates), so identity is a
+  // valid cache key; `tex: null` caches "renders as identity" (skip the LUT).
+  // Small LRU so a long curve drag (a new object per move) can't pile up.
+  private curveTextures = new Map<ColorCurves, WebGLTexture | null>()
+
+  private curvesTexture(curves: ColorCurves): WebGLTexture | null {
+    const hit = this.curveTextures.get(curves)
+    if (hit !== undefined) {
+      // Refresh LRU position.
+      this.curveTextures.delete(curves)
+      this.curveTextures.set(curves, hit)
+      return hit
+    }
+    const lut = buildCurvesLut(curves)
+    let tex: WebGLTexture | null = null
+    if (!isIdentityLut(lut)) {
+      const gl = this.gl
+      tex = gl.createTexture() as WebGLTexture
+      gl.activeTexture(gl.TEXTURE1)
+      gl.bindTexture(gl.TEXTURE_2D, tex)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, LUT_SIZE, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, lut)
+      gl.activeTexture(gl.TEXTURE0)
+    }
+    this.curveTextures.set(curves, tex)
+    if (this.curveTextures.size > 32) {
+      const [oldKey, oldTex] = this.curveTextures.entries().next().value as [ColorCurves, WebGLTexture | null]
+      if (oldTex) this.gl.deleteTexture(oldTex)
+      this.curveTextures.delete(oldKey)
+    }
+    return tex
+  }
+
   // WebGL context-loss recovery. A lost GPU context must restore (rebuild GL
   // resources) instead of black-screening — the exact "looks like a crash"
   // symptom we want to avoid. State machine is pure (webglRestore.ts); this
@@ -302,7 +375,7 @@ export class Compositor {
   constructor(
     canvas: HTMLCanvasElement,
     needsRender: () => void,
-    opts: { preserveDrawingBuffer?: boolean } = {}
+    opts: { preserveDrawingBuffer?: boolean; resolvePreviewPath?: (media: MediaItem) => string } = {}
   ) {
     const gl = canvas.getContext('webgl', {
       alpha: false,
@@ -314,7 +387,13 @@ export class Compositor {
     if (!gl) throw new Error('WebGL is not available in this renderer')
     this.gl = gl
     this.needsRender = needsRender
-    this.videos = new VideoPool(needsRender)
+    this.resolvePreviewPath = opts.resolvePreviewPath ?? null
+    // An idle-evicted video's texture goes with it.
+    this.videos = new VideoPool(needsRender, (clipId) => {
+      const tex = this.videoTextures.get(clipId)
+      if (tex) this.gl.deleteTexture(tex)
+      this.videoTextures.delete(clipId)
+    })
 
     this.buildGLResources()
 
@@ -337,10 +416,12 @@ export class Compositor {
     for (const name of [
       'uRect', 'uTex', 'uUseTex', 'uColor', 'uOpacity', 'uChroma', 'uKey', 'uSim', 'uSmooth', 'uSpill',
       'uUVMin', 'uUVMax', 'uTrans', 'uScale', 'uRot', 'uAspect', 'uAnchor',
-      'uColorOn', 'uExposure', 'uContrast', 'uSaturation', 'uTemp', 'uTint'
+      'uColorOn', 'uExposure', 'uContrast', 'uSaturation', 'uTemp', 'uTint', 'uCurvesOn', 'uCurves'
     ]) {
       this.u[name] = gl.getUniformLocation(this.prog, name)
     }
+    // The curve LUT always lives on texture unit 1 (unit 0 is the layer).
+    gl.uniform1i(this.u.uCurves, 1)
   }
 
   private buildProgram(vs: string, fs: string): WebGLProgram {
@@ -465,7 +546,7 @@ export class Compositor {
     gl.uniform2f(u.uTrans, tf.posX, tf.posY)
     gl.uniform1f(u.uScale, tf.scale)
     gl.uniform1f(u.uRot, (tf.rotationDeg * Math.PI) / 180)
-    gl.uniform1f(u.uAspect, this.W / this.H)
+    gl.uniform1f(u.uAspect, this.LW / this.LH)
     // Pivot is the ORIGINAL (uncropped) content centre, so a keyframed crop
     // pivots in place instead of swimming.
     gl.uniform2f(u.uAnchor, baseRect.x + baseRect.w * 0.5, baseRect.y + baseRect.h * 0.5)
@@ -499,6 +580,14 @@ export class Compositor {
       gl.uniform1f(u.uTemp, cc.temperature)
       gl.uniform1f(u.uTint, cc.tint)
     }
+    // Identity / absent curves skip the LUT entirely: neutral stays byte-identical.
+    const curveTex = effects.curves ? this.curvesTexture(effects.curves) : null
+    gl.uniform1i(u.uCurvesOn, curveTex ? 1 : 0)
+    if (curveTex) {
+      gl.activeTexture(gl.TEXTURE1)
+      gl.bindTexture(gl.TEXTURE_2D, curveTex)
+      gl.activeTexture(gl.TEXTURE0) // uploads elsewhere bind on the active unit
+    }
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
   }
 
@@ -522,6 +611,16 @@ export class Compositor {
     return tex
   }
 
+  /** The file to decode for a video media: the original on export
+   *  (renderExact, or a compositor without a resolver), else whatever the
+   *  preview resolver picks (its ready proxy, when proxies are on). The pool
+   *  keys entries by clip AND path, so a proxy becoming ready (or the toggle
+   *  flipping) swaps decoders on the next frame. */
+  private videoPath(media: MediaItem): string {
+    if (this.exactPass || !this.resolvePreviewPath) return media.path
+    return this.resolvePreviewPath(media) || media.path
+  }
+
   private drawClip(project: Project, clip: Clip, playheadSec: number): void {
     const effects = clip.effects ?? defaultEffects()
     // Sample transform + opacity once at clip-relative time; the SAME values feed
@@ -543,10 +642,13 @@ export class Compositor {
     if (media && media.kind === 'video' && media.path) {
       const speed = clip.speed ?? 1
       const srcTime = clip.inSec + (playheadSec - clip.startSec) * speed
-      const frame = this.videos.want(media.id, media.path, srcTime, this.playing, speed)
+      const path = this.videoPath(media)
+      const frame = this.videos.want(clip.id, path, srcTime, this.playing, speed)
       if (frame && frame.width > 0 && frame.height > 0) {
-        const tex = this.uploadVideoFrame(media.id, frame.source)
-        this.drawQuad(containRect(frame.width, frame.height, this.W, this.H), tex, null, effects, tf, opacity)
+        const tex = this.uploadVideoFrame(clip.id, frame.source)
+        // A proxy is laid out by the original's size (same geometry either way).
+        const size = frameLayoutSize(media, frame, path !== media.path)
+        this.drawQuad(containRect(size.width, size.height, this.LW, this.LH), tex, null, effects, tf, opacity)
         return
       }
       if (this.hidePlaceholders) return
@@ -559,7 +661,7 @@ export class Compositor {
     if (media && media.kind === 'image' && media.path) {
       const entry = this.imageTexture(media)
       if (entry.status === 'ready' && entry.tex) {
-        this.drawQuad(containRect(entry.w, entry.h, this.W, this.H), entry.tex, null, effects, tf, opacity)
+        this.drawQuad(containRect(entry.w, entry.h, this.LW, this.LH), entry.tex, null, effects, tf, opacity)
         return
       }
       if (this.hidePlaceholders) return
@@ -579,16 +681,47 @@ export class Compositor {
     this.drawQuad({ x: 0, y: 0, w: 1, h: 1 }, tex.tex, null, effects, tf, opacity)
   }
 
+  /**
+   * Draw the frame at `playheadSec`. `opts.scale` (0..1] renders into a
+   * proportionally smaller canvas — the preview-quality setting; the export
+   * never passes it, so it always renders at the full project size.
+   */
   render(
     project: Project,
     playheadSec: number,
     playing = false,
-    opts: { hidePlaceholders?: boolean } = {}
+    opts: { hidePlaceholders?: boolean; scale?: number } = {}
   ): void {
     // While a lost context is being recovered, drawing would hit a dead GL
     // context. Skip silently — the overlay tells the user what's happening.
     if (this.restore.state === 'reconnecting') return
-    this.setSize(project.width, project.height)
+    if (this.rendering) {
+      // Nested call (a frame-ready signal fired mid-render): redo it after.
+      this.renderRequested = true
+      return
+    }
+    this.rendering = true
+    try {
+      this.renderPass(project, playheadSec, playing, opts)
+    } finally {
+      this.rendering = false
+    }
+    if (this.renderRequested) {
+      this.renderRequested = false
+      queueMicrotask(() => this.needsRender())
+    }
+  }
+
+  private renderPass(
+    project: Project,
+    playheadSec: number,
+    playing: boolean,
+    opts: { hidePlaceholders?: boolean; scale?: number }
+  ): void {
+    this.LW = project.width
+    this.LH = project.height
+    const px = scaledCanvasSize(project.width, project.height, opts.scale ?? 1)
+    this.setSize(px.w, px.h)
     this.playing = playing
     this.hidePlaceholders = opts.hidePlaceholders ?? false
     const gl = this.gl
@@ -610,17 +743,30 @@ export class Compositor {
     // Bottom track first so the topmost track ends up on top of the stack.
     for (let ti = project.tracks.length - 1; ti >= 0; ti--) {
       const track = project.tracks[ti]
-      if (track.kind !== 'video' || track.hidden) continue
+      if (track.kind !== 'video') continue
+      // Hidden tracks aren't drawn, but their audio still plays (export mixes
+      // it too), so keep their clips' audio elements driven while playing.
+      if (track.hidden && !playing) continue
       const clips = byTrack.get(track.id)
       if (!clips) continue
       for (const clip of clips) {
         if (t < clip.startSec || t >= clip.startSec + clip.durationSec) continue
-        this.drawClip(project, clip, t)
+        if (track.hidden) this.driveHiddenAudio(project, clip, t)
+        else this.drawClip(project, clip, t)
       }
     }
 
     // Pause any video elements no longer under the playhead.
     this.videos.endFrame()
+  }
+
+  /** A hidden-track video clip under the playhead: audio side only, no draw. */
+  private driveHiddenAudio(project: Project, clip: Clip, playheadSec: number): void {
+    const media = clip.mediaId ? project.media[clip.mediaId] : undefined
+    if (!media || media.kind !== 'video' || !media.path) return
+    const speed = clip.speed ?? 1
+    const srcTime = clip.inSec + (playheadSec - clip.startSec) * speed
+    this.videos.wantAudio(clip.id, this.videoPath(media), srcTime, this.playing, speed)
   }
 
   /** Ensure every image used by the project is decoded. For export preflight. */
@@ -642,6 +788,8 @@ export class Compositor {
    * Deterministic render for export: seek every active video to its exact source
    * time and WAIT for the frame before compositing, so each output frame is the
    * right one. Placeholders are suppressed so empty lanes export as transparent.
+   * Always decodes the ORIGINAL media (MediaItem.path), never a proxy: the
+   * seeks below and the draw (exactPass) both bypass the preview resolver.
    */
   async renderExact(project: Project, t: number): Promise<void> {
     const seeks: Promise<void>[] = []
@@ -655,12 +803,17 @@ export class Compositor {
         if (!clip.mediaId) continue
         const media = project.media[clip.mediaId]
         if (media && media.kind === 'video' && media.path) {
-          seeks.push(this.videos.seekTo(media.id, media.path, clip.inSec + (t - clip.startSec) * (clip.speed ?? 1)))
+          seeks.push(this.videos.seekTo(clip.id, media.path, clip.inSec + (t - clip.startSec) * (clip.speed ?? 1)))
         }
       }
     }
     await Promise.all(seeks)
-    this.render(project, t, false, { hidePlaceholders: true })
+    this.exactPass = true
+    try {
+      this.render(project, t, false, { hidePlaceholders: true })
+    } finally {
+      this.exactPass = false
+    }
   }
 
   /** The video pool, so the audio engine can tap video-element audio. */
@@ -677,6 +830,7 @@ export class Compositor {
     this.images.clear()
     this.canvasCache.clear()
     this.videoTextures.clear()
+    this.curveTextures.clear()
     this.cacheOrder = []
   }
 
@@ -697,6 +851,8 @@ export class Compositor {
     for (const e of this.images.values()) if (e.tex) gl.deleteTexture(e.tex)
     for (const e of this.canvasCache.values()) gl.deleteTexture(e.tex)
     for (const tex of this.videoTextures.values()) gl.deleteTexture(tex)
+    for (const tex of this.curveTextures.values()) if (tex) gl.deleteTexture(tex)
+    this.curveTextures.clear()
     this.images.clear()
     this.canvasCache.clear()
     this.videoTextures.clear()

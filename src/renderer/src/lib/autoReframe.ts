@@ -1,5 +1,6 @@
 import type { Clip, Keyframe, Project } from '../types'
 import { mediaUrl } from './media'
+import { clipRelToSource } from './clipTime'
 import { WorkerJob, JobCancelled } from './workerJob'
 
 /** Re-exported under this module's name so existing callers (AutoReframeModal)
@@ -117,8 +118,10 @@ async function sampleFrames(
     const frames: Frame[] = []
     for (let i = 0; i < count; i++) {
       if (shouldCancel()) throw new JobCancelled()
+      // tRel is clip-relative TIMELINE time (what keyframes use); the source
+      // frame shown there is speed-scaled.
       const tRel = count <= 1 ? 0 : (clip.durationSec * i) / (count - 1)
-      await seekTo(video, clip.inSec + tRel)
+      await seekTo(video, clipRelToSource(clip, tRel))
       ctx.drawImage(video, 0, 0, W, H)
       frames.push({ t: tRel, image: ctx.getImageData(0, 0, W, H) })
       onProgress({ stage: 'sampling', progress: (i + 1) / count })
@@ -204,6 +207,8 @@ export async function autoReframe(
     )
     centers.push(pickCenter(boxes, opts.target))
   }
+  // Stop pressed during the last frame's detection: don't hand back keyframes.
+  if (shouldCancel()) throw new JobCancelled()
 
   const tracked = smooth(fillCenters(centers), 2)
   const s = Math.max(1.05, opts.zoom)

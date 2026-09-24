@@ -7,15 +7,41 @@ import {
   defaultTrackGate,
   defaultTrackDuck,
   defaultTrackEQ,
-  defaultTrackComp
+  defaultTrackComp,
+  defaultTrackReverb
 } from '../types'
+import { REVERB_LIMITS } from '../../../shared/reverb'
 import { sampleOpacity, sampleTransform, KEY_EPS } from '../lib/keyframes'
 import { useT } from '../lib/i18n'
+import { SLIDER_KEYS } from '../lib/transport'
 import { normalizeGainDb } from '../lib/normalize'
+import { canRemoveTrack, MAX_TRACK_HEIGHT, MIN_TRACK_HEIGHT } from '../lib/tracks'
+import { removeTrackWithConfirm } from '../lib/trackActions'
+import CurvesEditor from './CurvesEditor'
 import { denoiseCacheVersion, ensureDenoised, getDenoiseEntry, subscribeDenoiseCache } from '../lib/denoiseCache'
-import type { AnimProp, Marker, TextAlign, Track, TrackGate, TrackDuck, TrackEQ, TrackComp } from '../types'
+import type { AnimProp, Marker, TextAlign, Track, TrackGate, TrackDuck, TrackEQ, TrackComp, TrackReverb } from '../types'
 
 /** Labelled range slider that shows its current value. */
+/**
+ * Pre-edit undo snapshot for a pointerdown inside an Inspector panel, taken
+ * only when it lands on an enabled form control (or a <label> that drives one,
+ * e.g. an On/Off switch). Snapshotting on ANY pointerdown pushed a no-op undo
+ * step — and wiped redo — for clicks on blank space or headings. Controls whose
+ * action records its own history (or doesn't edit) opt out via data-no-snapshot.
+ */
+function snapshotOnControl(e: { target: EventTarget | null }): void {
+  const target = e.target
+  if (!(target instanceof Element)) return
+  let control: Element | null = target.closest('input, select, textarea, button')
+  if (!control) {
+    // A label click toggles/opens its control — except a slider's, which only focuses.
+    const viaLabel = target.closest('label')?.control ?? null
+    if (viaLabel && !(viaLabel instanceof HTMLInputElement && viaLabel.type === 'range')) control = viaLabel
+  }
+  if (!control || control.matches(':disabled') || control.closest('[data-no-snapshot]')) return
+  useEditor.getState().snapshot()
+}
+
 function Slider(props: {
   label: string
   value: number
@@ -72,6 +98,7 @@ function KeyableSlider(props: {
   const kfT = Math.max(0, Math.min(clipDur, tRel))
   const onKeyHere = keyTimes.some((t) => Math.abs(t - kfT) <= KEY_EPS)
   const st = useEditor.getState
+  const t = useT()
 
   // Armed edits only land when the playhead is on the clip (so a key can't be
   // written off-clip); disarmed edits set the time-independent static value.
@@ -97,7 +124,7 @@ function KeyableSlider(props: {
     <div className={`keyrow ${armed ? 'armed' : ''}`}>
       <button
         className={`kf-watch ${armed ? 'on' : ''}`}
-        title={armed ? 'Stop animating (bake current value)' : 'Animate this property with keyframes'}
+        title={armed ? t('Stop animating (bake current value)') : t('Animate this property with keyframes')}
         onClick={() => st().toggleKeyframeTrack(clipId, prop, kfT, value)}
       >
         ◷
@@ -115,18 +142,18 @@ function KeyableSlider(props: {
         />
       </div>
       <div className="kf-nav">
-        <button title="Previous keyframe" disabled={!armed} onClick={() => go(-1)}>
+        <button title={t('Previous keyframe')} disabled={!armed} onClick={() => go(-1)}>
           ‹
         </button>
         <button
           className={`kf-dia ${onKeyHere ? 'on' : ''}`}
-          title="Add / remove a keyframe at the playhead"
+          title={t('Add / remove a keyframe at the playhead')}
           disabled={!inside}
           onClick={toggleKeyHere}
         >
           ◆
         </button>
-        <button title="Next keyframe" disabled={!armed} onClick={() => go(1)}>
+        <button title={t('Next keyframe')} disabled={!armed} onClick={() => go(1)}>
           ›
         </button>
       </div>
@@ -135,6 +162,63 @@ function KeyableSlider(props: {
 }
 
 const ALIGNS: TextAlign[] = ['left', 'center', 'right']
+
+/** Track layout controls: lane height, stacking order, delete. Reordering and
+ *  deleting record their own undo step (data-no-snapshot); the height slider
+ *  relies on the panel's pre-edit snapshot like every other slider. */
+function TrackLayoutSection(props: { track: Track; tracks: Track[] }) {
+  const { track, tracks } = props
+  const t = useT()
+  const index = tracks.findIndex((tr) => tr.id === track.id)
+  const removable = canRemoveTrack(tracks, track.id)
+  const st = useEditor.getState
+  return (
+    <section className="insp-section">
+      <h4>{t('Track')}</h4>
+      <Slider
+        label={t('Height')}
+        value={track.height}
+        min={MIN_TRACK_HEIGHT}
+        max={MAX_TRACK_HEIGHT}
+        step={1}
+        onChange={(v) => st().setTrackHeight(track.id, v)}
+        format={(v) => `${Math.round(v)} px`}
+      />
+      <div className="insp-row">
+        <button
+          className="btn small"
+          data-no-snapshot
+          disabled={index <= 0}
+          title={t('Move track up')}
+          onClick={() => st().moveTrack(track.id, index - 1)}
+        >
+          ▲ {t('Up')}
+        </button>
+        <button
+          className="btn small"
+          data-no-snapshot
+          disabled={index < 0 || index >= tracks.length - 1}
+          title={t('Move track down')}
+          onClick={() => st().moveTrack(track.id, index + 1)}
+        >
+          ▼ {t('Down')}
+        </button>
+        <button
+          className="btn small"
+          data-no-snapshot
+          disabled={!removable}
+          title={removable ? undefined : t('The last video or audio track can’t be deleted.')}
+          onClick={() => removeTrackWithConfirm(track.id)}
+        >
+          {t('Delete track')}
+        </button>
+      </div>
+      {track.kind === 'video' && (
+        <p className="insp-note">{t('Higher video tracks draw on top of lower ones.')}</p>
+      )}
+    </section>
+  )
+}
 
 /** Mixer + dynamics panel for a selected track: volume, pan, gate, ducking. */
 function TrackPanel(props: {
@@ -145,8 +229,10 @@ function TrackPanel(props: {
   updateTrackDuck: (id: string, patch: Partial<TrackDuck>) => void
   updateTrackEQ: (id: string, patch: Partial<TrackEQ>) => void
   updateTrackComp: (id: string, patch: Partial<TrackComp>) => void
+  updateTrackReverb: (id: string, patch: Partial<TrackReverb>) => void
 }) {
-  const { track, tracks, updateTrack, updateTrackGate, updateTrackDuck, updateTrackEQ, updateTrackComp } = props
+  const { track, tracks, updateTrack, updateTrackGate, updateTrackDuck, updateTrackEQ, updateTrackComp, updateTrackReverb } =
+    props
   const t = useT()
   const gain = track.audioGain ?? 0
   const pan = track.pan ?? 0
@@ -154,26 +240,29 @@ function TrackPanel(props: {
   const duck = track.duck ?? defaultTrackDuck()
   const eq = track.eq ?? defaultTrackEQ()
   const comp = track.comp ?? defaultTrackComp()
+  const reverb = track.reverb ?? defaultTrackReverb()
   const otherAudio = tracks.filter((t) => t.kind === 'audio' && t.id !== track.id)
   return (
     <aside className="inspector">
-      <div className="panel-head">Inspector</div>
+      <div className="panel-head">{t('Inspector')}</div>
       <div
         className="insp-body"
-        onPointerDownCapture={() => useEditor.getState().snapshot()}
+        onPointerDownCapture={snapshotOnControl}
         onKeyDownCapture={(e) => {
           // Keyboard nudges on a slider also need a pre-edit snapshot for undo.
-          if ((e.target as HTMLInputElement).type === 'range') useEditor.getState().snapshot()
+          if ((e.target as HTMLInputElement).type === 'range' && SLIDER_KEYS.has(e.key)) useEditor.getState().snapshot()
         }}
       >
         <div className="insp-clipname">{track.name}</div>
         <div className="insp-clipmeta">
-          {track.kind} track{track.muted ? ' · muted' : ''}
+          {track.kind === 'audio' ? t('Audio track') : t('Video track')}
+          {track.muted ? ` · ${t('muted')}` : ''}
         </div>
+        <TrackLayoutSection track={track} tracks={tracks} />
         <section className="insp-section">
-          <h4>Mixer</h4>
+          <h4>{t('Mixer')}</h4>
           <Slider
-            label="Volume"
+            label={t('Volume')}
             value={gain}
             min={-40}
             max={6}
@@ -183,7 +272,7 @@ function TrackPanel(props: {
           />
           {track.kind === 'audio' && (
             <Slider
-              label="Pan"
+              label={t('Pan')}
               value={pan}
               min={-1}
               max={1}
@@ -196,7 +285,7 @@ function TrackPanel(props: {
             <div className="insp-row">
               <button
                 className="btn small"
-                title="Set the gain so the loudest peak hits -1 dBFS"
+                title={t('Set the gain so the loudest peak hits -1 dBFS')}
                 onClick={() => {
                   const g = normalizeGainDb(useEditor.getState().project, track.id)
                   if (g !== null) updateTrack(track.id, { audioGain: g })
@@ -207,26 +296,26 @@ function TrackPanel(props: {
             </div>
           )}
           <p className="insp-note">
-            Mute this track with the M badge on its timeline lane.
-            {track.kind === 'video' ? ' EQ, gate, compressor, pan and ducking apply to audio tracks.' : ''}
+            {t('Mute this track with the M badge on its timeline lane.')}
+            {track.kind === 'video' ? ` ${t('EQ, gate, compressor, pan, ducking and reverb apply to audio tracks.')}` : ''}
           </p>
         </section>
 
         {track.kind === 'audio' && (
           <section className="insp-section">
             <h4>
-              EQ
+              {t('EQ')}
               <label className="insp-switch">
                 <input
                   type="checkbox"
                   checked={eq.enabled}
                   onChange={(e) => updateTrackEQ(track.id, { enabled: e.target.checked })}
                 />
-                <span>{eq.enabled ? 'On' : 'Off'}</span>
+                <span>{eq.enabled ? t('On') : t('Off')}</span>
               </label>
             </h4>
             <Slider
-              label="Low"
+              label={t('Low')}
               value={eq.lowDb}
               min={-18}
               max={18}
@@ -235,7 +324,7 @@ function TrackPanel(props: {
               format={(v) => `${v > 0 ? '+' : ''}${v.toFixed(1)} dB`}
             />
             <Slider
-              label="Mid"
+              label={t('Mid')}
               value={eq.midDb}
               min={-18}
               max={18}
@@ -244,7 +333,7 @@ function TrackPanel(props: {
               format={(v) => `${v > 0 ? '+' : ''}${v.toFixed(1)} dB`}
             />
             <Slider
-              label="High"
+              label={t('High')}
               value={eq.highDb}
               min={-18}
               max={18}
@@ -252,25 +341,25 @@ function TrackPanel(props: {
               onChange={(v) => updateTrackEQ(track.id, { highDb: v })}
               format={(v) => `${v > 0 ? '+' : ''}${v.toFixed(1)} dB`}
             />
-            <p className="insp-note">3-band: low shelf 120 Hz · mid 1 kHz · high shelf 8 kHz.</p>
+            <p className="insp-note">{t('3-band: low shelf 120 Hz · mid 1 kHz · high shelf 8 kHz.')}</p>
           </section>
         )}
 
         {track.kind === 'audio' && (
           <section className="insp-section">
             <h4>
-              Compressor
+              {t('Compressor')}
               <label className="insp-switch">
                 <input
                   type="checkbox"
                   checked={comp.enabled}
                   onChange={(e) => updateTrackComp(track.id, { enabled: e.target.checked })}
                 />
-                <span>{comp.enabled ? 'On' : 'Off'}</span>
+                <span>{comp.enabled ? t('On') : t('Off')}</span>
               </label>
             </h4>
             <Slider
-              label="Threshold"
+              label={t('Threshold')}
               value={comp.thresholdDb}
               min={-60}
               max={0}
@@ -279,7 +368,7 @@ function TrackPanel(props: {
               format={(v) => `${v.toFixed(0)} dB`}
             />
             <Slider
-              label="Ratio"
+              label={t('Ratio')}
               value={comp.ratio}
               min={1}
               max={20}
@@ -288,7 +377,7 @@ function TrackPanel(props: {
               format={(v) => `${v.toFixed(1)}:1`}
             />
             <Slider
-              label="Attack"
+              label={t('Attack')}
               value={comp.attackMs}
               min={0}
               max={200}
@@ -297,7 +386,7 @@ function TrackPanel(props: {
               format={(v) => `${v.toFixed(0)} ms`}
             />
             <Slider
-              label="Release"
+              label={t('Release')}
               value={comp.releaseMs}
               min={0}
               max={1000}
@@ -306,7 +395,7 @@ function TrackPanel(props: {
               format={(v) => `${v.toFixed(0)} ms`}
             />
             <Slider
-              label="Makeup"
+              label={t('Makeup')}
               value={comp.makeupDb}
               min={0}
               max={24}
@@ -314,25 +403,25 @@ function TrackPanel(props: {
               onChange={(v) => updateTrackComp(track.id, { makeupDb: v })}
               format={(v) => `+${v.toFixed(1)} dB`}
             />
-            <p className="insp-note">Evens out level. Lower threshold + higher ratio = more squeeze.</p>
+            <p className="insp-note">{t('Evens out level. Lower threshold + higher ratio = more squeeze.')}</p>
           </section>
         )}
 
         {track.kind === 'audio' && (
           <section className="insp-section">
             <h4>
-              Noise Gate
+              {t('Noise Gate')}
               <label className="insp-switch">
                 <input
                   type="checkbox"
                   checked={gate.enabled}
                   onChange={(e) => updateTrackGate(track.id, { enabled: e.target.checked })}
                 />
-                <span>{gate.enabled ? 'On' : 'Off'}</span>
+                <span>{gate.enabled ? t('On') : t('Off')}</span>
               </label>
             </h4>
             <Slider
-              label="Threshold"
+              label={t('Threshold')}
               value={gate.thresholdDb}
               min={-80}
               max={0}
@@ -341,7 +430,7 @@ function TrackPanel(props: {
               format={(v) => `${v.toFixed(0)} dB`}
             />
             <Slider
-              label="Range"
+              label={t('Range')}
               value={gate.rangeDb}
               min={-90}
               max={0}
@@ -350,7 +439,7 @@ function TrackPanel(props: {
               format={(v) => `${v.toFixed(0)} dB`}
             />
             <Slider
-              label="Ratio"
+              label={t('Ratio')}
               value={gate.ratio}
               min={1}
               max={20}
@@ -359,7 +448,7 @@ function TrackPanel(props: {
               format={(v) => `${v.toFixed(1)}:1`}
             />
             <Slider
-              label="Attack"
+              label={t('Attack')}
               value={gate.attackMs}
               min={0}
               max={200}
@@ -368,7 +457,7 @@ function TrackPanel(props: {
               format={(v) => `${v.toFixed(0)} ms`}
             />
             <Slider
-              label="Release"
+              label={t('Release')}
               value={gate.releaseMs}
               min={0}
               max={1000}
@@ -376,31 +465,31 @@ function TrackPanel(props: {
               onChange={(v) => updateTrackGate(track.id, { releaseMs: v })}
               format={(v) => `${v.toFixed(0)} ms`}
             />
-            <p className="insp-note">Silences hiss below the threshold — clean up voice tracks between words.</p>
+            <p className="insp-note">{t('Silences hiss below the threshold — clean up voice tracks between words.')}</p>
           </section>
         )}
 
         {track.kind === 'audio' && (
           <section className="insp-section">
             <h4>
-              Ducking
+              {t('Ducking')}
               <label className="insp-switch">
                 <input
                   type="checkbox"
                   checked={duck.enabled}
                   onChange={(e) => updateTrackDuck(track.id, { enabled: e.target.checked })}
                 />
-                <span>{duck.enabled ? 'On' : 'Off'}</span>
+                <span>{duck.enabled ? t('On') : t('Off')}</span>
               </label>
             </h4>
             <label className="insp-field">
-              <span className="insp-label">Trigger track</span>
+              <span className="insp-label">{t('Trigger track')}</span>
               <select
                 className="insp-select"
                 value={duck.triggerTrackId ?? ''}
                 onChange={(e) => updateTrackDuck(track.id, { triggerTrackId: e.target.value || null })}
               >
-                <option value="">— none —</option>
+                <option value="">{t('— none —')}</option>
                 {otherAudio.map((t) => (
                   <option key={t.id} value={t.id}>
                     {t.name}
@@ -409,7 +498,7 @@ function TrackPanel(props: {
               </select>
             </label>
             <Slider
-              label="Threshold"
+              label={t('Threshold')}
               value={duck.thresholdDb}
               min={-60}
               max={0}
@@ -418,7 +507,7 @@ function TrackPanel(props: {
               format={(v) => `${v.toFixed(0)} dB`}
             />
             <Slider
-              label="Amount"
+              label={t('Amount')}
               value={duck.ratio}
               min={1}
               max={20}
@@ -427,7 +516,7 @@ function TrackPanel(props: {
               format={(v) => `${v.toFixed(1)}:1`}
             />
             <Slider
-              label="Attack"
+              label={t('Attack')}
               value={duck.attackMs}
               min={0}
               max={200}
@@ -436,7 +525,7 @@ function TrackPanel(props: {
               format={(v) => `${v.toFixed(0)} ms`}
             />
             <Slider
-              label="Release"
+              label={t('Release')}
               value={duck.releaseMs}
               min={0}
               max={1000}
@@ -445,8 +534,61 @@ function TrackPanel(props: {
               format={(v) => `${v.toFixed(0)} ms`}
             />
             <p className="insp-note">
-              Lowers this track automatically while the trigger track (e.g. a voiceover) is loud.
+              {t('Lowers this track automatically while the trigger track (e.g. a voiceover) is loud.')}
             </p>
+          </section>
+        )}
+
+        {track.kind === 'audio' && (
+          <section className="insp-section">
+            <h4>
+              {t('Reverb')}
+              <label className="insp-switch">
+                <input
+                  type="checkbox"
+                  checked={reverb.enabled}
+                  onChange={(e) => updateTrackReverb(track.id, { enabled: e.target.checked })}
+                />
+                <span>{reverb.enabled ? t('On') : t('Off')}</span>
+              </label>
+            </h4>
+            <Slider
+              label={t('Mix')}
+              value={reverb.mix}
+              min={REVERB_LIMITS.mix[0]}
+              max={REVERB_LIMITS.mix[1]}
+              step={0.01}
+              onChange={(v) => updateTrackReverb(track.id, { mix: v })}
+              format={(v) => `${Math.round(v * 100)}% ${t('wet')}`}
+            />
+            <Slider
+              label={t('Decay')}
+              value={reverb.decaySec}
+              min={REVERB_LIMITS.decaySec[0]}
+              max={REVERB_LIMITS.decaySec[1]}
+              step={0.1}
+              onChange={(v) => updateTrackReverb(track.id, { decaySec: v })}
+              format={(v) => `${v.toFixed(1)} s`}
+            />
+            <Slider
+              label={t('Pre-delay')}
+              value={reverb.preDelayMs}
+              min={REVERB_LIMITS.preDelayMs[0]}
+              max={REVERB_LIMITS.preDelayMs[1]}
+              step={1}
+              onChange={(v) => updateTrackReverb(track.id, { preDelayMs: v })}
+              format={(v) => `${v.toFixed(0)} ms`}
+            />
+            <Slider
+              label={t('Tone')}
+              value={reverb.tone}
+              min={REVERB_LIMITS.tone[0]}
+              max={REVERB_LIMITS.tone[1]}
+              step={0.01}
+              onChange={(v) => updateTrackReverb(track.id, { tone: v })}
+              format={(v) => (v < 0.34 ? t('Dark') : v > 0.66 ? t('Bright') : t('Neutral'))}
+            />
+            <p className="insp-note">{t('Convolution reverb — the export uses the exact same impulse response.')}</p>
           </section>
         )}
       </div>
@@ -457,25 +599,26 @@ function TrackPanel(props: {
 /** Shown when more than one clip is selected: count + safe batch actions. */
 function MultiClipPanel(props: { count: number }) {
   const st = useEditor.getState
+  const t = useT()
   return (
     <aside className="inspector">
-      <div className="panel-head">Inspector</div>
+      <div className="panel-head">{t('Inspector')}</div>
       <div className="insp-body">
-        <div className="insp-clipname">{props.count} clips selected</div>
-        <div className="insp-clipmeta">Drag to move all · Del removes all</div>
+        <div className="insp-clipname">{t('{n} clips selected', { n: props.count })}</div>
+        <div className="insp-clipmeta">{t('Drag to move all · Del removes all')}</div>
         <section className="insp-section">
           <div className="insp-row">
             <button className="btn small" onClick={() => st().copySelectedClips()}>
-              Copy
+              {t('Copy')}
             </button>
             <button className="btn small" onClick={() => st().removeSelectedClips()}>
-              Delete
+              {t('Delete')}
             </button>
             <button className="btn small" onClick={() => st().rippleDeleteSelected()}>
-              Ripple delete
+              {t('Ripple delete')}
             </button>
           </div>
-          <p className="insp-note">Select a single clip to edit its properties.</p>
+          <p className="insp-note">{t('Select a single clip to edit its properties.')}</p>
         </section>
       </div>
     </aside>
@@ -487,34 +630,36 @@ function MarkerPanel(props: { marker: Marker }) {
   const { marker } = props
   const updateMarker = useEditor((s) => s.updateMarker)
   const removeMarker = useEditor((s) => s.removeMarker)
+  const t = useT()
   return (
     <aside className="inspector">
-      <div className="panel-head">Inspector</div>
-      <div className="insp-body" onPointerDownCapture={() => useEditor.getState().snapshot()}>
-        <div className="insp-clipname">Marker</div>
-        <div className="insp-clipmeta">at {marker.timeSec.toFixed(2)}s</div>
+      <div className="panel-head">{t('Inspector')}</div>
+      <div className="insp-body" onPointerDownCapture={snapshotOnControl}>
+        <div className="insp-clipname">{t('Marker')}</div>
+        <div className="insp-clipmeta">{t('at {time}s', { time: marker.timeSec.toFixed(2) })}</div>
         <section className="insp-section">
           <textarea
             className="insp-textarea"
             rows={1}
             value={marker.label ?? ''}
-            placeholder="Label…"
+            placeholder={t('Label…')}
             onChange={(e) => updateMarker(marker.id, { label: e.target.value })}
           />
           <div className="insp-row">
             <label className="insp-color">
-              Colour
+              {t('Colour')}
               <input
                 type="color"
                 value={marker.color ?? '#ffcf4d'}
                 onChange={(e) => updateMarker(marker.id, { color: e.target.value })}
               />
             </label>
-            <button className="btn small" onClick={() => removeMarker(marker.id)}>
-              Delete
+            {/* removeMarker records its own undo step; a snapshot here would duplicate it. */}
+            <button className="btn small" data-no-snapshot onClick={() => removeMarker(marker.id)}>
+              {t('Delete')}
             </button>
           </div>
-          <p className="insp-note">M adds a marker at the playhead · , / . jump between markers.</p>
+          <p className="insp-note">{t('M adds a marker at the playhead · , / . jump between markers.')}</p>
         </section>
       </div>
     </aside>
@@ -557,6 +702,7 @@ export default function Inspector() {
   const updateTrackDuck = useEditor((s) => s.updateTrackDuck)
   const updateTrackEQ = useEditor((s) => s.updateTrackEQ)
   const updateTrackComp = useEditor((s) => s.updateTrackComp)
+  const updateTrackReverb = useEditor((s) => s.updateTrackReverb)
   const selCount = useEditor((s) => s.selectedClipIds.size)
   const marker = useEditor((s) =>
     s.selectedMarkerId ? s.project.markers?.find((m) => m.id === s.selectedMarkerId) ?? null : null
@@ -578,6 +724,7 @@ export default function Inspector() {
           updateTrackDuck={updateTrackDuck}
           updateTrackEQ={updateTrackEQ}
           updateTrackComp={updateTrackComp}
+          updateTrackReverb={updateTrackReverb}
         />
       )
     return (
@@ -597,7 +744,7 @@ export default function Inspector() {
   const isTimed = media?.kind === 'video' || media?.kind === 'audio'
   const speed = clip.speed ?? 1
   const title =
-    clip.role === 'title' ? 'Title' : clip.role === 'subtitle' ? 'Subtitle' : media?.name ?? 'Clip'
+    clip.role === 'title' ? t('Title') : clip.role === 'subtitle' ? t('Subtitle') : media?.name ?? t('Clip')
 
   // Audio clips have no picture; visual clips (video/image/title/subtitle) do.
   const isVisual = media?.kind !== 'audio'
@@ -621,15 +768,15 @@ export default function Inspector() {
 
   return (
     <aside className="inspector">
-      <div className="panel-head">Inspector</div>
+      <div className="panel-head">{t('Inspector')}</div>
       {/* Snapshot once at the start of any control interaction so a slider sweep
           or button click is a single undo step. */}
       <div
         className="insp-body"
-        onPointerDownCapture={() => useEditor.getState().snapshot()}
+        onPointerDownCapture={snapshotOnControl}
         onKeyDownCapture={(e) => {
           // Keyboard nudges on a slider also need a pre-edit snapshot for undo.
-          if ((e.target as HTMLInputElement).type === 'range') useEditor.getState().snapshot()
+          if ((e.target as HTMLInputElement).type === 'range' && SLIDER_KEYS.has(e.key)) useEditor.getState().snapshot()
         }}
       >
         <div className="insp-clipname">{title}</div>
@@ -639,9 +786,9 @@ export default function Inspector() {
 
         {isTimed && (
           <section className="insp-section">
-            <h4>Speed</h4>
+            <h4>{t('Speed')}</h4>
             <Slider
-              label="Playback speed"
+              label={t('Playback speed')}
               value={speed}
               min={0.25}
               max={4}
@@ -649,23 +796,23 @@ export default function Inspector() {
               onChange={(v) => setSpeed(id, v)}
               format={(v) => `${v.toFixed(2)}×`}
             />
-            <p className="insp-note">Slow-mo below 1×, fast-forward above. Audio pitches with speed.</p>
+            <p className="insp-note">{t('Slow-mo below 1×, fast-forward above. Audio pitches with speed.')}</p>
           </section>
         )}
 
         {isText && text && (
           <section className="insp-section">
-            <h4>Text</h4>
+            <h4>{t('Text')}</h4>
             <textarea
               className="insp-textarea"
               rows={2}
               value={text.content}
-              placeholder="Type your text…"
+              placeholder={t('Type your text…')}
               onChange={(e) => updateText(id, { content: e.target.value })}
             />
             <div className="insp-row">
               <label className="insp-color">
-                Fill
+                {t('Fill')}
                 <input
                   type="color"
                   value={text.color}
@@ -691,7 +838,7 @@ export default function Inspector() {
                   <button
                     key={a}
                     className={`btn small ${text.align === a ? 'active' : ''}`}
-                    title={`Align ${a}`}
+                    title={a === 'left' ? t('Align left') : a === 'center' ? t('Align center') : t('Align right')}
                     onClick={() => updateText(id, { align: a })}
                   >
                     {a[0].toUpperCase()}
@@ -700,7 +847,7 @@ export default function Inspector() {
               </div>
             </div>
             <Slider
-              label="Size"
+              label={t('Size')}
               value={text.fontSizePct}
               min={1}
               max={25}
@@ -709,7 +856,7 @@ export default function Inspector() {
               format={(v) => `${v.toFixed(1)}%`}
             />
             <Slider
-              label="Position X"
+              label={t('Position X')}
               value={text.xPct}
               min={0}
               max={100}
@@ -718,7 +865,7 @@ export default function Inspector() {
               format={(v) => `${v.toFixed(0)}%`}
             />
             <Slider
-              label="Position Y"
+              label={t('Position Y')}
               value={text.yPct}
               min={0}
               max={100}
@@ -728,7 +875,7 @@ export default function Inspector() {
             />
             <div className="insp-row">
               <label className="insp-color">
-                Outline
+                {t('Outline')}
                 <input
                   type="color"
                   value={text.strokeColor}
@@ -736,7 +883,7 @@ export default function Inspector() {
                 />
               </label>
               <label className="insp-color">
-                Box
+                {t('Box')}
                 <input
                   type="color"
                   value={text.boxColor}
@@ -745,7 +892,7 @@ export default function Inspector() {
               </label>
             </div>
             <Slider
-              label="Outline width"
+              label={t('Outline width')}
               value={text.strokeWidthPct}
               min={0}
               max={20}
@@ -754,7 +901,7 @@ export default function Inspector() {
               format={(v) => `${v.toFixed(1)}%`}
             />
             <Slider
-              label="Box opacity"
+              label={t('Box opacity')}
               value={text.boxOpacity}
               min={0}
               max={1}
@@ -767,19 +914,19 @@ export default function Inspector() {
         {isVisual && (
           <section className="insp-section">
             <h4>
-              Transform
+              {t('Transform')}
               <button
                 className="btn small"
-                title="Reset transform & keyframes"
+                title={t('Reset transform & keyframes')}
                 onClick={() => useEditor.getState().resetTransform(id)}
               >
-                Reset
+                {t('Reset')}
               </button>
             </h4>
             <KeyableSlider
               {...kProps}
               prop="opacity"
-              label="Opacity"
+              label={t('Opacity')}
               value={sampledOpacity}
               min={0}
               max={1}
@@ -790,7 +937,7 @@ export default function Inspector() {
             <KeyableSlider
               {...kProps}
               prop="scale"
-              label="Scale"
+              label={t('Scale')}
               value={sampled.scale}
               min={0.1}
               max={4}
@@ -801,7 +948,7 @@ export default function Inspector() {
             <KeyableSlider
               {...kProps}
               prop="posX"
-              label="Position X"
+              label={t('Position X')}
               value={sampled.posX}
               min={-1}
               max={1}
@@ -812,7 +959,7 @@ export default function Inspector() {
             <KeyableSlider
               {...kProps}
               prop="posY"
-              label="Position Y"
+              label={t('Position Y')}
               value={sampled.posY}
               min={-1}
               max={1}
@@ -823,7 +970,7 @@ export default function Inspector() {
             <KeyableSlider
               {...kProps}
               prop="rotationDeg"
-              label="Rotation"
+              label={t('Rotation')}
               value={sampled.rotationDeg}
               min={-180}
               max={180}
@@ -832,30 +979,31 @@ export default function Inspector() {
               keyTimes={keyTimes('rotationDeg')}
             />
             <div className="insp-row">
-              <button className="btn small" title="Slow zoom + pan" onClick={() => useEditor.getState().applyKenBurns(id)}>
-                ✨ Ken Burns
+              <button className="btn small" title={t('Slow zoom + pan')} onClick={() => useEditor.getState().applyKenBurns(id)}>
+                ✨ {t('Ken Burns')}
               </button>
-              <button className="btn small" title="Scale to fill the frame" onClick={() => useEditor.getState().fillFrame(id)}>
-                Fill frame
+              <button className="btn small" title={t('Scale to fill the frame')} onClick={() => useEditor.getState().fillFrame(id)}>
+                {t('Fill frame')}
               </button>
               {media?.kind === 'video' && (
                 <button
                   className="btn small"
-                  title="Track the subject with AI and add follow keyframes"
+                  title={t('Track the subject with AI and add follow keyframes')}
+                  data-no-snapshot // only opens the modal; applyReframe records its own step
                   onClick={() => useEditor.getState().setReframeOpen(true)}
                 >
-                  🎯 AI Reframe
+                  🎯 {t('AI Reframe')}
                 </button>
               )}
             </div>
             <details className="insp-crop">
-              <summary>Crop</summary>
+              <summary>{t('Crop')}</summary>
               {(['cropTop', 'cropBottom', 'cropLeft', 'cropRight'] as const).map((p) => (
                 <KeyableSlider
                   key={p}
                   {...kProps}
                   prop={p}
-                  label={p.replace('crop', '')}
+                  label={t(p.replace('crop', ''))}
                   value={sampled.crop[p.replace('crop', '').toLowerCase() as 'top' | 'bottom' | 'left' | 'right']}
                   min={0}
                   max={0.49}
@@ -871,25 +1019,25 @@ export default function Inspector() {
         {isVisual && (
           <section className="insp-section">
             <h4>
-              Chroma Key
+              {t('Chroma Key')}
               <label className="insp-switch">
                 <input
                   type="checkbox"
                   checked={chroma.enabled}
                   onChange={(e) => updateChroma(id, { enabled: e.target.checked })}
                 />
-                <span>{chroma.enabled ? 'On' : 'Off'}</span>
+                <span>{chroma.enabled ? t('On') : t('Off')}</span>
               </label>
             </h4>
             <div className="insp-row">
               <button className="btn small" onClick={() => updateChroma(id, { color: '#00d000', enabled: true })}>
-                🟩 Green
+                🟩 {t('Green')}
               </button>
               <button className="btn small" onClick={() => updateChroma(id, { color: '#0047bb', enabled: true })}>
-                🟦 Blue
+                🟦 {t('Blue')}
               </button>
               <label className="insp-color">
-                Key
+                {t('Key')}
                 <input
                   type="color"
                   value={chroma.color}
@@ -898,7 +1046,7 @@ export default function Inspector() {
               </label>
             </div>
             <Slider
-              label="Similarity"
+              label={t('Similarity')}
               value={chroma.similarity}
               min={0}
               max={1}
@@ -906,7 +1054,7 @@ export default function Inspector() {
               onChange={(v) => updateChroma(id, { similarity: v })}
             />
             <Slider
-              label="Smoothness"
+              label={t('Smoothness')}
               value={chroma.smoothness}
               min={0}
               max={1}
@@ -914,7 +1062,7 @@ export default function Inspector() {
               onChange={(v) => updateChroma(id, { smoothness: v })}
             />
             <Slider
-              label="Spill suppression"
+              label={t('Spill suppression')}
               value={chroma.spill}
               min={0}
               max={1}
@@ -922,7 +1070,7 @@ export default function Inspector() {
               onChange={(v) => updateChroma(id, { spill: v })}
             />
             <p className="insp-note">
-              Works on images and video. Drop in green/blue-screen footage and pick the screen color.
+              {t('Works on images and video. Drop in green/blue-screen footage and pick the screen color.')}
             </p>
           </section>
         )}
@@ -930,13 +1078,13 @@ export default function Inspector() {
         {isVisual && (
           <section className="insp-section">
             <h4>
-              Color
-              <button className="btn small" title="Reset color grade" onClick={() => useEditor.getState().resetColor(id)}>
-                Reset
+              {t('Color')}
+              <button className="btn small" title={t('Reset color grade')} onClick={() => useEditor.getState().resetColor(id)}>
+                {t('Reset')}
               </button>
             </h4>
             <Slider
-              label="Exposure"
+              label={t('Exposure')}
               value={color.exposure}
               min={-2}
               max={2}
@@ -945,7 +1093,7 @@ export default function Inspector() {
               format={(v) => `${v > 0 ? '+' : ''}${v.toFixed(2)}`}
             />
             <Slider
-              label="Contrast"
+              label={t('Contrast')}
               value={color.contrast}
               min={0}
               max={2}
@@ -954,7 +1102,7 @@ export default function Inspector() {
               format={(v) => `${Math.round(v * 100)}%`}
             />
             <Slider
-              label="Saturation"
+              label={t('Saturation')}
               value={color.saturation}
               min={0}
               max={2}
@@ -963,31 +1111,63 @@ export default function Inspector() {
               format={(v) => `${Math.round(v * 100)}%`}
             />
             <Slider
-              label="Temperature"
+              label={t('Temperature')}
               value={color.temperature}
               min={-1}
               max={1}
               step={0.01}
               onChange={(v) => updateColor(id, { temperature: v })}
-              format={(v) => (Math.abs(v) < 0.005 ? 'Neutral' : v < 0 ? `Cool ${Math.round(-v * 100)}` : `Warm ${Math.round(v * 100)}`)}
+              format={(v) =>
+                Math.abs(v) < 0.005
+                  ? t('Neutral')
+                  : v < 0
+                    ? t('Cool {n}', { n: Math.round(-v * 100) })
+                    : t('Warm {n}', { n: Math.round(v * 100) })
+              }
             />
             <Slider
-              label="Tint"
+              label={t('Tint')}
               value={color.tint}
               min={-1}
               max={1}
               step={0.01}
               onChange={(v) => updateColor(id, { tint: v })}
-              format={(v) => (Math.abs(v) < 0.005 ? 'Neutral' : v < 0 ? `Green ${Math.round(-v * 100)}` : `Magenta ${Math.round(v * 100)}`)}
+              format={(v) =>
+                Math.abs(v) < 0.005
+                  ? t('Neutral')
+                  : v < 0
+                    ? t('Green {n}', { n: Math.round(-v * 100) })
+                    : t('Magenta {n}', { n: Math.round(v * 100) })
+              }
             />
+          </section>
+        )}
+
+        {isVisual && (
+          <section className="insp-section">
+            <h4>
+              {t('Curves')}
+              <button
+                className="btn small"
+                title={t('Reset all curves')}
+                disabled={!eff.curves}
+                onClick={() => useEditor.getState().resetCurves(id)}
+              >
+                {t('Reset all')}
+              </button>
+            </h4>
+            <CurvesEditor clipId={id} curves={eff.curves} />
+            <p className="insp-note">
+              {t('Click to add a point, drag to move, double-click or right-click to remove. Applied after the color grade.')}
+            </p>
           </section>
         )}
 
         {isAudible && (
           <section className="insp-section">
-            <h4>Audio</h4>
+            <h4>{t('Audio')}</h4>
             <Slider
-              label="Volume"
+              label={t('Volume')}
               value={audio.volume}
               min={0}
               max={1}
@@ -995,7 +1175,7 @@ export default function Inspector() {
               onChange={(v) => updateAudio(id, { volume: v })}
             />
             <Slider
-              label="Fade in"
+              label={t('Fade in')}
               value={Math.min(audio.fadeInSec, fadeMax)}
               min={0}
               max={fadeMax}
@@ -1004,7 +1184,7 @@ export default function Inspector() {
               format={(v) => `${v.toFixed(2)}s`}
             />
             <Slider
-              label="Fade out"
+              label={t('Fade out')}
               value={Math.min(audio.fadeOutSec, fadeMax)}
               min={0}
               max={fadeMax}
@@ -1024,7 +1204,7 @@ export default function Inspector() {
                       if (enabled) ensureDenoised(media.id, media.path as string)
                     }}
                   />
-                  <span>Denoise</span>
+                  <span>{t('Denoise')}</span>
                 </label>
                 {clip.denoiseEnabled &&
                   (() => {
@@ -1032,17 +1212,17 @@ export default function Inspector() {
                     return (
                       <p className="insp-note">
                         {entry?.status === 'ready'
-                          ? 'Noise removal applied — reused for export.'
+                          ? t('Noise removal applied — reused for export.')
                           : entry?.status === 'error'
-                            ? `Denoise failed: ${entry.error ?? 'unknown error'}`
-                            : 'Processing… this can take a while for long clips.'}
+                            ? t('Denoise failed: {error}', { error: entry.error ?? t('unknown error') })
+                            : t('Processing… this can take a while for long clips.')}
                       </p>
                     )
                   })()}
               </>
             )}
             {media?.kind === 'video' && (
-              <p className="insp-note">This is the video clip&apos;s own audio (plays in preview and export).</p>
+              <p className="insp-note">{t("This is the video clip's own audio (plays in preview and export).")}</p>
             )}
           </section>
         )}

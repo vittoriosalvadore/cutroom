@@ -16,6 +16,20 @@ export interface ClipBounds {
 /** A clip can never be trimmed shorter than this. */
 export const MIN_CLIP_SEC = 0.1
 
+/** Nearest candidate within `thresholdSec`, or null when nothing is close enough. */
+function nearestCandidate(value: number, candidates: number[], thresholdSec: number): number | null {
+  let best: number | null = null
+  let bestDist = thresholdSec
+  for (const c of candidates) {
+    const d = Math.abs(c - value)
+    if (d <= bestDist) {
+      bestDist = d
+      best = c
+    }
+  }
+  return best
+}
+
 /**
  * Snap a time to the nearest candidate within `thresholdPx` (converted to
  * seconds via the zoom). Returns the snapped time, or the input if nothing is
@@ -27,19 +41,7 @@ export function snapTime(
   pxPerSec: number,
   thresholdPx = 8
 ): number {
-  const thresholdSec = thresholdPx / pxPerSec
-  let best = value
-  let bestDist = thresholdSec
-  let found = false
-  for (const c of candidates) {
-    const d = Math.abs(c - value)
-    if (d <= bestDist) {
-      bestDist = d
-      best = c
-      found = true
-    }
-  }
-  return found ? best : value
+  return nearestCandidate(value, candidates, thresholdPx / pxPerSec) ?? value
 }
 
 /**
@@ -54,15 +56,18 @@ export function snapMove(
   pxPerSec: number,
   thresholdPx = 8
 ): number {
-  const snapStart = snapTime(rawStart, candidates, pxPerSec, thresholdPx)
-  const snapByEnd = snapTime(rawStart + durationSec, candidates, pxPerSec, thresholdPx) - durationSec
-  const startMoved = snapStart !== rawStart
-  const endMoved = snapByEnd !== rawStart
-  if (startMoved && endMoved) {
+  const thresholdSec = thresholdPx / pxPerSec
+  // Track whether each edge actually snapped explicitly: comparing the result
+  // against rawStart would misfire on float noise ((a + d) - d !== a).
+  const startHit = nearestCandidate(rawStart, candidates, thresholdSec)
+  const endHit = nearestCandidate(rawStart + durationSec, candidates, thresholdSec)
+  const snapStart = startHit ?? rawStart
+  const snapByEnd = endHit != null ? endHit - durationSec : rawStart
+  if (startHit != null && endHit != null) {
     return Math.abs(snapStart - rawStart) <= Math.abs(snapByEnd - rawStart) ? snapStart : snapByEnd
   }
-  if (startMoved) return snapStart
-  if (endMoved) return snapByEnd
+  if (startHit != null) return snapStart
+  if (endHit != null) return snapByEnd
   return rawStart
 }
 
@@ -215,7 +220,9 @@ export interface RippleMarker {
 
 /**
  * Shift markers/regions the same way rippleShift shifts clips: any time at/
- * after removedStartSec moves left by removedDurationSec. Ripple-delete today
+ * after the removed range's END moves left by removedDurationSec; a time
+ * INSIDE the removed range collapses to its start (the footage it pointed at is
+ * gone, so the nearest surviving spot is the cut point). Ripple-delete today
  * (store.ts) only shifts clips, never markers — silently desyncing marker
  * positions whenever something is ripple-deleted. Auto-cut-silence calls
  * ripple-delete far more densely than today's manual usage, so this fixes it.
@@ -225,6 +232,50 @@ export function rippleShiftMarkers<T extends RippleMarker>(
   removedStartSec: number,
   removedDurationSec: number
 ): T[] {
-  const shift = (t: number): number => (t >= removedStartSec - 1e-6 ? Math.max(0, t - removedDurationSec) : t)
+  const shift = (t: number): number => shiftTimeForRanges(t, [{ startSec: removedStartSec, durationSec: removedDurationSec }])
   return markers.map((m) => ({ ...m, timeSec: shift(m.timeSec), endSec: m.endSec != null ? shift(m.endSec) : m.endSec }))
+}
+
+/** A removed span of timeline: [startSec, startSec + durationSec). */
+export interface RemovedRange {
+  startSec: number
+  durationSec: number
+}
+
+/**
+ * Union possibly-overlapping removed ranges (e.g. clips deleted from several
+ * tracks at once) into sorted, non-overlapping spans. Markers live on the
+ * shared timeline, not a lane, so two clips deleted in parallel on V1 and A1
+ * remove that time ONCE, not twice.
+ */
+export function mergeRemovedRanges(ranges: RemovedRange[]): RemovedRange[] {
+  const sorted = ranges.filter((r) => r.durationSec > 0).sort((a, b) => a.startSec - b.startSec)
+  const out: RemovedRange[] = []
+  for (const r of sorted) {
+    const last = out[out.length - 1]
+    const end = r.startSec + r.durationSec
+    if (last && r.startSec <= last.startSec + last.durationSec + 1e-6) {
+      last.durationSec = Math.max(last.durationSec, end - last.startSec)
+    } else {
+      out.push({ startSec: r.startSec, durationSec: r.durationSec })
+    }
+  }
+  return out
+}
+
+/**
+ * Where time `t` lands after removing every range in `ranges` (which must be
+ * non-overlapping — see mergeRemovedRanges). Evaluated against the ORIGINAL
+ * positions in one pass, so the result is independent of range order: each
+ * range wholly before `t` pulls it left by its duration; a range containing `t`
+ * collapses it onto that range's start.
+ */
+export function shiftTimeForRanges(t: number, ranges: RemovedRange[]): number {
+  let shift = 0
+  for (const r of ranges) {
+    const end = r.startSec + r.durationSec
+    if (t >= end - 1e-6) shift += r.durationSec
+    else if (t > r.startSec) shift += t - r.startSec
+  }
+  return Math.max(0, t - shift)
 }

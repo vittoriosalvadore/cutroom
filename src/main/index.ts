@@ -6,9 +6,21 @@ import { Readable } from 'stream'
 import { registerExportIpc } from './export'
 import { registerAudioMuxIpc } from './audioMux'
 import { registerDenoiseIpc } from './denoise'
+import { registerScrubAudioIpc } from './scrubAudio'
+import { registerProxyIpc, sweepStaleProxyPartials } from './proxy'
 import { clearSessionLock, flagRecoveryPending, initProjectStore, registerProjectIpc } from './projectStore'
 import { readSettingsSync, registerSettingsIpc } from './settings'
 import { shouldFlagRecovery } from './crashFlags'
+import { shutdownFfmpeg, sweepStaleTemps } from './ffmpeg'
+import { isLocalFilePath } from './paths'
+import { parseRange } from './range'
+
+// One instance only: a second one would mistake the first one's session.lock
+// for a crash and both would write the same recovery ring.
+if (!app.requestSingleInstanceLock()) {
+  app.quit()
+  process.exit(0)
+}
 
 // Keep the main process alive on unexpected errors rather than hard-crashing —
 // the renderer autosaves to recovery, and a logged error beats a dead window.
@@ -67,23 +79,22 @@ const MIME: Record<string, string> = {
 async function serveMedia(request: Request): Promise<Response> {
   try {
     const filePath = new URL(request.url).searchParams.get('path')
-    if (!filePath) return new Response('missing path', { status: 400 })
+    if (!isLocalFilePath(filePath)) return new Response('bad path', { status: 400 })
 
     const info = await stat(filePath)
     const size = info.size
     const type = MIME[extname(filePath).toLowerCase()] ?? 'application/octet-stream'
     const rangeHeader = request.headers.get('range')
 
-    if (rangeHeader) {
-      const match = /bytes=(\d*)-(\d*)/.exec(rangeHeader)
-      let start = match && match[1] ? parseInt(match[1], 10) : 0
-      let end = match && match[2] ? parseInt(match[2], 10) : size - 1
-      if (!Number.isFinite(start) || start < 0) start = 0
-      if (!Number.isFinite(end) || end >= size) end = size - 1
-      if (start > end) {
-        start = 0
-        end = size - 1
-      }
+    const range = rangeHeader ? parseRange(rangeHeader, size) : null
+    if (range === 'unsatisfiable') {
+      return new Response(null, {
+        status: 416,
+        headers: { 'Content-Range': `bytes */${size}`, 'Access-Control-Allow-Origin': '*' }
+      })
+    }
+    if (range) {
+      const { start, end } = range
       const body = Readable.toWeb(createReadStream(filePath, { start, end })) as unknown as ReadableStream
       return new Response(body, {
         status: 206,
@@ -132,20 +143,42 @@ function createWindow(): void {
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       // contextIsolation keeps renderer code from reaching Node directly; the
-      // preload bridge is the only door. sandbox:false lets the preload use
-      // CommonJS require, which electron-vite emits.
+      // preload bridge is the only door. The preload only needs contextBridge,
+      // ipcRenderer and webUtils, all available to a sandboxed preload.
       contextIsolation: true,
-      sandbox: false,
+      sandbox: true,
       nodeIntegration: false
     }
   })
 
   mainWindow.on('ready-to-show', () => mainWindow.show())
 
-  // Open target="_blank" / external links in the user's real browser, never in-app.
+  // Open target="_blank" / external links in the user's real browser, never
+  // in-app — and only web links, never file: or custom schemes the OS might
+  // hand to another program.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url)
+    if (/^https?:\/\//i.test(url)) void shell.openExternal(url)
     return { action: 'deny' }
+  })
+  // The app is a single page: never navigate the window away from it (e.g. a
+  // file dropped outside the drop zone, or a stray link).
+  mainWindow.webContents.on('will-navigate', (e, url) => {
+    if (url !== mainWindow.webContents.getURL()) e.preventDefault()
+  })
+
+  // The renderer's beforeunload handler blocks closing while the project has
+  // unsaved changes; Electron shows no prompt of its own, so ask here.
+  mainWindow.webContents.on('will-prevent-unload', (e) => {
+    const choice = dialog.showMessageBoxSync(mainWindow, {
+      type: 'warning',
+      buttons: ['Discard changes', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      title: 'Unsaved changes',
+      message: 'This project has unsaved changes.',
+      detail: 'Close anyway and discard them?'
+    })
+    if (choice === 0) e.preventDefault() // ignore beforeunload → close proceeds
   })
 
   // Crash detection: flag recovery when the renderer dies abnormally (OOM,
@@ -207,6 +240,9 @@ function registerIpc(): void {
   registerExportIpc()
   registerAudioMuxIpc()
   registerDenoiseIpc()
+  registerScrubAudioIpc()
+  // Preview proxies (optimized media) in userData/proxies.
+  registerProxyIpc()
 
   // Project save/load + crash recovery.
   registerProjectIpc()
@@ -239,8 +275,18 @@ function registerIpc(): void {
   })
 }
 
+// A second launch focuses the existing window instead.
+app.on('second-instance', () => {
+  const win = BrowserWindow.getAllWindows()[0]
+  if (!win) return
+  if (win.isMinimized()) win.restore()
+  win.focus()
+})
+
 app.whenReady().then(() => {
   initProjectStore() // detect a prior crash + mark this session active
+  sweepStaleTemps() // temp media left behind by a crashed/killed session
+  sweepStaleProxyPartials() // half-written proxies from a crashed/killed session
   registerIpc()
   createWindow()
 
@@ -252,7 +298,12 @@ app.whenReady().then(() => {
 
 // Removing the session lock here records a clean shutdown, so the next launch
 // won't offer recovery. A crash/kill skips this, leaving the lock as the signal.
-app.on('will-quit', () => clearSessionLock())
+app.on('will-quit', () => {
+  clearSessionLock()
+  // Kill any encoder/mux/denoise/proxy job still running and remove their temp
+  // (and partial proxy) files.
+  shutdownFfmpeg()
+})
 
 // A utility/GPU process crash can take the renderer's WebGL context with it.
 // Flag recovery so the next launch offers recovered work; the compositor

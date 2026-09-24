@@ -53,6 +53,50 @@ describe('settings sanitize', () => {
     expect(sanitize({ snapping: false }).snapping).toBe(false)
   })
 
+  it('audio scrubbing defaults on and only accepts a boolean', () => {
+    expect(DEFAULT_SETTINGS.audioScrub).toBe(true)
+    expect(sanitize({ audioScrub: false }).audioScrub).toBe(false)
+    expect(sanitize({ audioScrub: 'no' })).not.toHaveProperty('audioScrub')
+  })
+
+  it('keeps a valid preview quality and drops an unknown one', () => {
+    expect(sanitize({ previewQuality: 'half' }).previewQuality).toBe('half')
+    expect(sanitize({ previewQuality: 'quarter' }).previewQuality).toBe('quarter')
+    expect(sanitize({ previewQuality: 'eighth' })).not.toHaveProperty('previewQuality')
+    expect(sanitize({ previewQuality: 0.5 })).not.toHaveProperty('previewQuality')
+    expect(DEFAULT_SETTINGS.previewQuality).toBe('full')
+  })
+
+  it('validates the remembered export preset fields', () => {
+    const clean = sanitize({
+      exportFormat: 'mp4-hevc',
+      exportResolution: '720',
+      exportQualityMode: 'bitrate',
+      exportBitrateMbps: 16,
+      exportEncoder: 'nvenc'
+    })
+    expect(clean).toMatchObject({
+      exportFormat: 'mp4-hevc',
+      exportResolution: '720',
+      exportQualityMode: 'bitrate',
+      exportBitrateMbps: 16,
+      exportEncoder: 'nvenc'
+    })
+    expect(sanitize({ exportFormat: 'avi' })).not.toHaveProperty('exportFormat')
+    expect(sanitize({ exportResolution: '1440' })).not.toHaveProperty('exportResolution')
+    expect(sanitize({ exportQualityMode: 'vbr' })).not.toHaveProperty('exportQualityMode')
+    expect(sanitize({ exportEncoder: 'cuda' })).not.toHaveProperty('exportEncoder')
+    expect(sanitize({ exportBitrateMbps: '8' })).not.toHaveProperty('exportBitrateMbps')
+    expect(sanitize({ exportBitrateMbps: 9999 }).exportBitrateMbps).toBe(200)
+  })
+
+  it('proxy options: preview proxies on, auto-create off by default; booleans only', () => {
+    expect(DEFAULT_SETTINGS.useProxies).toBe(true)
+    expect(DEFAULT_SETTINGS.autoProxy).toBe(false)
+    expect(sanitize({ useProxies: false, autoProxy: true })).toEqual({ useProxies: false, autoProxy: true })
+    expect(sanitize({ useProxies: 'yes', autoProxy: 1 })).toEqual({})
+  })
+
   it('every default value survives a round-trip through sanitize', () => {
     expect(sanitize(DEFAULT_SETTINGS)).toEqual(DEFAULT_SETTINGS)
   })

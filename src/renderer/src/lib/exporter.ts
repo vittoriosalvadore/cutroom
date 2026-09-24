@@ -1,14 +1,17 @@
 import type { Project } from '../types'
 import type { AudioClipPlanEntry } from '../../../preload'
 import { Compositor } from './compositor'
-import { resolveDuck } from '../state/selectors'
+import { resolveDuck, resolveReverb } from '../state/selectors'
 import { useSettings } from '../state/settings'
 import { ensureDenoisedForExport, getDenoiseEntry } from './denoiseCache'
+import { formatInfo, type EncoderChoice } from '../../../shared/exportOptions'
 
 // ---------------------------------------------------------------------------
 // Export driver (renderer side). Two passes:
 //   1. Render the timeline frame-by-frame with the preview compositor, stream
-//      PNGs to FFmpeg -> a SILENT temp MP4 (WYSIWYG: it is the preview pipeline).
+//      JPEGs to FFmpeg -> a SILENT temp MP4/WebM (WYSIWYG: it is the preview
+//      pipeline). Main scales/encodes per the export preset; a failed hardware
+//      encode is retried once in software.
 //   2. Build the audible-clip plan and have the main process mux a mixed
 //      soundtrack into that video, writing the user's chosen file.
 // ---------------------------------------------------------------------------
@@ -64,11 +67,16 @@ function buildAudioPlan(project: Project): AudioClipPlanEntry[] {
             makeupDb: track.comp.makeupDb
           }
         : undefined
+    const rv = resolveReverb(track)
+    const reverb = rv
+      ? { mix: rv.mix, decaySec: rv.decaySec, preDelayMs: rv.preDelayMs, tone: rv.tone }
+      : undefined
     // Denoise is a source-media substitution: swap in the cached temp WAV
     // (readied by the export preflight below) when enabled, falling back to
     // the original on any glitch — export must never hard-fail over denoise.
     const denoised = clip.denoiseEnabled ? getDenoiseEntry(media.id) : undefined
-    const path = denoised?.status === 'ready' && denoised.tempPath ? denoised.tempPath : media.path
+    const denoisedPath = denoised?.status === 'ready' ? denoised.tempPath : undefined
+    const path = denoisedPath || media.path
     plan.push({
       path,
       startSec: clip.startSec,
@@ -85,7 +93,12 @@ function buildAudioPlan(project: Project): AudioClipPlanEntry[] {
       gate,
       duck,
       eq,
-      comp
+      comp,
+      reverb,
+      // A (non-denoised) video-track clip plays through its <video> element
+      // tap straight into the preview master — no track panner — where
+      // WebAudio up-mixes mono at unity (see audioPool resolvePreviewBuffer).
+      ...(track.kind !== 'audio' && !denoisedPath ? { directTap: true } : {})
     })
   }
   return plan
@@ -118,8 +131,10 @@ function canvasToJpeg(canvas: HTMLCanvasElement): Promise<ArrayBuffer> {
 
 /**
  * Returns a cheap integer hash of the rendered canvas content by drawing it
- * to a 32×18 thumbnail and sampling all pixels. Used to detect identical
- * frames and skip re-encoding (huge win for static-image timelines).
+ * to a 32×18 thumbnail and sampling all pixels. A PRE-FILTER only: different
+ * hashes prove the frames differ, but equal hashes do not prove they match (a
+ * moving cursor or a changed caption can vanish in the downscale), so a hash
+ * hit is confirmed by framesIdentical() before a JPEG is reused.
  */
 function frameHash(src: HTMLCanvasElement, thumb: HTMLCanvasElement): number {
   const ctx = thumb.getContext('2d')!
@@ -130,26 +145,54 @@ function frameHash(src: HTMLCanvasElement, thumb: HTMLCanvasElement): number {
   return h
 }
 
+/** Full-resolution pixel equality of two same-size 2D canvases. */
+function framesIdentical(a: HTMLCanvasElement, b: HTMLCanvasElement): boolean {
+  const w = a.width
+  const h = a.height
+  const da = new Uint32Array(a.getContext('2d')!.getImageData(0, 0, w, h).data.buffer)
+  const db = new Uint32Array(b.getContext('2d')!.getImageData(0, 0, w, h).data.buffer)
+  if (da.length !== db.length) return false
+  for (let i = 0; i < da.length; i++) if (da[i] !== db[i]) return false
+  return true
+}
+
+/** Export result. `warning` is set when the export succeeded via a fallback. */
+export interface ExportOutcome {
+  ok: boolean
+  error?: string
+  warning?: string
+  /** The FFmpeg video encoder that produced the file. */
+  encoder?: string
+}
+
 /**
  * Run a full export. Returns when the file is written (ok:true) or on
- * error/cancel. `shouldCancel` is polled each frame.
+ * error/cancel. `shouldCancel` is polled each frame. Format, resolution,
+ * quality and encoder come from the (remembered) export settings.
  */
 export async function exportTimeline(
   project: Project,
   outputPath: string,
   onProgress: (p: ExportProgress) => void,
   shouldCancel: () => boolean
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<ExportOutcome> {
   const duration = timelineDuration(project)
   if (duration <= 0) return { ok: false, error: 'Timeline is empty — add a clip first.' }
 
   const fps = project.fps
   const totalFrames = Math.max(1, Math.round(duration * fps))
+  const settings = useSettings.getState()
+  const ext = formatInfo(settings.exportFormat).ext
 
+  // Frames always render at PROJECT size (the compositor is untouched); the
+  // resolution preset is applied by FFmpeg's scale filter in pass 1.
   const canvas = document.createElement('canvas')
   canvas.width = project.width
   canvas.height = project.height
 
+  // Export ALWAYS decodes the original full-quality media: this compositor is
+  // built without the preview's proxy resolver (and renderExact bypasses it
+  // regardless), and the audio plan below reads MediaItem.path too.
   let comp: Compositor
   try {
     comp = new Compositor(canvas, () => undefined, { preserveDrawingBuffer: true })
@@ -159,13 +202,105 @@ export async function exportTimeline(
 
   // The pass-1 silent file is normally consumed (deleted) by muxAudio. On any
   // other exit — cancel, frame failure, encode failure, exception — we delete it
-  // here so temp MP4s don't accumulate.
+  // here so temp videos don't accumulate.
   let silentPath = ''
   const discardTemp = async (): Promise<void> => {
     if (silentPath) {
       await window.cutroom.discardTemp(silentPath).catch(() => undefined)
       silentPath = ''
     }
+  }
+
+  /**
+   * Pass 1: render every frame into a fresh silent temp video with the given
+   * encoder choice. On failure the temp file is already discarded; `hardware`
+   * says whether a hardware encoder was the one running.
+   */
+  const renderPass = async (
+    encoder: EncoderChoice
+  ): Promise<{ ok: boolean; error?: string; hardware?: boolean; encoder?: string }> => {
+    silentPath = await window.cutroom.exportTempVideoPath(ext)
+    const started = await window.cutroom.exportStart({
+      width: project.width,
+      height: project.height,
+      fps,
+      outputPath: silentPath,
+      preset: settings.exportPreset,
+      crf: settings.exportCrf,
+      format: settings.exportFormat,
+      resolution: settings.exportResolution,
+      qualityMode: settings.exportQualityMode,
+      bitrateMbps: settings.exportBitrateMbps,
+      encoder
+    })
+    if (!started.ok) {
+      await discardTemp()
+      return { ok: false, error: started.error ?? 'Could not start FFmpeg.' }
+    }
+    const fail = async (error: string): Promise<{ ok: false; error: string; hardware?: boolean }> => {
+      await window.cutroom.exportCancel()
+      await discardTemp()
+      return { ok: false, error, hardware: started.hardware }
+    }
+
+    // 32×18 thumbnail canvas used for frame-change detection (< 2 KB of pixels).
+    // drawImage from the WebGL canvas to a 2D context is GPU-accelerated and
+    // costs ~1 ms — much cheaper than a full PNG/JPEG encode.
+    const thumb = document.createElement('canvas')
+    thumb.width = 32
+    thumb.height = 18
+    // Full-res copies of the previous and current frame (GPU-side drawImage,
+    // cheap); pixels are only read back when the thumbnail hash matches.
+    const makeFull = (): HTMLCanvasElement => {
+      const c = document.createElement('canvas')
+      c.width = project.width
+      c.height = project.height
+      return c
+    }
+    let prevFull = makeFull()
+    let curFull = makeFull()
+    let lastHash = -1
+    let lastJpeg: ArrayBuffer | null = null
+
+    for (let i = 0; i < totalFrames; i++) {
+      if (shouldCancel()) {
+        await fail('Export cancelled.')
+        return { ok: false, error: 'Export cancelled.' }
+      }
+      await comp.renderExact(project, i / fps)
+
+      // Skip re-encoding only if the rendered output is PROVABLY identical to
+      // the previous frame (hash pre-filter, then a full-resolution compare).
+      // Still a big speedup for static-image timelines (all frames equal).
+      const hash = frameHash(canvas, thumb)
+      const curCtx = curFull.getContext('2d')!
+      curCtx.clearRect(0, 0, curFull.width, curFull.height)
+      curCtx.drawImage(canvas, 0, 0)
+      let jpeg: ArrayBuffer
+      if (hash === lastHash && lastJpeg !== null && framesIdentical(curFull, prevFull)) {
+        jpeg = lastJpeg
+      } else {
+        jpeg = await canvasToJpeg(canvas)
+        lastHash = hash
+        lastJpeg = jpeg
+      }
+      // The current frame becomes the comparison baseline for the next one.
+      const baseline = curFull
+      curFull = prevFull
+      prevFull = baseline
+
+      const wrote = await window.cutroom.exportFrame(jpeg)
+      if (!wrote.ok) return fail(wrote.error ?? 'Failed while writing a frame.')
+      onProgress({ phase: 'rendering', frame: i + 1, totalFrames })
+    }
+
+    onProgress({ phase: 'encoding' })
+    const finished = await window.cutroom.exportFinish()
+    if (!finished.ok) {
+      await discardTemp()
+      return { ok: false, error: finished.error ?? 'Encoding failed.', hardware: started.hardware }
+    }
+    return { ok: true, hardware: started.hardware, encoder: started.encoder }
   }
 
   try {
@@ -176,66 +311,18 @@ export async function exportTimeline(
     // the original (undenoised) audio for that clip.
     await ensureDenoisedForExport(project)
 
-    // Pass 1: render the silent video to a temp file.
-    silentPath = await window.cutroom.exportTempVideoPath()
-    const settings = useSettings.getState()
-    const started = await window.cutroom.exportStart({
-      width: project.width,
-      height: project.height,
-      fps,
-      outputPath: silentPath,
-      preset: settings.exportPreset,
-      crf: settings.exportCrf
-    })
-    if (!started.ok) {
-      await discardTemp()
-      return { ok: false, error: started.error ?? 'Could not start FFmpeg.' }
+    let pass = await renderPass(settings.exportEncoder)
+    let warning: string | undefined
+    // A hardware encoder can pass the probe and still fail on the real job
+    // (session limits, size caps, driver hiccup) — at start or mid-stream.
+    // Retry the whole pass once in software rather than failing the export.
+    if (!pass.ok && pass.hardware && pass.error !== 'Export cancelled.') {
+      console.warn('[export] hardware encode failed, retrying in software:', pass.error)
+      onProgress({ phase: 'preparing' })
+      pass = await renderPass('software')
+      if (pass.ok) warning = 'The hardware encoder failed, so this export used the software encoder.'
     }
-
-    // 32×18 thumbnail canvas used for frame-change detection (< 2 KB of pixels).
-    // drawImage from the WebGL canvas to a 2D context is GPU-accelerated and
-    // costs ~1 ms — much cheaper than a full PNG/JPEG encode.
-    const thumb = document.createElement('canvas')
-    thumb.width = 32
-    thumb.height = 18
-    let lastHash = -1
-    let lastJpeg: ArrayBuffer | null = null
-
-    for (let i = 0; i < totalFrames; i++) {
-      if (shouldCancel()) {
-        await window.cutroom.exportCancel()
-        await discardTemp()
-        return { ok: false, error: 'Export cancelled.' }
-      }
-      await comp.renderExact(project, i / fps)
-
-      // Skip re-encoding if the rendered output is identical to the previous frame.
-      // This gives a massive speedup for static-image timelines (all frames equal).
-      const hash = frameHash(canvas, thumb)
-      let jpeg: ArrayBuffer
-      if (hash === lastHash && lastJpeg !== null) {
-        jpeg = lastJpeg
-      } else {
-        jpeg = await canvasToJpeg(canvas)
-        lastHash = hash
-        lastJpeg = jpeg
-      }
-
-      const wrote = await window.cutroom.exportFrame(jpeg)
-      if (!wrote.ok) {
-        await window.cutroom.exportCancel()
-        await discardTemp()
-        return { ok: false, error: wrote.error ?? 'Failed while writing a frame.' }
-      }
-      onProgress({ phase: 'rendering', frame: i + 1, totalFrames })
-    }
-
-    onProgress({ phase: 'encoding' })
-    const finished = await window.cutroom.exportFinish()
-    if (!finished.ok) {
-      await discardTemp()
-      return finished
-    }
+    if (!pass.ok) return { ok: false, error: pass.error }
 
     // Pass 2: mux the mixed audio into the silent video at the user's path.
     onProgress({ phase: 'muxing' })
@@ -243,7 +330,8 @@ export async function exportTimeline(
       silentPath,
       outputPath,
       sampleRate: project.sampleRate,
-      clips: buildAudioPlan(project)
+      clips: buildAudioPlan(project),
+      durationSec: totalFrames / fps
     })
     if (!mux.ok) {
       await discardTemp() // covers mux guard-returns that don't delete the temp
@@ -252,7 +340,7 @@ export async function exportTimeline(
     silentPath = '' // consumed by a successful mux
 
     onProgress({ phase: 'done', frame: totalFrames, totalFrames })
-    return { ok: true }
+    return { ok: true, warning, encoder: pass.encoder }
   } catch (e) {
     await window.cutroom.exportCancel().catch(() => undefined)
     await discardTemp()

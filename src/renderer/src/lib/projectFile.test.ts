@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { serializeProject, deserializeProject } from './projectFile'
+import { serializeProject, deserializeProject, FILE_VERSION } from './projectFile'
 import type { Project } from '../types'
 
 function sample(): Project {
@@ -73,5 +73,134 @@ describe('project (de)serialize', () => {
       expect(r.project.sampleRate).toBe(48000)
       expect(r.project.name).toBe('Untitled Project')
     }
+  })
+
+  it('rejects a file from a newer format version with a clear error', () => {
+    const json = JSON.stringify({ app: 'cutroom', version: FILE_VERSION + 1, project: sample() })
+    const r = deserializeProject(json)
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error).toMatch(/newer version/)
+  })
+
+  it('rejects arrays in place of the clips/media maps', () => {
+    expect(deserializeProject(JSON.stringify({ project: { ...sample(), clips: [] } })).ok).toBe(false)
+    expect(deserializeProject(JSON.stringify({ project: { ...sample(), media: [] } })).ok).toBe(false)
+  })
+
+  it('rejects malformed tracks (non-object, missing id, unknown kind)', () => {
+    const bad = (tracks: unknown[]): boolean => deserializeProject(JSON.stringify({ project: { ...sample(), tracks } })).ok
+    expect(bad([null])).toBe(false)
+    expect(bad([{ kind: 'video' }])).toBe(false)
+    expect(bad([{ id: 'v1', kind: 'subtitle' }])).toBe(false)
+  })
+
+  it('drops invalid clips but keeps the rest of the file', () => {
+    const p = sample()
+    const raw = {
+      ...p,
+      clips: {
+        ...p.clips,
+        nan: { ...p.clips.c1, id: 'nan', startSec: 'x' },
+        zero: { ...p.clips.c1, id: 'zero', durationSec: 0 },
+        orphan: { ...p.clips.c1, id: 'orphan', trackId: 'gone' },
+        noMedia: { ...p.clips.c1, id: 'noMedia', mediaId: 'm_missing' },
+        title: { ...p.clips.c1, id: 'title', mediaId: null },
+        junk: 42
+      }
+    }
+    const r = deserializeProject(JSON.stringify({ project: raw }))
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(Object.keys(r.project.clips).sort()).toEqual(['c1', 'title'])
+  })
+
+  it('sorts keyframes and drops malformed keys', () => {
+    const p = sample()
+    const raw = {
+      ...p,
+      clips: {
+        c1: {
+          ...p.clips.c1,
+          keyframes: {
+            scale: [
+              { t: 3, v: 2, ease: 'linear' },
+              { t: 'bad', v: 1, ease: 'linear' },
+              { t: 1, v: 1, ease: 'hold' }
+            ]
+          }
+        }
+      }
+    }
+    const r = deserializeProject(JSON.stringify({ project: raw }))
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.project.clips.c1.keyframes?.scale).toEqual([
+        { t: 1, v: 1, ease: 'hold' },
+        { t: 3, v: 2, ease: 'linear' }
+      ])
+    }
+  })
+
+  it('validates track effect blocks instead of passing garbage through', () => {
+    const p = sample()
+    const audio = { id: 'a1', kind: 'audio', name: 'A1', height: 52, muted: false, hidden: false }
+    const raw = {
+      ...p,
+      tracks: [...p.tracks, audio].map((t) =>
+        t.id === audio.id
+          ? {
+              ...t,
+              pan: 7,
+              reverb: { enabled: true, decaySec: '2', mix: 5 },
+              gate: { enabled: 'yes', thresholdDb: -30, attackMs: null },
+              duck: { enabled: true, triggerTrackId: 42 },
+              eq: 'loud'
+            }
+          : t
+      )
+    }
+    const r = deserializeProject(JSON.stringify({ project: raw }))
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    const t = r.project.tracks.find((x) => x.id === audio.id)!
+    expect(t.pan).toBe(1)
+    expect(t.reverb?.enabled).toBe(true)
+    expect(typeof t.reverb?.decaySec).toBe('number') // "2" -> default, never a string
+    expect(t.reverb?.mix).toBeLessThanOrEqual(1)
+    expect(t.gate?.enabled).toBe(false) // non-boolean -> default
+    expect(t.gate?.thresholdDb).toBe(-30)
+    expect(Number.isFinite(t.gate?.attackMs)).toBe(true)
+    expect(t.duck?.triggerTrackId).toBeNull()
+    expect(t.eq).toBeUndefined()
+  })
+
+  it('round-trips RGB curves on a clip', () => {
+    const p = sample()
+    const curves = {
+      master: [{ x: 0, y: 0 }, { x: 0.25, y: 0.15 }, { x: 0.75, y: 0.85 }, { x: 1, y: 1 }],
+      r: [{ x: 0, y: 0 }, { x: 1, y: 0.9 }],
+      g: [{ x: 0, y: 0 }, { x: 1, y: 1 }],
+      b: [{ x: 0, y: 0.05 }, { x: 1, y: 1 }]
+    }
+    p.clips.c1.effects = { opacity: 1, chroma: { enabled: false, color: '#00d000', similarity: 0.4, smoothness: 0.1, spill: 0.25 }, curves }
+    const r = deserializeProject(serializeProject(p))
+    expect(r.ok && r.project.clips.c1.effects?.curves).toEqual(curves)
+  })
+
+  it('sanitizes curve points: clamps, sorts, drops malformed, identity -> removed', () => {
+    const p = sample() as unknown as { clips: Record<string, Record<string, unknown>> }
+    p.clips.c1.effects = {
+      opacity: 1,
+      chroma: { enabled: false, color: '#00d000', similarity: 0.4, smoothness: 0.1, spill: 0.25 },
+      curves: { master: [{ x: 1, y: 1.4 }, 'junk', { x: 0.5, y: 0.2 }, { x: -3, y: 0 }], r: 'nope' }
+    }
+    p.clips.c2 = { ...p.clips.c1, id: 'c2', effects: { opacity: 1, chroma: {}, curves: { g: [{ x: 0, y: 0 }, { x: 1, y: 1 }] } } }
+    const r = deserializeProject(JSON.stringify(p))
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    const c = r.project.clips.c1.effects?.curves
+    expect(c?.master).toEqual([{ x: 0, y: 0 }, { x: 0.5, y: 0.2 }, { x: 1, y: 1 }])
+    expect(c?.r).toEqual([{ x: 0, y: 0 }, { x: 1, y: 1 }])
+    expect(r.project.clips.c2.effects).toBeDefined()
+    expect(r.project.clips.c2.effects && 'curves' in r.project.clips.c2.effects).toBe(false)
   })
 })

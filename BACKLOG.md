@@ -17,10 +17,18 @@ candidate features. Ordered roughly by how much they came up. Update as we go.
 
 - **Pan is audio-tracks-only** — video-track audio is not panned in preview or
   export (it gets volume + mute, centre pan). Add video-track pan if needed.
-- **Stereo-source pan parity** — export pan is *sample-exact for mono* sources
-  but an equal-power *balance* approximation for already-stereo sources (preview
-  uses WebAudio `StereoPannerNode`'s redistribute algorithm). Fine for typical
-  use; revisit if exact stereo parity is required.
+- **Mixed mono + stereo clips on one panned track (FX projects)** — when a project
+  uses track FX, a plain track's clips are summed (`amix`) *before* its pan, so a
+  mono clip sharing a track with a stereo clip is up-mixed at −3 dB and then gets
+  the stereo pan law; the preview pans each clip with the law for whatever is
+  playing at that instant (mono law for the mono clip). Identical when centred;
+  differs only for a panned track that holds both kinds. The flat (no-FX) export
+  pans per clip and is exact.
+- **Dynamics worklet stays in after its FX are turned off (preview)** — once a
+  track has had EQ/gate/comp/duck on, the preview keeps the worklet inserted
+  (passthrough, so toggling never clicks). Its 2-channel input up-mixes mono at
+  unity, so a *mono* source on that track stays 3 dB louder (centred) than a fresh
+  preview or the export until the project is reopened. Stereo sources unaffected.
 - **Gate/duck preview vs export parity** — the preview AudioWorklet approximates
   FFmpeg `agate`/`sidechaincompress` (same knobs/units, perceptually matched, not
   sample-identical). Also: the duck key taps the trigger **pre-gate** in preview
@@ -31,28 +39,17 @@ candidate features. Ordered roughly by how much they came up. Update as we go.
   floor). A parallel-bus emulation could add a floor later if wanted.
 - **Gate/duck apply to audio tracks only** — video-track audio bypasses the
   per-track dynamics chain in preview. Revisit if video-track gating is needed.
+- **Scrub grains play at the clip's normal pitch** whatever the shuttle speed. Video clips
+  scrub from a light 16 kHz mono copy of their audio (extracted in the background on import).
 
 ## Candidate features (Vegas-style, not yet built — rough priority)
 
-1. **Reverb** — true convolution reverb: a native `ConvolverNode` (preview) + a shared
-   impulse-response WAV echoed by FFmpeg `afir` (export) for WYSIWYG parity. Needs the
-   per-track audio chain to gain a native wet/dry node (graph rewiring) — its own pass.
-2. **i18n full coverage** — framework + switcher + chrome shipped; sweep the remaining
-   Inspector/Transport/MediaBin strings into the dictionary (incremental).
-3. **Rubber-band marquee** selection (shift/ctrl-click + group ops shipped; marquee deferred).
-4. **Track management** — reorder, add/remove video tracks, resize lane height.
-5. **Export presets** — resolution / bitrate / format presets.
-6. **Proxy / optimized media** for heavy footage.
-7. **Transport niceties** — J/K/L shuttle, frame-step, audio scrubbing.
-8. **Preview quality setting** — render the preview at half resolution for perf
-   (deferred from Options to avoid touching the compositor before transform).
-9. **Hardware export encoder** — h264_nvenc / qsv / amf with x264 fallback; needs
-   encoder probing + per-encoder args (deferred from Options; CRF/preset shipped).
-10. **Color curves / scopes** — beyond primary grade: RGB curves, histogram/vectorscope.
+All previously listed candidates have shipped (see Done). Add new ideas here.
 
 ## Done
 
-- **Per-track mixer** — volume (dB) + pan, preview + export (mono pan sample-exact).
+- **Per-track mixer** — volume (dB) + pan, preview + export (pan sample-exact for mono and
+  stereo sources, see Mono/stereo level parity).
 - **Audio crossfades** — `X` crossfades a clip with its nearest neighbour; rides
   the fade/`amix` machinery; fade-ramp visuals on the timeline.
 - **Noise gate + ducking** — per-track noise gate (`agate` / AudioWorklet) and
@@ -85,6 +82,46 @@ candidate features. Ordered roughly by how much they came up. Update as we go.
   Ctrl+C/V copy-paste at playhead (fresh ids, project-isolated). `selectedClipId` = primary.
 - **Normalize** — one-click per-track peak-normalize (sets the track gain to −1 dBFS;
   parity-perfect since it's just a gain). Inspector → track → Normalize.
+- **Reverb** — per-track convolution reverb (mix / decay / pre-delay / tone). One pure
+  seeded IR generator (`src/shared/reverb.ts`) feeds the preview `ConvolverNode`
+  (normalize off) and a float-WAV IR for FFmpeg `afir` (`irnorm=-1`, no auto-gain);
+  equal-power dry/wet, post-duck/pre-pan. Measured vs Chromium: wet sample-exact
+  (≤ −107 dB error). Select an audio track → Inspector → Reverb.
+- **Preview quality** — Full / Half / Quarter preview resolution (Options → Performance);
+  the compositor renders a smaller backing canvas, CSS keeps the size, export stays full.
 - **i18n / languages** — `t()`/`useT()` framework (English = key, fallback-safe), EN/ES/FR/DE
   dictionaries, language switcher in Options; chrome (top bar, Options, Inspector) translated.
-</content>
+- **Rubber-band marquee** — drag on empty lane space to box-select clips (Shift/Ctrl adds);
+  scroll-aware; a plain click still deselects + seeks. Pure hit-test in `lib/tracks.ts`.
+- **Track management** — `+ Video` / `+ Audio`, delete (confirm if it has clips; last video /
+  audio track kept), reorder (drag header, right-click menu, Inspector ▲/▼ = compositor stacking),
+  drag a lane's bottom edge to resize (36–200 px, saved). All undoable.
+- **Export presets** — Export modal picks format (MP4 H.264 / MP4 HEVC / WebM VP9+Opus),
+  resolution (project / 2160–480p / vertical 1080×1920, Lanczos fit, even dims), CRF or
+  4–40 Mbps, plus named presets (YouTube, Reels/TikTok, master, small 720p); remembered.
+- **Hardware export encoder** — NVENC / QSV / AMF / VideoToolbox probed once in main (listed +
+  tiny test encode); Encoder = Auto / Software / detected; a failed hw encode retries in software.
+- **Transport niceties** — J/K/L shuttle (L/J forward/reverse, repeat for 2×/4×, K pauses; off-1×
+  rates scrub the preview frame-paced with scrub-grain audio; rate badge in the transport), ←/→ frame
+  step and Shift+←/→ one second. Stops at the timeline end / at 0.
+- **i18n full coverage** — every Inspector/Transport/MediaBin/Timeline/modal string goes through
+  `t()` with ES/FR/DE translations and `{name}` interpolation; a test fails on any untranslated key.
+- **Mono/stereo level parity** — the export now reproduces WebAudio's channel handling instead of
+  FFmpeg's −3 dB mono→stereo conversion: one `pan` filter carries StereoPannerNode's mono law (on
+  FC) *and* stereo law (on FL/FR) — `pan` drops terms for channels the input lacks, so it works
+  without knowing the channel count — and a unity up-mix (`FL=FL+FC|FR=FR+FC`) goes wherever the
+  preview up-mixes at unity: tracks running the dynamics worklet, the duck key, the reverb wet, and
+  `<video>`-tap clips. Measured vs Chromium (16 mono/stereo × pan × EQ/reverb/duck/video cases):
+  ≤ −87 dB error (EQ cases, float32 worklet biquads), ≤ −105 dB elsewhere; was 3 dB off for mono.
+- **Audio scrubbing** — dragging the ruler playhead or shuttling off 1× (incl. reverse) plays ~70 ms
+  windowed grains of the audio under the playhead through each clip's track chain (mute / gain /
+  pan / FX / reverb), at most every 45 ms and only when the playhead moved; reverse plays the audio
+  just before the playhead backwards. Options → Editing → Audio scrubbing (on by default).
+- **Color curves + scopes** — per-clip master + R/G/B curves (monotone-cubic, composed into a 256×1
+  LUT sampled after the primary grade; identity skips it, byte-identical; shared by preview + export;
+  saved/validated in project files), Inspector → Curves. Toggleable Scopes panel under the preview
+  (RGB/luma histogram, luma waveform, BT.709 vectorscope) from a throttled 8 Hz 256-px readback.
+- **Proxy / optimized media** — Media Bin → Create proxy (or Options → auto for video > 1080p): FFmpeg in
+  main makes a 720p short-GOP H.264 copy in `userData/proxies/<hash(path,size,mtime)>.mp4` (queued one at a
+  time, progress %, rotation baked, duration-checked); the preview decodes it when "Use proxies" is on,
+  export always reads the original. Never saved in projects; Options shows/clears the cache.

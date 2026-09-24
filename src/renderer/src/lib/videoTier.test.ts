@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest'
-import { extensionTier, resolveTier } from './videoTier'
+import { extensionTier, hasDisplayRotation, resolveTier } from './videoTier'
 import type { MediaItem } from '../types'
 
 describe('extensionTier', () => {
@@ -69,5 +69,23 @@ describe('resolveTier', () => {
   it('falls back when the probe fails', async () => {
     g.VideoDecoder = { isConfigSupported: async () => ({ supported: true }) }
     expect(await resolveTier(media('/a.mp4'), async () => Promise.reject(new Error('boom')))).toBe('video-element')
+  })
+})
+
+describe('hasDisplayRotation', () => {
+  const ONE = 0x10000 // 1.0 in 16.16 fixed point
+  const W = 0x40000000 // 1.0 in 2.30 fixed point
+  it('is false for the identity matrix or a missing one', () => {
+    expect(hasDisplayRotation([ONE, 0, 0, 0, ONE, 0, 0, 0, W])).toBe(false)
+    expect(hasDisplayRotation(new Int32Array([ONE, 0, 0, 0, ONE, 0, 0, 0, W]))).toBe(false)
+    expect(hasDisplayRotation(undefined)).toBe(false)
+  })
+  it('is true for 90/180/270 degree rotations (phone footage)', () => {
+    expect(hasDisplayRotation([0, ONE, 0, -ONE, 0, 0, 1080 * ONE, 0, W])).toBe(true) // 90
+    expect(hasDisplayRotation([-ONE, 0, 0, 0, -ONE, 0, 1920 * ONE, 1080 * ONE, W])).toBe(true) // 180
+    expect(hasDisplayRotation([0, -ONE, 0, ONE, 0, 0, 0, 1920 * ONE, W])).toBe(true) // 270
+  })
+  it('ignores pure scale/translation', () => {
+    expect(hasDisplayRotation([2 * ONE, 0, 0, 0, 2 * ONE, 0, 10 * ONE, 0, W])).toBe(false)
   })
 })
