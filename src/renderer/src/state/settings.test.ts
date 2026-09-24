@@ -61,6 +61,29 @@ describe('settings sanitize', () => {
     expect(DEFAULT_SETTINGS.previewQuality).toBe('full')
   })
 
+  it('validates the remembered export preset fields', () => {
+    const clean = sanitize({
+      exportFormat: 'mp4-hevc',
+      exportResolution: '720',
+      exportQualityMode: 'bitrate',
+      exportBitrateMbps: 16,
+      exportEncoder: 'nvenc'
+    })
+    expect(clean).toMatchObject({
+      exportFormat: 'mp4-hevc',
+      exportResolution: '720',
+      exportQualityMode: 'bitrate',
+      exportBitrateMbps: 16,
+      exportEncoder: 'nvenc'
+    })
+    expect(sanitize({ exportFormat: 'avi' })).not.toHaveProperty('exportFormat')
+    expect(sanitize({ exportResolution: '1440' })).not.toHaveProperty('exportResolution')
+    expect(sanitize({ exportQualityMode: 'vbr' })).not.toHaveProperty('exportQualityMode')
+    expect(sanitize({ exportEncoder: 'cuda' })).not.toHaveProperty('exportEncoder')
+    expect(sanitize({ exportBitrateMbps: '8' })).not.toHaveProperty('exportBitrateMbps')
+    expect(sanitize({ exportBitrateMbps: 9999 }).exportBitrateMbps).toBe(200)
+  })
+
   it('every default value survives a round-trip through sanitize', () => {
     expect(sanitize(DEFAULT_SETTINGS)).toEqual(DEFAULT_SETTINGS)
   })

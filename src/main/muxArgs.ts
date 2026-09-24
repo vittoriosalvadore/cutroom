@@ -5,7 +5,8 @@
 // Input 0 is the silent video; inputs 1..N are the audible source files. Each
 // audio input is trimmed to its used span, re-timed, gained, faded, and delayed
 // to its timeline position, then all are summed (amix, no auto-normalize) and
-// brick-limited. Video is stream-copied (never re-encoded).
+// brick-limited. Video is stream-copied (never re-encoded); audio is AAC in MP4
+// or Opus in WebM, matching the pass-1 container.
 //
 // Filter order aresample -> atrim -> asetpts -> volume -> afade -> adelay is
 // mandatory; reordering produces wrong timing or silence.
@@ -138,6 +139,8 @@ export interface BuildMuxArgsOptions {
    * reference them by that index.
    */
   irPaths?: string[]
+  /** Output container (default mp4 = AAC). webm = Opus, which only runs at 48 kHz. */
+  container?: 'mp4' | 'webm'
 }
 
 function dbToLinear(db: number): number {
@@ -247,19 +250,20 @@ export function buildMuxArgs(opts: BuildMuxArgsOptions): string[] {
   if (filterScriptPath) args.push('-filter_complex_script', filterScriptPath)
   else args.push('-filter_complex', buildMuxGraph(clips, sampleRate))
 
+  // The audio codec follows the container of the pass-1 video being copied:
+  // AAC in MP4, Opus in WebM (Opus only runs at 48 kHz, so it is resampled).
+  const webm = opts.container === 'webm'
   args.push(
     '-map', '0:v',
     '-map', '[aout]',
     '-c:v', 'copy',
-    '-c:a', 'aac',
-    '-b:a', '192k',
-    '-ar', String(sampleRate),
+    ...(webm ? ['-c:a', 'libopus', '-b:a', '160k', '-ar', '48000'] : ['-c:a', 'aac', '-b:a', '192k', '-ar', String(sampleRate)]),
     '-ac', '2',
     '-shortest',
     ...(durationSec && Number.isFinite(durationSec) && durationSec > 0 ? ['-t', durationSec.toFixed(3)] : []),
-    '-movflags', '+faststart',
+    ...(webm ? [] : ['-movflags', '+faststart']),
     // Explicit muxer: the caller may write to a `.part` name and rename on success.
-    '-f', 'mp4',
+    '-f', webm ? 'webm' : 'mp4',
     outputPath
   )
   return args

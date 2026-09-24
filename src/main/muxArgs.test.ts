@@ -240,6 +240,27 @@ describe('buildMuxArgs input planning + safety', () => {
   it('names the muxer explicitly so the output may use a temp extension', () => {
     const args = buildMuxArgs({ ...base, clips: [clip({})] })
     expect(args.slice(-3)).toEqual(['-f', 'mp4', '/tmp/out.mp4'])
+    expect(args[args.indexOf('-c:a') + 1]).toBe('aac')
+    expect(args).toContain('+faststart')
+  })
+
+  it('WebM muxes Opus at 48 kHz (Opus has no 44.1k) and forces -f webm', () => {
+    const args = buildMuxArgs({
+      ...base,
+      sampleRate: 44100,
+      outputPath: '/tmp/out.webm.part',
+      container: 'webm',
+      clips: [clip({})],
+      durationSec: 8
+    })
+    expect(args[args.indexOf('-c:a') + 1]).toBe('libopus')
+    expect(args[args.indexOf('-ar') + 1]).toBe('48000')
+    expect(args[args.indexOf('-c:v') + 1]).toBe('copy')
+    expect(args[args.indexOf('-t') + 1]).toBe('8.000')
+    expect(args).not.toContain('-movflags')
+    expect(args.slice(-3)).toEqual(['-f', 'webm', '/tmp/out.webm.part'])
+    // the filtergraph still mixes at the project rate
+    expect(graphOf(args)).toContain('aresample=44100')
   })
 })
 

@@ -47,12 +47,9 @@ candidate features. Ordered roughly by how much they came up. Update as we go.
 
 1. **i18n full coverage** — framework + switcher + chrome shipped; sweep the remaining
    Inspector/Transport/MediaBin strings into the dictionary (incremental).
-2. **Export presets** — resolution / bitrate / format presets.
-3. **Proxy / optimized media** for heavy footage.
-4. **Transport niceties** — J/K/L shuttle, frame-step, audio scrubbing.
-5. **Hardware export encoder** — h264_nvenc / qsv / amf with x264 fallback; needs
-   encoder probing + per-encoder args (deferred from Options; CRF/preset shipped).
-6. **Color curves / scopes** — beyond primary grade: RGB curves, histogram/vectorscope.
+2. **Proxy / optimized media** for heavy footage.
+3. **Transport niceties** — J/K/L shuttle, frame-step, audio scrubbing.
+4. **Color curves / scopes** — beyond primary grade: RGB curves, histogram/vectorscope.
 
 ## Done
 
@@ -103,3 +100,8 @@ candidate features. Ordered roughly by how much they came up. Update as we go.
 - **Track management** — `+ Video` / `+ Audio`, delete (confirm if it has clips; last video /
   audio track kept), reorder (drag header, right-click menu, Inspector ▲/▼ = compositor stacking),
   drag a lane's bottom edge to resize (36–200 px, saved). All undoable.
+- **Export presets** — Export modal picks format (MP4 H.264 / MP4 HEVC / WebM VP9+Opus),
+  resolution (project / 2160–480p / vertical 1080×1920, Lanczos fit, even dims), CRF or
+  4–40 Mbps, plus named presets (YouTube, Reels/TikTok, master, small 720p); remembered.
+- **Hardware export encoder** — NVENC / QSV / AMF / VideoToolbox probed once in main (listed +
+  tiny test encode); Encoder = Auto / Software / detected; a failed hw encode retries in software.

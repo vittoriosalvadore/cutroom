@@ -4,11 +4,14 @@ import { Compositor } from './compositor'
 import { resolveDuck, resolveReverb } from '../state/selectors'
 import { useSettings } from '../state/settings'
 import { ensureDenoisedForExport, getDenoiseEntry } from './denoiseCache'
+import { formatInfo, type EncoderChoice } from '../../../shared/exportOptions'
 
 // ---------------------------------------------------------------------------
 // Export driver (renderer side). Two passes:
 //   1. Render the timeline frame-by-frame with the preview compositor, stream
-//      PNGs to FFmpeg -> a SILENT temp MP4 (WYSIWYG: it is the preview pipeline).
+//      JPEGs to FFmpeg -> a SILENT temp MP4/WebM (WYSIWYG: it is the preview
+//      pipeline). Main scales/encodes per the export preset; a failed hardware
+//      encode is retried once in software.
 //   2. Build the audible-clip plan and have the main process mux a mixed
 //      soundtrack into that video, writing the user's chosen file.
 // ---------------------------------------------------------------------------
@@ -148,22 +151,36 @@ function framesIdentical(a: HTMLCanvasElement, b: HTMLCanvasElement): boolean {
   return true
 }
 
+/** Export result. `warning` is set when the export succeeded via a fallback. */
+export interface ExportOutcome {
+  ok: boolean
+  error?: string
+  warning?: string
+  /** The FFmpeg video encoder that produced the file. */
+  encoder?: string
+}
+
 /**
  * Run a full export. Returns when the file is written (ok:true) or on
- * error/cancel. `shouldCancel` is polled each frame.
+ * error/cancel. `shouldCancel` is polled each frame. Format, resolution,
+ * quality and encoder come from the (remembered) export settings.
  */
 export async function exportTimeline(
   project: Project,
   outputPath: string,
   onProgress: (p: ExportProgress) => void,
   shouldCancel: () => boolean
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<ExportOutcome> {
   const duration = timelineDuration(project)
   if (duration <= 0) return { ok: false, error: 'Timeline is empty — add a clip first.' }
 
   const fps = project.fps
   const totalFrames = Math.max(1, Math.round(duration * fps))
+  const settings = useSettings.getState()
+  const ext = formatInfo(settings.exportFormat).ext
 
+  // Frames always render at PROJECT size (the compositor is untouched); the
+  // resolution preset is applied by FFmpeg's scale filter in pass 1.
   const canvas = document.createElement('canvas')
   canvas.width = project.width
   canvas.height = project.height
@@ -177,7 +194,7 @@ export async function exportTimeline(
 
   // The pass-1 silent file is normally consumed (deleted) by muxAudio. On any
   // other exit — cancel, frame failure, encode failure, exception — we delete it
-  // here so temp MP4s don't accumulate.
+  // here so temp videos don't accumulate.
   let silentPath = ''
   const discardTemp = async (): Promise<void> => {
     if (silentPath) {
@@ -186,28 +203,36 @@ export async function exportTimeline(
     }
   }
 
-  try {
-    onProgress({ phase: 'preparing' })
-    await comp.preload(project)
-    // Ensure every denoise-enabled clip's temp audio is ready BEFORE the plan
-    // is built below — otherwise a job still in flight would silently export
-    // the original (undenoised) audio for that clip.
-    await ensureDenoisedForExport(project)
-
-    // Pass 1: render the silent video to a temp file.
-    silentPath = await window.cutroom.exportTempVideoPath()
-    const settings = useSettings.getState()
+  /**
+   * Pass 1: render every frame into a fresh silent temp video with the given
+   * encoder choice. On failure the temp file is already discarded; `hardware`
+   * says whether a hardware encoder was the one running.
+   */
+  const renderPass = async (
+    encoder: EncoderChoice
+  ): Promise<{ ok: boolean; error?: string; hardware?: boolean; encoder?: string }> => {
+    silentPath = await window.cutroom.exportTempVideoPath(ext)
     const started = await window.cutroom.exportStart({
       width: project.width,
       height: project.height,
       fps,
       outputPath: silentPath,
       preset: settings.exportPreset,
-      crf: settings.exportCrf
+      crf: settings.exportCrf,
+      format: settings.exportFormat,
+      resolution: settings.exportResolution,
+      qualityMode: settings.exportQualityMode,
+      bitrateMbps: settings.exportBitrateMbps,
+      encoder
     })
     if (!started.ok) {
       await discardTemp()
       return { ok: false, error: started.error ?? 'Could not start FFmpeg.' }
+    }
+    const fail = async (error: string): Promise<{ ok: false; error: string; hardware?: boolean }> => {
+      await window.cutroom.exportCancel()
+      await discardTemp()
+      return { ok: false, error, hardware: started.hardware }
     }
 
     // 32×18 thumbnail canvas used for frame-change detection (< 2 KB of pixels).
@@ -231,8 +256,7 @@ export async function exportTimeline(
 
     for (let i = 0; i < totalFrames; i++) {
       if (shouldCancel()) {
-        await window.cutroom.exportCancel()
-        await discardTemp()
+        await fail('Export cancelled.')
         return { ok: false, error: 'Export cancelled.' }
       }
       await comp.renderExact(project, i / fps)
@@ -258,11 +282,7 @@ export async function exportTimeline(
       prevFull = baseline
 
       const wrote = await window.cutroom.exportFrame(jpeg)
-      if (!wrote.ok) {
-        await window.cutroom.exportCancel()
-        await discardTemp()
-        return { ok: false, error: wrote.error ?? 'Failed while writing a frame.' }
-      }
+      if (!wrote.ok) return fail(wrote.error ?? 'Failed while writing a frame.')
       onProgress({ phase: 'rendering', frame: i + 1, totalFrames })
     }
 
@@ -270,8 +290,31 @@ export async function exportTimeline(
     const finished = await window.cutroom.exportFinish()
     if (!finished.ok) {
       await discardTemp()
-      return finished
+      return { ok: false, error: finished.error ?? 'Encoding failed.', hardware: started.hardware }
     }
+    return { ok: true, hardware: started.hardware, encoder: started.encoder }
+  }
+
+  try {
+    onProgress({ phase: 'preparing' })
+    await comp.preload(project)
+    // Ensure every denoise-enabled clip's temp audio is ready BEFORE the plan
+    // is built below — otherwise a job still in flight would silently export
+    // the original (undenoised) audio for that clip.
+    await ensureDenoisedForExport(project)
+
+    let pass = await renderPass(settings.exportEncoder)
+    let warning: string | undefined
+    // A hardware encoder can pass the probe and still fail on the real job
+    // (session limits, size caps, driver hiccup) — at start or mid-stream.
+    // Retry the whole pass once in software rather than failing the export.
+    if (!pass.ok && pass.hardware && pass.error !== 'Export cancelled.') {
+      console.warn('[export] hardware encode failed, retrying in software:', pass.error)
+      onProgress({ phase: 'preparing' })
+      pass = await renderPass('software')
+      if (pass.ok) warning = 'The hardware encoder failed, so this export used the software encoder.'
+    }
+    if (!pass.ok) return { ok: false, error: pass.error }
 
     // Pass 2: mux the mixed audio into the silent video at the user's path.
     onProgress({ phase: 'muxing' })
@@ -289,7 +332,7 @@ export async function exportTimeline(
     silentPath = '' // consumed by a successful mux
 
     onProgress({ phase: 'done', frame: totalFrames, totalFrames })
-    return { ok: true }
+    return { ok: true, warning, encoder: pass.encoder }
   } catch (e) {
     await window.cutroom.exportCancel().catch(() => undefined)
     await discardTemp()

@@ -91,7 +91,29 @@ const STRINGS: Record<Exclude<Lang, 'en'>, Record<string, string>> = {
     Up: 'Subir',
     Down: 'Bajar',
     'Higher video tracks draw on top of lower ones.':
-      'Las pistas de vídeo superiores se dibujan encima de las inferiores.'
+      'Las pistas de vídeo superiores se dibujan encima de las inferiores.',
+    // export presets / encoder
+    Preset: 'Preajuste',
+    Custom: 'Personalizado',
+    Format: 'Formato',
+    Resolution: 'Resolución',
+    Quality: 'Calidad',
+    'Constant quality': 'Calidad constante',
+    Encoder: 'Codificador',
+    Auto: 'Automático',
+    'detecting…': 'detectando…',
+    Software: 'Software',
+    hardware: 'hardware',
+    Project: 'Proyecto',
+    vertical: 'vertical',
+    Output: 'Salida',
+    frames: 'fotogramas',
+    'YouTube 1080p': 'YouTube 1080p',
+    'Vertical 1080×1920 (Reels/TikTok)': 'Vertical 1080×1920 (Reels/TikTok)',
+    'High quality master': 'Máster de alta calidad',
+    'Small file 720p': 'Archivo ligero 720p',
+    'Renders the timeline — titles, subtitles, chroma key, and a mixed soundtrack — to a video file. This is an offline render, so it can take a while.': 'Renderiza la línea de tiempo — títulos, subtítulos, croma y una banda sonora mezclada — a un archivo de vídeo. Es un render sin conexión, así que puede tardar.',
+    'The hardware encoder failed, so this export used the software encoder.': 'El codificador por hardware falló, así que esta exportación usó el codificador por software.'
   },
   fr: {
     New: 'Nouveau',
@@ -160,7 +182,29 @@ const STRINGS: Record<Exclude<Lang, 'en'>, Record<string, string>> = {
     Up: 'Monter',
     Down: 'Descendre',
     'Higher video tracks draw on top of lower ones.':
-      'Les pistes vidéo supérieures s’affichent au-dessus des pistes inférieures.'
+      'Les pistes vidéo supérieures s’affichent au-dessus des pistes inférieures.',
+    // export presets / encoder
+    Preset: 'Préréglage',
+    Custom: 'Personnalisé',
+    Format: 'Format',
+    Resolution: 'Résolution',
+    Quality: 'Qualité',
+    'Constant quality': 'Qualité constante',
+    Encoder: 'Encodeur',
+    Auto: 'Auto',
+    'detecting…': 'détection…',
+    Software: 'Logiciel',
+    hardware: 'matériel',
+    Project: 'Projet',
+    vertical: 'vertical',
+    Output: 'Sortie',
+    frames: 'images',
+    'YouTube 1080p': 'YouTube 1080p',
+    'Vertical 1080×1920 (Reels/TikTok)': 'Vertical 1080×1920 (Reels/TikTok)',
+    'High quality master': 'Master haute qualité',
+    'Small file 720p': 'Fichier léger 720p',
+    'Renders the timeline — titles, subtitles, chroma key, and a mixed soundtrack — to a video file. This is an offline render, so it can take a while.': 'Rend la timeline — titres, sous-titres, incrustation et bande-son mixée — dans un fichier vidéo. C’est un rendu hors ligne, cela peut prendre un moment.',
+    'The hardware encoder failed, so this export used the software encoder.': 'L’encodeur matériel a échoué ; cet export a utilisé l’encodeur logiciel.'
   },
   de: {
     New: 'Neu',
@@ -228,7 +272,29 @@ const STRINGS: Record<Exclude<Lang, 'en'>, Record<string, string>> = {
     Height: 'Höhe',
     Up: 'Hoch',
     Down: 'Runter',
-    'Higher video tracks draw on top of lower ones.': 'Höhere Videospuren werden über tieferen gezeichnet.'
+    'Higher video tracks draw on top of lower ones.': 'Höhere Videospuren werden über tieferen gezeichnet.',
+    // export presets / encoder
+    Preset: 'Voreinstellung',
+    Custom: 'Benutzerdefiniert',
+    Format: 'Format',
+    Resolution: 'Auflösung',
+    Quality: 'Qualität',
+    'Constant quality': 'Konstante Qualität',
+    Encoder: 'Encoder',
+    Auto: 'Automatisch',
+    'detecting…': 'wird erkannt…',
+    Software: 'Software',
+    hardware: 'Hardware',
+    Project: 'Projekt',
+    vertical: 'vertikal',
+    Output: 'Ausgabe',
+    frames: 'Frames',
+    'YouTube 1080p': 'YouTube 1080p',
+    'Vertical 1080×1920 (Reels/TikTok)': 'Vertikal 1080×1920 (Reels/TikTok)',
+    'High quality master': 'Master in hoher Qualität',
+    'Small file 720p': 'Kleine Datei 720p',
+    'Renders the timeline — titles, subtitles, chroma key, and a mixed soundtrack — to a video file. This is an offline render, so it can take a while.': 'Rendert die Timeline — Titel, Untertitel, Chroma Key und einen gemischten Soundtrack — in eine Videodatei. Das ist ein Offline-Render und kann eine Weile dauern.',
+    'The hardware encoder failed, so this export used the software encoder.': 'Der Hardware-Encoder ist fehlgeschlagen, daher wurde für diesen Export der Software-Encoder verwendet.'
   }
 }
 

@@ -2,6 +2,18 @@ import { create } from 'zustand'
 import { applyTheme } from '../lib/theme'
 import type { Lang } from '../lib/i18n'
 import { PREVIEW_QUALITIES, type PreviewQuality } from '../lib/previewScale'
+import {
+  BITRATE_CHOICES,
+  ENCODER_CHOICES,
+  EXPORT_FORMATS,
+  EXPORT_RESOLUTIONS,
+  MAX_MBPS,
+  MIN_MBPS,
+  type EncoderChoice,
+  type ExportFormat,
+  type ExportResolution,
+  type QualityMode
+} from '../../../shared/exportOptions'
 
 // ---------------------------------------------------------------------------
 // App settings (theme, decoding, editing, export, visual options).
@@ -35,6 +47,14 @@ export interface Settings {
   exportPreset: ExportPreset
   /** x264 CRF, 14 (high quality) .. 28 (small file). */
   exportCrf: number
+  /** Last export choices (Export modal remembers them). */
+  exportFormat: ExportFormat
+  exportResolution: ExportResolution
+  exportQualityMode: QualityMode
+  /** Target video bitrate in bitrate mode (Mbps). */
+  exportBitrateMbps: number
+  /** Auto = first working hardware encoder, else software. */
+  exportEncoder: EncoderChoice
   // --- appearance ---
   theme: ThemePreset
   /** Accent colour (hex). Drives all primary + selection state. */
@@ -55,6 +75,11 @@ export const DEFAULT_SETTINGS: Settings = {
   showWaveforms: true,
   exportPreset: 'medium',
   exportCrf: 20,
+  exportFormat: 'mp4-h264',
+  exportResolution: 'project',
+  exportQualityMode: 'crf',
+  exportBitrateMbps: BITRATE_CHOICES[1],
+  exportEncoder: 'auto',
   theme: 'graphite',
   accent: '#4c8dff',
   density: 'comfortable',
@@ -93,6 +118,16 @@ export function sanitize(raw: unknown): Partial<Settings> {
   if (crf !== undefined) out.exportCrf = crf
   const preset = oneOf(o.exportPreset, ['ultrafast', 'veryfast', 'fast', 'medium', 'slow'] as const)
   if (preset) out.exportPreset = preset
+  const format = oneOf(o.exportFormat, EXPORT_FORMATS)
+  if (format) out.exportFormat = format
+  const res = oneOf(o.exportResolution, EXPORT_RESOLUTIONS)
+  if (res) out.exportResolution = res
+  const qmode = oneOf(o.exportQualityMode, ['crf', 'bitrate'] as const)
+  if (qmode) out.exportQualityMode = qmode
+  const mbps = clampNum(o.exportBitrateMbps, MIN_MBPS, MAX_MBPS)
+  if (mbps !== undefined) out.exportBitrateMbps = mbps
+  const encoder = oneOf(o.exportEncoder, ENCODER_CHOICES)
+  if (encoder) out.exportEncoder = encoder
   const theme = oneOf(o.theme, ['graphite', 'midnight', 'slate', 'contrast'] as const)
   if (theme) out.theme = theme
   const density = oneOf(o.density, ['comfortable', 'compact'] as const)
@@ -116,6 +151,11 @@ function pick(s: Settings): Settings {
     showWaveforms: s.showWaveforms,
     exportPreset: s.exportPreset,
     exportCrf: s.exportCrf,
+    exportFormat: s.exportFormat,
+    exportResolution: s.exportResolution,
+    exportQualityMode: s.exportQualityMode,
+    exportBitrateMbps: s.exportBitrateMbps,
+    exportEncoder: s.exportEncoder,
     theme: s.theme,
     accent: s.accent,
     density: s.density,

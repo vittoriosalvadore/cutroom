@@ -1,21 +1,38 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
+import type { EncoderChoice, ExportFormat, ExportResolution, QualityMode } from '../shared/exportOptions'
 
-/** Settings for a video export. */
+/** Settings for a video export. Main re-validates every field. */
 export interface ExportStartOptions {
+  /** Project (render) size; the output size is derived from `resolution` in main. */
   width: number
   height: number
   fps: number
   outputPath: string
-  /** x264 speed/quality preset (default 'medium'). */
+  /** x264 speed/quality preset (default 'medium'); mapped per encoder. */
   preset?: string
-  /** x264 constant rate factor; lower = higher quality (default 20). */
+  /** x264-scale constant rate factor; lower = higher quality (default 20). */
   crf?: number
+  /** Container + codec (default MP4 H.264). */
+  format?: ExportFormat
+  /** Output size preset (default: project size). */
+  resolution?: ExportResolution
+  /** CRF (quality) or a target bitrate. */
+  qualityMode?: QualityMode
+  bitrateMbps?: number
+  /** Encoder family (default software). */
+  encoder?: EncoderChoice
 }
 
 /** Result of an export IPC call. */
 export interface ExportResult {
   ok: boolean
   error?: string
+}
+
+/** export:start also reports which encoder actually runs. */
+export interface ExportStartResult extends ExportResult {
+  encoder?: string
+  hardware?: boolean
 }
 
 /** Result of an AI noise-removal (denoise) pass on a source file. */
@@ -156,10 +173,12 @@ const api = {
     ipcRenderer.invoke('dialog:saveSubtitle', content),
 
   // --- video export ---
-  /** Native save dialog for the output .mp4. Resolves the path, or null. */
-  saveVideo: (): Promise<string | null> => ipcRenderer.invoke('dialog:saveVideo'),
+  /** Native save dialog for the output (.mp4 / .webm per format). Resolves the path, or null. */
+  saveVideo: (format?: ExportFormat): Promise<string | null> => ipcRenderer.invoke('dialog:saveVideo', format),
+  /** Working hardware encoders (probed once in main; [] = software only). */
+  hwEncoders: (): Promise<string[]> => ipcRenderer.invoke('export:hwEncoders'),
   /** Spawn the FFmpeg encoder for a new export. */
-  exportStart: (opts: ExportStartOptions): Promise<ExportResult> =>
+  exportStart: (opts: ExportStartOptions): Promise<ExportStartResult> =>
     ipcRenderer.invoke('export:start', opts),
   /** Stream one PNG frame (backpressured). */
   exportFrame: (data: ArrayBuffer): Promise<ExportResult> =>
@@ -168,8 +187,8 @@ const api = {
   exportFinish: (): Promise<ExportResult> => ipcRenderer.invoke('export:finish'),
   /** Abort the current export and kill FFmpeg. */
   exportCancel: (): Promise<ExportResult> => ipcRenderer.invoke('export:cancel'),
-  /** A fresh temp path for the silent (pass-1) video. */
-  exportTempVideoPath: (): Promise<string> => ipcRenderer.invoke('export:tempVideoPath'),
+  /** A fresh temp path for the silent (pass-1) video, with the container's extension. */
+  exportTempVideoPath: (ext?: 'mp4' | 'webm'): Promise<string> => ipcRenderer.invoke('export:tempVideoPath', ext),
   /** Pass 2: mix the timeline audio and mux it into the silent video. */
   muxAudio: (opts: MuxAudioOptions): Promise<ExportResult> => ipcRenderer.invoke('export:muxAudio', opts),
   /** Delete a leftover temp silent video after a cancelled/failed export. */

@@ -1,7 +1,7 @@
 import { ipcMain } from 'electron'
 import { spawn } from 'child_process'
 import { copyFile, rename, unlink, writeFile } from 'fs/promises'
-import { join } from 'path'
+import { extname, join } from 'path'
 import { tmpdir } from 'os'
 import { ffmpegPath, releaseTemp, trackProcess, trackTemp } from './ffmpeg'
 import { isLocalFilePath, isOwnTempFile } from './paths'
@@ -129,7 +129,9 @@ async function runMux(opts: MuxOptions): Promise<{ ok: boolean; error?: string }
           clips: audible,
           filterScriptPath: scriptPath,
           durationSec: opts.durationSec,
-          irPaths
+          irPaths,
+          // The container follows the temp file main itself named (see export:tempVideoPath).
+          container: extname(opts.silentPath).toLowerCase() === '.webm' ? 'webm' : 'mp4'
         })
       )
     }
@@ -147,7 +149,12 @@ async function runMux(opts: MuxOptions): Promise<{ ok: boolean; error?: string }
 }
 
 export function registerAudioMuxIpc(): void {
-  ipcMain.handle('export:tempVideoPath', () => tempPath('silent.mp4'))
+  // The pass-1 temp's extension carries the container (mp4 / webm): pass 1
+  // forces it, and the no-audio path copies this file verbatim to the user's
+  // output, so the two must agree.
+  ipcMain.handle('export:tempVideoPath', (_event, ext?: unknown) =>
+    tempPath(ext === 'webm' ? 'silent.webm' : 'silent.mp4')
+  )
   ipcMain.handle('export:muxAudio', (_event, opts: MuxOptions) => runMux(opts))
   // Remove a leftover temp silent video (cancelled / failed export). Only our
   // own temp files — never an arbitrary path the renderer passes in.
