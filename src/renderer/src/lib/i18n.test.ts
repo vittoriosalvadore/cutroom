@@ -40,6 +40,7 @@ const DYNAMIC_KEYS = [
   'Fast',
   'Balanced',
   'Accurate',
+  'Best',
   'Performance',
   'Editing',
   'Export',

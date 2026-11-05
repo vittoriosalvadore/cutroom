@@ -3,13 +3,23 @@
 // DOM/worker code so it is unit-tested directly.
 // ---------------------------------------------------------------------------
 
-export type TranscribeModel = 'tiny' | 'base' | 'small'
+export type TranscribeModel = 'tiny' | 'base' | 'small' | 'medium'
 
-/** Multilingual Whisper checkpoints (the old `.en` model only knew English). */
-export const TRANSCRIBE_MODELS: ReadonlyArray<{ id: TranscribeModel; hub: string; label: string; approxMb: number }> = [
+/** Multilingual Whisper checkpoints (the old `.en` model only knew English).
+ *  `slow` flags a model whose CPU inference is several times slower than the
+ *  default — "Best" (medium) is for sung lyrics, where smaller models struggle,
+ *  and costs a ~780 MB download plus a long wait per song. */
+export const TRANSCRIBE_MODELS: ReadonlyArray<{
+  id: TranscribeModel
+  hub: string
+  label: string
+  approxMb: number
+  slow?: boolean
+}> = [
   { id: 'tiny', hub: 'Xenova/whisper-tiny', label: 'Fast', approxMb: 40 },
   { id: 'base', hub: 'Xenova/whisper-base', label: 'Balanced', approxMb: 80 },
-  { id: 'small', hub: 'Xenova/whisper-small', label: 'Accurate', approxMb: 250 }
+  { id: 'small', hub: 'Xenova/whisper-small', label: 'Accurate', approxMb: 250 },
+  { id: 'medium', hub: 'Xenova/whisper-medium', label: 'Best', approxMb: 780, slow: true }
 ]
 export const TRANSCRIBE_MODEL_IDS = TRANSCRIBE_MODELS.map((m) => m.id)
 

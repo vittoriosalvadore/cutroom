@@ -4,6 +4,7 @@ import { resolveDuck } from './selectors'
 import { defaultTrackGate } from '../types'
 import { evalKeyframes } from '../lib/keyframes'
 import type { Clip, Project, Track, TrackDuck } from '../types'
+import { activeWordIndex } from '../lib/karaoke'
 
 function makeProject(): Project {
   return {
@@ -670,6 +671,85 @@ describe('streamed subtitle import', () => {
     expect(useEditor.getState().past.length).toBe(1)
     useEditor.getState().undo()
     expect(Object.values(useEditor.getState().project.clips).some((c) => c.role === 'subtitle')).toBe(false)
+  })
+})
+
+describe('karaoke subtitles (word timing through edits)', () => {
+  // One card at 10..14 s whose words are sung at 10, 11 and 12.5 s on the timeline.
+  const words = [
+    { text: 'one', startSec: 0, endSec: 1 },
+    { text: 'two', startSec: 1, endSec: 2 },
+    { text: 'three', startSec: 2.5, endSec: 3.5 }
+  ]
+  const addKaraoke = (): string => {
+    useEditor.getState().importSubtitles([{ startSec: 10, endSec: 14, text: 'one two three', words }])
+    return Object.values(useEditor.getState().project.clips).find((c) => c.role === 'subtitle')!.id
+  }
+  const subtitles = (): Clip[] => Object.values(useEditor.getState().project.clips).filter((c) => c.role === 'subtitle')
+  /** The word lit at absolute time t — whichever subtitle piece covers t. */
+  const litAt = (t: number): string | null => {
+    const clip = subtitles().find((c) => t >= c.startSec && t < c.startSec + c.durationSec)
+    const w = clip?.text?.words
+    if (!clip || !w) return null
+    const i = activeWordIndex(w, t - clip.startSec)
+    return i < 0 ? null : w[i].text
+  }
+  const SAMPLES = [10, 10.5, 10.99, 11, 11.7, 12.4, 12.5, 13, 13.9]
+
+  it('importSubtitles puts the cue words on the subtitle clip (plain cues stay plain)', () => {
+    addKaraoke()
+    useEditor.getState().importSubtitles([{ startSec: 20, endSec: 21, text: 'plain' }])
+    const [k, plain] = subtitles().sort((a, b) => a.startSec - b.startSec)
+    expect(k.text!.words).toEqual(words)
+    expect(plain.text).not.toHaveProperty('words')
+  })
+
+  it('splitAtPlayhead keeps every word lit at the same moment on both halves', () => {
+    addKaraoke()
+    const before = SAMPLES.map(litAt)
+    expect(before).toEqual(['one', 'one', 'one', 'two', 'two', 'two', 'three', 'three', 'three'])
+    useEditor.getState().setPlayhead(11.7) // mid-"two"
+    useEditor.getState().splitAtPlayhead()
+    expect(subtitles()).toHaveLength(2)
+    expect(SAMPLES.map(litAt)).toEqual(before)
+    // Both halves keep the full text and all three words (paired by position).
+    for (const c of subtitles()) expect(c.text!.words!.map((w) => w.text)).toEqual(['one', 'two', 'three'])
+  })
+
+  it('a head trim rebases the words so the highlight stays on the audio', () => {
+    const id = addKaraoke()
+    const kept = SAMPLES.filter((t) => t >= 11.5)
+    const before = kept.map(litAt)
+    // computeTrim keeps inSec for text clips: only the start/duration move.
+    useEditor.getState().applyTrim(id, { startSec: 11.5, durationSec: 2.5, inSec: 0 })
+    expect(kept.map(litAt)).toEqual(before)
+    expect(litAt(11.5)).toBe('two') // the word in progress at the new head
+  })
+
+  it('a head-trim drag (with origin) in and back out restores the exact timings', () => {
+    const id = addKaraoke()
+    const origin = useEditor.getState().project.clips[id]
+    const st = useEditor.getState()
+    st.applyTrim(id, { startSec: 12, durationSec: 2, inSec: 0 }, origin)
+    st.applyTrim(id, { startSec: 9, durationSec: 5, inSec: 0 }, origin) // past the original head
+    expect(litAt(9.5)).toBeNull() // before the first word: nothing lit yet
+    expect(litAt(10)).toBe('one')
+    st.applyTrim(id, { startSec: 10, durationSec: 4, inSec: 0 }, origin)
+    expect(useEditor.getState().project.clips[id].text!.words).toEqual(words)
+  })
+
+  it('a tail trim leaves the words (and the text object) untouched', () => {
+    const id = addKaraoke()
+    const text = useEditor.getState().project.clips[id].text
+    useEditor.getState().applyTrim(id, { startSec: 10, durationSec: 3, inSec: 0 })
+    expect(useEditor.getState().project.clips[id].text).toBe(text)
+  })
+
+  it('moving the clip carries its words along', () => {
+    const id = addKaraoke()
+    useEditor.getState().moveClip(id, 20)
+    expect(useEditor.getState().project.clips[id].text!.words).toEqual(words)
+    expect([20, 21, 22.5].map(litAt)).toEqual(['one', 'two', 'three'])
   })
 })
 

@@ -53,6 +53,12 @@ describe('settings sanitize', () => {
     expect(sanitize({ snapping: false }).snapping).toBe(false)
   })
 
+  it('karaoke transcription defaults off and only accepts a boolean', () => {
+    expect(DEFAULT_SETTINGS.transcribeKaraoke).toBe(false)
+    expect(sanitize({ transcribeKaraoke: true }).transcribeKaraoke).toBe(true)
+    expect(sanitize({ transcribeKaraoke: 'yes' })).not.toHaveProperty('transcribeKaraoke')
+  })
+
   it('audio scrubbing defaults on and only accepts a boolean', () => {
     expect(DEFAULT_SETTINGS.audioScrub).toBe(true)
     expect(sanitize({ audioScrub: false }).audioScrub).toBe(false)

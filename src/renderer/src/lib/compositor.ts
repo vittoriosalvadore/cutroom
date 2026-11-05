@@ -1,6 +1,7 @@
 import type { Clip, ClipTransform, ColorCurves, Effects, MediaItem, Project, TextProps } from '../types'
-import { defaultEffects, isNeutralColor } from '../types'
+import { DEFAULT_KARAOKE_COLOR, defaultEffects, isNeutralColor } from '../types'
 import { sampleOpacity, sampleTransform } from './keyframes'
+import { activeWordIndex } from './karaoke'
 import { mediaUrl } from './media'
 import { VideoPool } from './videoPool'
 import { roundRectPath } from './canvas'
@@ -138,9 +139,125 @@ function hexToCss(hex: string, alpha: number): string {
   return `rgba(${Math.round(r * 255)}, ${Math.round(g * 255)}, ${Math.round(b * 255)}, ${alpha})`
 }
 
+/** How much the 'pop' karaoke style enlarges the word being sung (at most). */
+const POP_SCALE = 1.18
+/** Extra space between words in the 'pop' style (fraction of the font size),
+ *  so the enlarged word has room without pushing its neighbours around. */
+const POP_GAP = 0.1
 
-/** Draw a title/subtitle onto a transparent full-frame canvas. */
-function renderTextCanvas(text: TextProps, W: number, H: number): HTMLCanvasElement {
+/** One karaoke line laid out word by word (see drawKaraokeLine). */
+interface KaraokeLine {
+  tokens: string[]
+  widths: number[]
+  /** Advance between two words. */
+  gap: number
+  width: number
+}
+
+/** Lay a karaoke line out word by word. Tokens are the line's own words (not
+ *  `text.words[].text`), so the picture always matches the text box. The
+ *  'pop' style's wider gaps are there on every frame, so the line never
+ *  shifts as the highlight moves. */
+function karaokeLayout(ctx: CanvasRenderingContext2D, line: string, text: TextProps, fontPx: number): KaraokeLine {
+  const tokens = line.split(/\s+/).filter(Boolean)
+  const widths = tokens.map((tok) => ctx.measureText(tok).width)
+  const gap = ctx.measureText(' ').width + ((text.karaokeStyle ?? 'pop') === 'pop' ? fontPx * POP_GAP : 0)
+  const width = widths.reduce((a, b) => a + b, 0) + gap * Math.max(0, tokens.length - 1)
+  return { tokens, widths, gap, width }
+}
+
+/**
+ * Draw one karaoke line word by word, so the active word can be highlighted
+ * per `text.karaokeStyle`. `wordOffset` is this line's first index into the
+ * flat `text.words` list, for matching `activeWord`. Laying words out one by
+ * one can drift a hair from measuring the whole line (no kerning across the
+ * spaces) — invisible at caption sizes.
+ */
+function drawKaraokeLine(
+  ctx: CanvasRenderingContext2D,
+  layout: KaraokeLine,
+  wordOffset: number,
+  activeWord: number,
+  ax: number,
+  y: number,
+  text: TextProps,
+  fontPx: number,
+  strokeW: number
+): void {
+  const { tokens, widths, gap } = layout
+  const color = text.karaokeColor || DEFAULT_KARAOKE_COLOR
+  const style = text.karaokeStyle ?? 'pop'
+  const xs: number[] = []
+  let x = text.align === 'center' ? ax - layout.width / 2 : text.align === 'left' ? ax : ax - layout.width
+  for (const w of widths) {
+    xs.push(x)
+    x += w + gap
+  }
+  const active = activeWord - wordOffset // index into this line's tokens
+
+  // The box goes in first so neighbouring words, drawn after, stay on top.
+  if (style === 'fill-wipe' && active >= 0 && active < tokens.length) {
+    const pad = fontPx * 0.14
+    ctx.fillStyle = hexToCss(color, 0.9)
+    roundRectPath(ctx, xs[active] - pad, y - fontPx * 0.6, widths[active] + pad * 2, fontPx * 1.2, fontPx * 0.16)
+    ctx.fill()
+  }
+
+  const drawWord = (i: number): void => {
+    const on = i === active
+    // On the box the word needs contrast with the highlight colour, not the video.
+    const fill = !on ? text.color : style !== 'fill-wipe' ? color : luminance(color) > 0.6 ? '#000000' : text.color
+    ctx.save()
+    if (on && style === 'pop') {
+      // Grow the word about its own centre, but only into half of each gap
+      // beside it (less the outlines), so a long word can't crowd its
+      // neighbours: short words get the full pop, long ones a little less.
+      const grow = Math.min(POP_SCALE, 1 + Math.max(0, gap - strokeW) / Math.max(1, widths[i]))
+      const cx = xs[i] + widths[i] / 2
+      ctx.translate(cx, y)
+      ctx.scale(grow, grow)
+      ctx.translate(-cx, -y)
+    }
+    if (strokeW > 0 && !(on && style === 'fill-wipe')) {
+      ctx.lineWidth = strokeW
+      ctx.strokeStyle = text.strokeColor
+      ctx.strokeText(tokens[i], xs[i], y)
+    }
+    ctx.fillStyle = fill
+    ctx.fillText(tokens[i], xs[i], y)
+    ctx.restore()
+    if (on && style === 'underline') {
+      const barH = Math.max(2, fontPx * 0.08)
+      const barY = y + fontPx * 0.52
+      if (strokeW > 0) {
+        ctx.lineWidth = Math.max(1, strokeW * 0.5)
+        ctx.strokeStyle = text.strokeColor
+        ctx.strokeRect(xs[i], barY, widths[i], barH)
+      }
+      ctx.fillStyle = color
+      ctx.fillRect(xs[i], barY, widths[i], barH)
+    }
+  }
+
+  ctx.textAlign = 'left'
+  // The active word last, so it sits on top of its neighbours.
+  tokens.forEach((_, i) => {
+    if (i !== active) drawWord(i)
+  })
+  if (active >= 0 && active < tokens.length) drawWord(active)
+  ctx.textAlign = text.align
+}
+
+/** Relative luminance (0..1) of a hex colour, for picking legible text on it. */
+function luminance(hex: string): number {
+  const [r, g, b] = hexToRgb01(hex)
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
+/** Draw a title/subtitle onto a transparent full-frame canvas. `activeWord`
+ *  (-1 = none) is the karaoke word to highlight when `text.words` is set;
+ *  plain titles/subtitles (no words) render exactly as before. */
+function renderTextCanvas(text: TextProps, W: number, H: number, activeWord = -1): HTMLCanvasElement {
   const canvas = document.createElement('canvas')
   canvas.width = W
   canvas.height = H
@@ -155,8 +272,13 @@ function renderTextCanvas(text: TextProps, W: number, H: number): HTMLCanvasElem
 
   const lines = text.content.split('\n')
   const lineHeight = fontPx * 1.25
+  // Karaoke lines are drawn word by word; measure them the same way so the
+  // box fits what is drawn.
+  const karaoke = text.words && text.words.length > 0 ? lines.map((ln) => karaokeLayout(ctx, ln, text, fontPx)) : null
   let maxW = 0
-  for (const ln of lines) maxW = Math.max(maxW, ctx.measureText(ln).width)
+  lines.forEach((ln, i) => {
+    maxW = Math.max(maxW, karaoke ? karaoke[i].width : ctx.measureText(ln).width)
+  })
   const blockH = lineHeight * lines.length
   const cx = (text.xPct / 100) * W
   const cy = (text.yPct / 100) * H
@@ -175,8 +297,15 @@ function renderTextCanvas(text: TextProps, W: number, H: number): HTMLCanvasElem
   ctx.lineJoin = 'round'
   ctx.miterLimit = 2
 
+  let wordCursor = 0
+
   lines.forEach((ln, i) => {
     const y = cy - blockH / 2 + lineHeight * (i + 0.5)
+    if (karaoke) {
+      drawKaraokeLine(ctx, karaoke[i], wordCursor, activeWord, ax, y, text, fontPx, strokeW)
+      wordCursor += karaoke[i].tokens.length
+      return
+    }
     if (strokeW > 0) {
       ctx.lineWidth = strokeW
       ctx.strokeStyle = text.strokeColor
@@ -306,19 +435,23 @@ export class Compositor {
   // hasn't changed; otherwise mint a fresh key so cachedCanvas() correctly
   // misses and re-rasterizes. Capped like canvasCache so creating/deleting
   // many title clips over a long session can't grow this map unboundedly.
+  // `word` (the active karaoke word, -1 without words) suffixes the key: a
+  // plain clip keeps ONE canvas for its whole life, as before, while a karaoke
+  // clip rasterizes once per word transition — not per frame — and revisiting
+  // a word (scrubbing back) reuses its canvas while it is still cached.
   private textKeyCache = new Map<string, { ref: TextProps; w: number; h: number; key: string }>()
   private textKeyCounter = 0
 
-  private textCacheKey(clipId: string, text: TextProps): string {
+  private textCacheKey(clipId: string, text: TextProps, word: number): string {
     const cached = this.textKeyCache.get(clipId)
-    if (cached && cached.ref === text && cached.w === this.W && cached.h === this.H) return cached.key
+    if (cached && cached.ref === text && cached.w === this.W && cached.h === this.H) return `${cached.key}:${word}`
     const key = `text:${this.W}x${this.H}:${clipId}:${this.textKeyCounter++}`
     this.textKeyCache.set(clipId, { ref: text, w: this.W, h: this.H, key })
     if (this.textKeyCache.size > 64) {
       const oldest = this.textKeyCache.keys().next().value
       if (oldest !== undefined) this.textKeyCache.delete(oldest)
     }
-    return key
+    return `${key}:${word}`
   }
 
   // Curve LUT textures, keyed by the clip's ColorCurves object. The store
@@ -634,9 +767,13 @@ export class Compositor {
     const opacity = sampleOpacity(clip, effects.opacity, tRel)
 
     if (clip.role === 'title' || clip.role === 'subtitle') {
-      if (!clip.text || !clip.text.content.trim()) return
-      const key = this.textCacheKey(clip.id, clip.text)
-      const tex = this.cachedCanvas(key, () => renderTextCanvas(clip.text as TextProps, this.W, this.H))
+      const text = clip.text
+      if (!text || !text.content.trim()) return
+      // Karaoke: the word active at the same clip-relative time the transform
+      // uses, so preview and export (renderExact -> render) highlight alike.
+      const word = text.words && text.words.length > 0 ? activeWordIndex(text.words, tRel) : -1
+      const key = this.textCacheKey(clip.id, text, word)
+      const tex = this.cachedCanvas(key, () => renderTextCanvas(text, this.W, this.H, word))
       this.drawQuad({ x: 0, y: 0, w: 1, h: 1 }, tex.tex, null, effects, tf, opacity)
       return
     }

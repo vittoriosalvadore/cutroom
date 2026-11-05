@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react'
 import { useEditor } from '../state/store'
-import { transcribeClip, type TranscribeProgress } from '../lib/transcribe'
+import { abandonTranscription, transcribeClip, type TranscribeProgress } from '../lib/transcribe'
+import { JobCancelled } from '../lib/workerJob'
 import { interpolateParts, useT } from '../lib/i18n'
 import { useSettings } from '../state/settings'
 import {
@@ -50,10 +51,19 @@ export default function TranscribeModal() {
   const [progress, setProgress] = useState<TranscribeProgress>({ stage: 'extracting' })
   const [error, setError] = useState<string | null>(null)
   const [count, setCount] = useState(0)
-  const cancelRef = useRef(false)
+  // Karaoke: the model couldn't time words, so their timing was estimated.
+  const [estimated, setEstimated] = useState(false)
+  // Stop lands at the next window boundary (the window in flight finishes and
+  // its cues are kept); while it is pending the button closes the modal
+  // instead, abandoning the worker rather than waiting it out.
+  const [stopping, setStopping] = useState(false)
+  // Cancellation belongs to ONE run: a later run must not reset a flag an
+  // older, still-settling run polls, or that run could wake up and race it.
+  const activeRunRef = useRef<{ cancelled: boolean } | null>(null)
   const t = useT()
   const model = useSettings((s) => s.transcribeModel)
   const language = useSettings((s) => s.transcribeLanguage)
+  const karaoke = useSettings((s) => s.transcribeKaraoke)
   const setSettings = useSettings((s) => s.set)
 
   if (!open) return null
@@ -67,8 +77,9 @@ export default function TranscribeModal() {
       : progress.stage === 'transcribing'
         ? 100
         : 8
-  const label =
-    progress.stage === 'extracting'
+  const label = stopping
+    ? t('Stopping…')
+    : progress.stage === 'extracting'
       ? t('Preparing audio…')
       : progress.stage === 'loading'
         ? `${t('Loading model…')} ${progress.progress != null ? Math.round(progress.progress * 100) + '%' : ''}`
@@ -76,47 +87,83 @@ export default function TranscribeModal() {
 
   const run = async (): Promise<void> => {
     if (!clip) return
-    cancelRef.current = false
+    // Defensive: a run still settling must neither commit cues nor share (and
+    // later tear down) the worker the new run is about to use.
+    if (activeRunRef.current) {
+      activeRunRef.current.cancelled = true
+      abandonTranscription()
+    }
+    const runState = { cancelled: false }
+    activeRunRef.current = runState
+    const current = (): boolean => activeRunRef.current === runState
+    setStopping(false)
     setStatus('running')
     setError(null)
     setProgress({ stage: 'extracting' })
     setCount(0)
+    setEstimated(false)
     try {
-      // Each cue is committed to the project the moment its 30s window resolves
+      // Each cue is committed to the project the moment its window resolves
       // (not batched until the whole clip finishes) — a crash mid-transcription
       // only loses the window in flight, not everything already transcribed.
       // Only the first cue records an undo step; the rest join it, so the whole
       // transcription undoes at once and a long one can't flush the history.
       let first = true
-      const cues = await transcribeClip(
+      const result = await transcribeClip(
         useEditor.getState().project,
         clip,
-        setProgress,
+        (p) => {
+          if (current()) setProgress(p)
+        },
         (cue) => {
+          if (!current()) return // abandoned run: the modal moved on
           importSubtitles([cue], { recordHistory: first })
           first = false
           setCount((c) => c + 1)
         },
-        () => cancelRef.current,
-        { model, language }
+        () => runState.cancelled || !current(),
+        { model, language, karaoke }
       )
-      setCount(cues.length)
+      if (!current()) return
+      setCount(result.cues.length)
+      setEstimated(result.estimatedWords)
       setStatus('done')
     } catch (e) {
-      if (e instanceof Error && e.message === 'cancelled') {
+      if (!current()) return
+      // A user stop surfaces as JobCancelled at the next checkpoint; intent
+      // decides, not the message (a torn-down worker rejects differently).
+      if (runState.cancelled || e instanceof JobCancelled) {
         setStatus('idle') // user stopped it; already-committed cues stay on the timeline
       } else {
         setError(e instanceof Error ? e.message : t('Transcription failed.'))
         setStatus('error')
       }
+    } finally {
+      if (current()) {
+        activeRunRef.current = null
+        setStopping(false)
+      }
     }
   }
 
   const close = (): void => {
-    if (running) {
-      cancelRef.current = true // let the in-flight window finish, then it can be reopened
+    const active = activeRunRef.current
+    if (running && active && !stopping) {
+      // First press: stop once the window in flight is done.
+      active.cancelled = true
+      setStopping(true)
       return
     }
+    if (running && active) {
+      // Closed while that stop is pending: don't wait (on the "Best" model a
+      // window can take minutes). Terminating the worker settles its call at
+      // once and gives the next run a fresh worker; the abandoned run's
+      // handlers see they are no longer current and leave the modal alone.
+      active.cancelled = true
+      activeRunRef.current = null
+      abandonTranscription()
+    }
+    setStopping(false)
     setStatus('idle')
     setError(null)
     setOpen(false)
@@ -167,14 +214,28 @@ export default function TranscribeModal() {
                   >
                     {TRANSCRIBE_MODELS.map((m) => (
                       <option key={m.id} value={m.id}>
-                        {t(m.label)} (~{m.approxMb} MB)
+                        {t(m.label)} (~{m.approxMb} MB{m.slow ? `, ${t('slow')}` : ''})
                       </option>
                     ))}
                   </select>
                 </label>
+                <label className="transcribe-karaoke">
+                  <input
+                    type="checkbox"
+                    checked={karaoke}
+                    disabled={running}
+                    onChange={(e) => setSettings({ transcribeKaraoke: e.target.checked })}
+                  />
+                  <span>
+                    {t('Karaoke (word timing)')}
+                    <small>{t('Highlights each word as it is sung or spoken, on short caption lines.')}</small>
+                  </span>
+                </label>
               </div>
               <p className="modal-note">
-                {t('Pick the language spoken in the clip for the best results. "Accurate" is much better on non-English speech but slower.')}
+                {t(
+                  'Pick the language spoken in the clip for the best results. "Accurate" is much better on non-English speech but slower. For sung lyrics choose "Best": the most accurate, but a large download and slow to transcribe.'
+                )}
               </p>
               {running && (
                 <div className="export-progress">
@@ -191,13 +252,18 @@ export default function TranscribeModal() {
                     : t('Added {n} subtitles to the Subtitles track.', { n: count })}
                 </p>
               )}
+              {status === 'done' && estimated && (
+                <p className="modal-warn">
+                  {t('This model could not time individual words, so the word timings are estimated from whole phrases.')}
+                </p>
+              )}
               {status === 'error' && error && <p className="modal-error">{error}</p>}
             </>
           )}
         </div>
         <div className="modal-foot">
           <button className="btn" onClick={close}>
-            {running ? t('Stop') : t('Close')}
+            {running && !stopping ? t('Stop') : t('Close')}
           </button>
           {transcribable && status !== 'done' && (
             <button className="btn primary" onClick={run} disabled={running}>

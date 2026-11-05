@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { serializeProject, deserializeProject, FILE_VERSION, projectFileLabel } from './projectFile'
+import { defaultSubtitleText } from '../types'
 import type { Project } from '../types'
 
 function sample(): Project {
@@ -202,6 +203,76 @@ describe('project (de)serialize', () => {
     expect(c?.r).toEqual([{ x: 0, y: 0 }, { x: 1, y: 1 }])
     expect(r.project.clips.c2.effects).toBeDefined()
     expect(r.project.clips.c2.effects && 'curves' in r.project.clips.c2.effects).toBe(false)
+  })
+
+  const subtitle = (text: Record<string, unknown>): Record<string, unknown> => ({
+    id: 's1',
+    trackId: 'v1',
+    mediaId: null,
+    startSec: 2,
+    durationSec: 3,
+    inSec: 0,
+    role: 'subtitle',
+    text: { ...defaultSubtitleText('la la land'), ...text }
+  })
+
+  it('round-trips a karaoke subtitle (words, style, colour)', () => {
+    const p = sample()
+    const karaoke = {
+      words: [
+        { text: 'la', startSec: -0.5, endSec: 0.2 }, // negative: rebased by a split
+        { text: 'la', startSec: 0.2, endSec: 0.6 },
+        { text: 'land', startSec: 0.6, endSec: 1.4 }
+      ],
+      karaokeStyle: 'underline',
+      karaokeColor: '#ff3366'
+    }
+    const raw = { ...p, clips: { ...p.clips, s1: subtitle(karaoke) } }
+    const r = deserializeProject(JSON.stringify({ project: raw }))
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.project.clips.s1.text).toEqual({ ...defaultSubtitleText('la la land'), ...karaoke })
+    const again = deserializeProject(serializeProject(r.project))
+    expect(again.ok && again.project.clips.s1).toEqual(r.project.clips.s1)
+  })
+
+  it('sanitizes karaoke fields: bad words dropped and sorted, bad style/colour removed', () => {
+    const p = sample()
+    const raw = {
+      ...p,
+      clips: {
+        ...p.clips,
+        s1: subtitle({
+          words: [
+            { text: 'land', startSec: 1, endSec: 0.5, extra: 'x' }, // end before start -> clamped
+            'junk',
+            { text: 'la', startSec: 'soon', endSec: 1 },
+            { text: 7, startSec: 0, endSec: 1 },
+            { text: 'la', startSec: 0, endSec: 0.4 }
+          ],
+          karaokeStyle: 'sparkle',
+          karaokeColor: 'yellow'
+        }),
+        s2: subtitle({ words: 'nope', karaokeStyle: 'pop', karaokeColor: '#FD3' }),
+        s3: subtitle({ words: [] })
+      }
+    }
+    const r = deserializeProject(JSON.stringify({ project: raw }))
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    const s1 = r.project.clips.s1.text!
+    expect(s1.words).toEqual([
+      { text: 'la', startSec: 0, endSec: 0.4 },
+      { text: 'land', startSec: 1, endSec: 1 }
+    ])
+    expect(s1).not.toHaveProperty('karaokeStyle')
+    expect(s1).not.toHaveProperty('karaokeColor')
+    const s2 = r.project.clips.s2.text!
+    expect(s2).not.toHaveProperty('words')
+    expect(s2.karaokeStyle).toBe('pop')
+    expect(s2.karaokeColor).toBe('#FFDD33') // expanded for the colour input
+    expect(r.project.clips.s3.text).not.toHaveProperty('words') // empty -> plain subtitle
+    expect(r.project.clips.s3.text!.content).toBe('la la land')
   })
 })
 

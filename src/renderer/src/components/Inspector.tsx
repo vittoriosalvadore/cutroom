@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useEditor } from '../state/store'
 import {
+  DEFAULT_KARAOKE_COLOR,
+  KARAOKE_STYLES,
   defaultAudio,
   defaultColor,
   defaultEffects,
@@ -908,6 +910,41 @@ export default function Inspector() {
               step={0.01}
               onChange={(v) => updateText(id, { boxOpacity: v })}
             />
+            {text.words && text.words.length > 0 && (
+              <>
+                <div className="insp-row">
+                  <label className="insp-color">
+                    {t('Highlight')}
+                    <input
+                      type="color"
+                      value={text.karaokeColor ?? DEFAULT_KARAOKE_COLOR}
+                      onChange={(e) => updateText(id, { karaokeColor: e.target.value })}
+                    />
+                  </label>
+                  <div className="insp-toggle-group">
+                    {KARAOKE_STYLES.map((s) => (
+                      <button
+                        key={s}
+                        className={`btn small ${(text.karaokeStyle ?? 'pop') === s ? 'active' : ''}`}
+                        title={
+                          s === 'pop'
+                            ? t('The word being sung grows and takes the highlight colour')
+                            : s === 'underline'
+                              ? t('The word being sung is underlined in the highlight colour')
+                              : t('A box in the highlight colour sits behind the word being sung')
+                        }
+                        onClick={() => updateText(id, { karaokeStyle: s })}
+                      >
+                        {s === 'pop' ? t('Pop') : s === 'underline' ? t('Underline') : t('Fill')}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <p className="insp-note">
+                  {t('Karaoke: the highlight follows the timed words in order, so keep the same number of words when you correct the text.')}
+                </p>
+              </>
+            )}
           </section>
         )}
 

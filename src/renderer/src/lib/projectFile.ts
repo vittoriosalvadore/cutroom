@@ -1,5 +1,5 @@
-import type { AnimProp, Clip, Easing, Keyframe, MediaItem, Marker, Project, Track } from '../types'
-import { defaultTrackComp, defaultTrackDuck, defaultTrackEQ, defaultTrackGate } from '../types'
+import type { AnimProp, Clip, Easing, Keyframe, MediaItem, Marker, Project, TextProps, Track, WordTiming } from '../types'
+import { defaultTrackComp, defaultTrackDuck, defaultTrackEQ, defaultTrackGate, KARAOKE_STYLES } from '../types'
 import { clampReverb } from '../../../shared/reverb'
 import { clampTrackHeight } from './tracks'
 import { sanitizeCurves } from './curves'
@@ -160,6 +160,38 @@ function sanitizeKeyframes(raw: unknown): Clip['keyframes'] | undefined {
   return Object.keys(out).length > 0 ? out : undefined
 }
 
+/** Karaoke word timings: keep well-formed words (text + finite times, end not
+ *  before start), sorted by start — the highlight lookup assumes it. None left
+ *  = undefined, i.e. a plain subtitle. Times may be negative (see WordTiming). */
+function sanitizeWords(raw: unknown): WordTiming[] | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const out: WordTiming[] = []
+  for (const w of raw) {
+    if (!isRecord(w) || typeof w.text !== 'string' || !Number.isFinite(w.startSec) || !Number.isFinite(w.endSec)) continue
+    const startSec = w.startSec as number
+    out.push({ text: w.text, startSec, endSec: Math.max(startSec, w.endSec as number) })
+  }
+  return out.length > 0 ? out.sort((a, b) => a.startSec - b.startSec) : undefined
+}
+
+const KARAOKE_STYLE_SET = new Set<string>(KARAOKE_STYLES)
+
+/** A text clip's optional karaoke fields; the rest of the text passes through.
+ *  A bad style or colour is dropped (= the default), a 3-digit colour is
+ *  expanded so the Inspector's colour input can show it. */
+function sanitizeKaraoke(raw: Record<string, unknown>): TextProps {
+  const text = { ...(raw as unknown as TextProps) }
+  const words = sanitizeWords(raw.words)
+  if (words) text.words = words
+  else delete text.words
+  if (!KARAOKE_STYLE_SET.has(raw.karaokeStyle as string)) delete text.karaokeStyle
+  const color = typeof raw.karaokeColor === 'string' ? raw.karaokeColor : ''
+  if (/^#[0-9a-fA-F]{6}$/.test(color)) text.karaokeColor = color
+  else if (/^#[0-9a-fA-F]{3}$/.test(color)) text.karaokeColor = '#' + [...color.slice(1)].map((ch) => ch + ch).join('')
+  else delete text.karaokeColor
+  return text
+}
+
 /** A clip survives only if it can be placed and rendered: finite timing, a
  *  positive length, a real track, and a media reference that is null or
  *  resolvable. Anything else is dropped (not the whole file). */
@@ -187,6 +219,7 @@ function sanitizeClips(raw: Record<string, unknown>, trackIds: Set<string>, medi
       if (kf) clip.keyframes = kf
       else delete clip.keyframes
     }
+    if (isRecord(c.text)) clip.text = sanitizeKaraoke(c.text)
     out[id] = clip
   }
   return out

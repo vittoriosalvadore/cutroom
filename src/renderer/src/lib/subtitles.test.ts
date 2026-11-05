@@ -1,5 +1,27 @@
 import { describe, it, expect } from 'vitest'
-import { parseSubtitles, toSrt } from './subtitles'
+import { parseSubtitles, projectToCues, toSrt } from './subtitles'
+import { defaultSubtitleText } from '../types'
+import type { Project } from '../types'
+
+describe('projectToCues', () => {
+  it('exports a karaoke subtitle as plain text, without its word timings', () => {
+    const text = {
+      ...defaultSubtitleText('la la land'),
+      words: [
+        { text: 'la', startSec: 0, endSec: 0.4 },
+        { text: 'la', startSec: 0.4, endSec: 0.8 },
+        { text: 'land', startSec: 0.8, endSec: 1.6 }
+      ],
+      karaokeStyle: 'fill-wipe' as const
+    }
+    const project = {
+      clips: { s: { id: 's', trackId: 't', mediaId: null, startSec: 2, durationSec: 2, inSec: 0, role: 'subtitle', text } }
+    } as unknown as Project
+    const cues = projectToCues(project)
+    expect(cues).toEqual([{ startSec: 2, endSec: 4, text: 'la la land' }])
+    expect(toSrt(cues)).toBe('1\n00:00:02,000 --> 00:00:04,000\nla la land\n')
+  })
+})
 
 describe('toSrt', () => {
   it('formats timestamps as HH:MM:SS,mmm', () => {

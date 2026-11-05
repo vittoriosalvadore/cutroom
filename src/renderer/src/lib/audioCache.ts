@@ -60,13 +60,40 @@ function computePeaks(buffer: AudioBuffer): Float32Array {
   return peaks
 }
 
+/**
+ * The cached buffer for a media item, waiting for the app's own background
+ * decode (ensureAudioDecoded, started on import) when it is still in flight
+ * instead of starting a redundant parallel one — transcribing right after
+ * importing a long file used to decode it twice. Resolves null when the cache
+ * won't provide one (never requested, skipped as too long, or failed), so the
+ * caller decodes on demand.
+ */
+export function waitForDecoded(mediaId: string): Promise<AudioBuffer | null> {
+  // undefined = still loading.
+  const settled = (): AudioBuffer | null | undefined => {
+    const e = getAudioEntry(mediaId)
+    if (e?.status === 'loading') return undefined
+    return e?.status === 'ready' && e.buffer ? e.buffer : null
+  }
+  const now = settled()
+  if (now !== undefined) return Promise.resolve(now)
+  return new Promise((resolve) => {
+    const unsub = subscribeAudioCache(() => {
+      const r = settled()
+      if (r === undefined) return
+      unsub()
+      resolve(r)
+    })
+  })
+}
+
 /** Get a media item's decoded AudioBuffer directly — reuses the cache if
- *  ready, else decodes on demand. For features needing synchronous buffer
- *  access outside the normal ensureAudioDecoded cache-and-notify flow (e.g.
- *  transcription, silence detection). */
+ *  ready (or about to be), else decodes on demand. For features needing
+ *  synchronous buffer access outside the normal ensureAudioDecoded
+ *  cache-and-notify flow (e.g. transcription, silence detection). */
 export async function getOrDecodeBuffer(mediaId: string, path: string): Promise<AudioBuffer> {
-  const entry = getAudioEntry(mediaId)
-  if (entry?.status === 'ready' && entry.buffer) return entry.buffer
+  const cached = await waitForDecoded(mediaId)
+  if (cached) return cached
   const arr = await fetch(mediaUrl(path)).then((r) => r.arrayBuffer())
   return getAudioContext().decodeAudioData(arr)
 }

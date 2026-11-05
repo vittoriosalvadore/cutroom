@@ -1,11 +1,22 @@
 import { describe, it, expect } from 'vitest'
-import { defaultTranscribeLanguage, isSilent, modelHub, splitAtQuiet } from './transcribeOptions'
+import { defaultTranscribeLanguage, isSilent, modelHub, splitAtQuiet, TRANSCRIBE_MODELS } from './transcribeOptions'
+import { DEFAULT_SETTINGS, sanitize } from '../state/settings'
 
 describe('transcribe options', () => {
   it('uses multilingual checkpoints', () => {
     expect(modelHub('base')).toBe('Xenova/whisper-base')
     expect(modelHub('small')).toBe('Xenova/whisper-small')
+    expect(modelHub('medium')).toBe('Xenova/whisper-medium')
     expect(modelHub('tiny')).not.toMatch(/\.en$/)
+  })
+
+  it('offers "Best" (medium) as an opt-in: flagged slow, the largest download, not the default', () => {
+    const best = TRANSCRIBE_MODELS.find((m) => m.id === 'medium')!
+    expect(best.label).toBe('Best')
+    expect(best.slow).toBe(true)
+    expect(best.approxMb).toBe(Math.max(...TRANSCRIBE_MODELS.map((m) => m.approxMb)))
+    expect(DEFAULT_SETTINGS.transcribeModel).toBe('small')
+    expect(sanitize({ transcribeModel: 'medium' }).transcribeModel).toBe('medium')
   })
 
   it('derives the spoken language from the OS locale', () => {

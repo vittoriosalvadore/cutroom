@@ -3,12 +3,15 @@ import type { SubtitleCue } from '../state/store'
 import { getOrDecodeBuffer } from './audioCache'
 import { WorkerJob, JobCancelled } from './workerJob'
 import { clipSourceSpan, sourceToTimeline } from './clipTime'
+import { t } from './i18n'
+import { estimateWordChunks, wordsToCues, type WhisperChunk } from './karaoke'
 import { isSilent, modelHub, splitAtQuiet, type TranscribeLanguage, type TranscribeModel } from './transcribeOptions'
 
 // ---------------------------------------------------------------------------
 // Drives the Whisper worker: extract a clip's audio to 16 kHz mono PCM (Whisper's
 // required format), transcribe it off-thread, and map the timestamped segments to
-// subtitle cues positioned on the timeline.
+// subtitle cues positioned on the timeline. In karaoke mode the cues also carry
+// per-word timing (lib/karaoke.ts) for the compositor's word highlight.
 // ---------------------------------------------------------------------------
 
 export interface TranscribeProgress {
@@ -18,23 +21,45 @@ export interface TranscribeProgress {
   file?: string
 }
 
-interface WhisperChunk {
-  timestamp: [number, number | null]
-  text: string
+// Extraction (decode + offline render) has no checkpoint where Stop could land,
+// so a decode that never settles would hang the modal for good. A generous
+// limit that grows with the file still catches that without failing big files
+// on slow machines.
+function extractTimeoutMs(sourceSec: number): number {
+  return 60_000 + Math.max(0, sourceSec) * 250
 }
 
-async function getSourceBuffer(project: Project, clip: Clip): Promise<AudioBuffer> {
-  const media = clip.mediaId ? project.media[clip.mediaId] : null
-  if (!media || !media.path) throw new Error('This clip has no audio to transcribe.')
-  return getOrDecodeBuffer(media.id, media.path)
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms)
+    promise.then(
+      (v) => {
+        clearTimeout(timer)
+        resolve(v)
+      },
+      (e) => {
+        clearTimeout(timer)
+        reject(e)
+      }
+    )
+  })
 }
 
 /** Render the clip's used SOURCE span (durationSec * speed) to 16 kHz mono PCM,
  *  at natural speed — Whisper needs un-stretched audio; cue times are mapped
  *  back through the clip's speed afterwards. */
-async function getClipPcm16k(project: Project, clip: Clip): Promise<Float32Array> {
-  const buffer = await getSourceBuffer(project, clip)
+async function getClipPcm16k(project: Project, clip: Clip, shouldCancel: () => boolean): Promise<Float32Array> {
+  const media = clip.mediaId ? project.media[clip.mediaId] : null
+  if (!media || !media.path) throw new Error(t('This clip has no audio to transcribe.'))
   const srcSpan = clipSourceSpan(clip)
+  const limit = extractTimeoutMs(Math.max(media.durationSec, srcSpan))
+  // Reuses the background decode started on import if it is still running.
+  const buffer = await withTimeout(
+    getOrDecodeBuffer(media.id, media.path),
+    limit,
+    t('Decoding this audio took too long. The file may be too large or damaged.')
+  )
+  if (shouldCancel()) throw new JobCancelled()
   const length = Math.max(1, Math.ceil(srcSpan * 16000))
   const offline = new OfflineAudioContext(1, length, 16000)
   const src = offline.createBufferSource()
@@ -43,7 +68,7 @@ async function getClipPcm16k(project: Project, clip: Clip): Promise<Float32Array
   const offset = Math.max(0, Math.min(clip.inSec, buffer.duration))
   const dur = Math.max(0, Math.min(srcSpan, buffer.duration - offset))
   src.start(0, offset, dur)
-  const rendered = await offline.startRendering()
+  const rendered = await withTimeout(offline.startRendering(), limit, t("Preparing this clip's audio took too long."))
   return rendered.getChannelData(0).slice()
 }
 
@@ -73,20 +98,47 @@ interface TranscribeIn {
   model: string
   /** Whisper language name, or 'auto'. */
   language: string
+  /** Ask for word-level timestamps (karaoke). */
+  words: boolean
 }
 
 export interface TranscribeOptions {
   model: TranscribeModel
   language: TranscribeLanguage
+  /** Word-timed cues for a karaoke highlight. */
+  karaoke?: boolean
 }
 interface TranscribeOut {
   chunks: WhisperChunk[]
   text: string
+  /** True when `chunks` are single words with their own timestamps. False
+   *  means phrase segments — also what a word-level request falls back to
+   *  when the model can't time words (see transcribe.worker.ts). */
+  wordTimestamps?: boolean
+}
+
+export interface TranscribeResult {
+  cues: SubtitleCue[]
+  /** Karaoke only: the model couldn't time words, so some word timings were
+   *  estimated from phrase timestamps (see karaoke.estimateWordChunks). */
+  estimatedWords: boolean
 }
 
 const job = new WorkerJob<TranscribeIn, TranscribeOut>(
   () => new Worker(new URL('./transcribe.worker.ts', import.meta.url), { type: 'module' })
 )
+
+/**
+ * Tear down the transcribe worker (if any) and every call posted to it. A
+ * call already in the worker can't be cancelled in place, only waited out —
+ * and once the caller has given up on it (the modal was closed while a Stop
+ * was pending), leaving it to occupy the shared worker is a trap: the next
+ * Transcribe queues behind it, and if the stale call later times out, that
+ * teardown takes the new call down too. The next call starts a fresh worker.
+ */
+export function abandonTranscription(): void {
+  job.terminate()
+}
 
 const SAMPLE_RATE = 16000
 // Windows of up to 2 min, each ending at the quietest spot of its last 4 s so
@@ -109,10 +161,11 @@ export async function transcribeClip(
   onCue: (cue: SubtitleCue) => void,
   shouldCancel: () => boolean = () => false,
   options: TranscribeOptions = { model: 'small', language: 'auto' }
-): Promise<SubtitleCue[]> {
+): Promise<TranscribeResult> {
   onProgress({ stage: 'extracting' })
-  const pcm = await getClipPcm16k(project, clip)
+  const pcm = await getClipPcm16k(project, clip, shouldCancel)
   const allCues: SubtitleCue[] = []
+  let estimatedWords = false
 
   for (const [start, end] of splitAtQuiet(pcm, SAMPLE_RATE, WINDOW_SEC, QUIET_SEARCH_SEC)) {
     if (shouldCancel()) throw new JobCancelled()
@@ -125,24 +178,41 @@ export async function transcribeClip(
     const winSrcSec = clip.inSec + start / SAMPLE_RATE
     const toTimeline = (winSec: number): number => sourceToTimeline(clip, winSrcSec + winSec)
 
-    const { chunks } = await job.call(
-      { type: 'transcribe', pcm: chunkPcm, model: modelHub(options.model), language: options.language },
+    const out = await job.call(
+      {
+        type: 'transcribe',
+        pcm: chunkPcm,
+        model: modelHub(options.model),
+        language: options.language,
+        words: !!options.karaoke
+      },
       {
         onProgress: (p) => onProgress({ stage: 'loading', progress: p.progress, file: p.file }),
         onStatus: (msg) => {
           if ((msg as { status?: string }).status === 'transcribing') onProgress({ stage: 'transcribing' })
         },
         shouldCancel,
-        // A 2 min window on the "Accurate" model can run for minutes on CPU
-        // without an intermediate message; only a truly hung worker should trip this.
+        // The worker reports after each 30 s chunk of a window, but one chunk on
+        // the "Best" model can still run for minutes on CPU without a message;
+        // only a truly hung worker should trip this.
         timeoutMs: 15 * 60_000,
         transfer: [chunkPcm.buffer]
       }
     )
-    for (const cue of chunksToCues(chunks, toTimeline)) {
+    let cues: SubtitleCue[]
+    if (options.karaoke) {
+      // Word times are SOURCE seconds within the window; toTimeline maps them
+      // through the clip's speed, exactly like the segment path.
+      const words = out.wordTimestamps ? out.chunks : estimateWordChunks(out.chunks)
+      if (!out.wordTimestamps && words.length > 0) estimatedWords = true
+      cues = wordsToCues(words, toTimeline)
+    } else {
+      cues = chunksToCues(out.chunks, toTimeline)
+    }
+    for (const cue of cues) {
       allCues.push(cue)
       onCue(cue)
     }
   }
-  return allCues
+  return { cues: allCues, estimatedWords }
 }

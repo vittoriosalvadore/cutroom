@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+import { defaultSubtitleText } from '../types'
 import {
   alignSplitTimes,
   computeCrossfade,
@@ -130,6 +131,28 @@ describe('splitClipAt', () => {
     expect(r.left.fadeOutSec).toBe(0)
     expect(r.right.fadeInSec).toBe(0)
     expect(r.right.fadeOutSec).toBeCloseTo(3) // min(3, rightDur=3)
+  })
+  it('rebases karaoke word timings onto the right piece, keeping every word', () => {
+    const text = {
+      ...defaultSubtitleText('one two three'),
+      words: [
+        { text: 'one', startSec: 0, endSec: 1 },
+        { text: 'two', startSec: 1, endSec: 2 },
+        { text: 'three', startSec: 2.5, endSec: 3.5 }
+      ]
+    }
+    const r = splitClipAt({ ...clip, text }, 3.5)! // offset 1.5
+    expect(r.left.text).toBe(text) // left keeps its origin: untouched
+    expect(r.right.text!.content).toBe('one two three')
+    // All three words survive (the renderer pairs them with the text by position).
+    expect(r.right.text!.words!.map((w) => [w.text, w.startSec, w.endSec])).toEqual([
+      ['one', -1.5, -0.5],
+      ['two', -0.5, 0.5],
+      ['three', 1, 2]
+    ])
+  })
+  it('adds no text to clips that have none', () => {
+    expect(splitClipAt(clip, 3)!.right).not.toHaveProperty('text')
   })
 })
 

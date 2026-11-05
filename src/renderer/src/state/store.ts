@@ -19,7 +19,8 @@ import type {
   TrackDuck,
   TrackEQ,
   TrackComp,
-  TrackReverb
+  TrackReverb,
+  WordTiming
 } from '../types'
 import {
   clampSpeed,
@@ -49,14 +50,17 @@ import {
 import { clampFades } from '../lib/fades'
 import { CURVE_CHANNELS, identityCurves, identityPoints, isDefaultChannel } from '../lib/curves'
 import { canRemoveTrack, clampTrackHeight, moveTrackTo, newVideoTrackIndex, nextTrackName } from '../lib/tracks'
-import { clampProp, keyIndexAt, KEY_EPS, rebaseTracks, sortKeys, splitTracksAt, withTransformProp } from '../lib/keyframes'
+import { clampProp, keyIndexAt, KEY_EPS, rebaseTracks, sortKeys, withTransformProp } from '../lib/keyframes'
+import { shiftWords } from '../lib/karaoke'
 import { useSettings } from './settings'
 
-/** One imported subtitle cue (used by SRT/VTT import). */
+/** One imported subtitle cue (SRT/VTT import, and Whisper transcription). */
 export interface SubtitleCue {
   startSec: number
   endSec: number
   text: string
+  /** Word timing for a karaoke highlight, relative to THIS cue's startSec. */
+  words?: WordTiming[]
 }
 
 // ---------------------------------------------------------------------------
@@ -657,6 +661,11 @@ export const useEditor = create<EditorState>((set) => {
       // should match reality too (e.g. the Inspector fade slider shouldn't show
       // an 8s fade-out on a clip that's now only 3s long).
       const { fadeInSec, fadeOutSec } = clampFades(base.fadeInSec ?? 0, base.fadeOutSec ?? 0, bounds.durationSec)
+      // Karaoke word timings are clip-relative too: rebase them the same way so
+      // the highlight stays on the audio. Text clips keep inSec on a head trim
+      // (computeTrim), so nothing else would carry this offset.
+      const words = base.text?.words && delta !== 0 ? shiftWords(base.text.words, -delta) : base.text?.words
+      const text = clip.text && words && clip.text.words !== words ? { ...clip.text, words } : clip.text
       const next: Clip = {
         ...clip,
         startSec: bounds.startSec,
@@ -664,7 +673,8 @@ export const useEditor = create<EditorState>((set) => {
         inSec: bounds.inSec,
         fadeInSec,
         fadeOutSec,
-        keyframes
+        keyframes,
+        text
       }
       return { project: { ...s.project, clips: { ...s.project.clips, [clipId]: next } } }
     }),
@@ -675,34 +685,16 @@ export const useEditor = create<EditorState>((set) => {
       const clips = { ...s.project.clips }
       let changed = false
       for (const c of Object.values(s.project.clips)) {
-        // Only split clips the playhead actually crosses (not at the very edges).
-        if (t > c.startSec + 1e-4 && t < c.startSec + c.durationSec - 1e-4) {
-          const offset = t - c.startSec
-          const rightDur = c.durationSec - offset
-          // Rebase keyframe tracks across the cut so the animation doesn't pop.
-          const kf = c.keyframes ? splitTracksAt(c.keyframes, offset) : undefined
-          // Split fades across the cut so the envelope isn't duplicated: the left
-          // half keeps the fade-in, the right half keeps the fade-out.
-          clips[c.id] = {
-            ...c,
-            durationSec: offset,
-            fadeInSec: Math.min(c.fadeInSec ?? 0, offset),
-            fadeOutSec: 0,
-            keyframes: kf?.left
-          }
-          const rid = uid('c')
-          clips[rid] = {
-            ...c,
-            id: rid,
-            startSec: t,
-            durationSec: rightDur,
-            inSec: c.inSec + offset * (c.speed ?? 1), // right part reads later (scaled by speed)
-            fadeInSec: 0,
-            fadeOutSec: Math.min(c.fadeOutSec ?? 0, rightDur),
-            keyframes: kf?.right
-          }
-          changed = true
-        }
+        // Only clips the playhead actually crosses split (not at the very edges).
+        // splitClipAt rebases keyframes and karaoke words across the cut, splits
+        // the fades (left keeps the fade-in, right the fade-out) and advances
+        // the right part's in-point (scaled by speed).
+        const parts = splitClipAt(c, t)
+        if (!parts) continue
+        clips[c.id] = parts.left
+        const rid = uid('c')
+        clips[rid] = { ...parts.right, id: rid }
+        changed = true
       }
       return changed ? { ...recordHistory(s), project: { ...s.project, clips } } : {}
     }),
@@ -1142,6 +1134,7 @@ export const useEditor = create<EditorState>((set) => {
       const clips = { ...s.project.clips }
       for (const cue of cues) {
         const id = uid('c')
+        const text = defaultSubtitleText(cue.text)
         clips[id] = {
           id,
           trackId,
@@ -1150,7 +1143,8 @@ export const useEditor = create<EditorState>((set) => {
           durationSec: Math.max(0.1, cue.endSec - cue.startSec),
           inSec: 0,
           role: 'subtitle',
-          text: defaultSubtitleText(cue.text),
+          // The cue's word times are relative to its own start = the clip's start.
+          text: cue.words && cue.words.length > 0 ? { ...text, words: cue.words } : text,
           effects: defaultEffects()
         }
       }

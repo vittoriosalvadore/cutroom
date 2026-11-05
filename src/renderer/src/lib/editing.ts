@@ -1,5 +1,6 @@
-import type { AnimProp, Keyframe } from '../types'
+import type { AnimProp, Keyframe, TextProps } from '../types'
 import { splitTracksAt } from './keyframes'
+import { shiftWords } from './karaoke'
 
 // ---------------------------------------------------------------------------
 // Pure timeline-editing math: snapping and clip trimming. No DOM/state deps, so
@@ -147,6 +148,7 @@ export interface SplittableClip {
   fadeInSec?: number
   fadeOutSec?: number
   keyframes?: Partial<Record<AnimProp, Keyframe[]>>
+  text?: TextProps
 }
 
 export interface SplitResult<T> {
@@ -156,11 +158,12 @@ export interface SplitResult<T> {
 
 /**
  * Split one clip at absolute timeline time `atSec`. Returns undefined if atSec
- * doesn't actually fall strictly inside the clip. Mirrors the inline split
- * logic `splitAtPlayhead` (store.ts) already applies at the playhead, factored
- * out so auto-cut-silence can call it many times per job. The two returned
- * pieces carry no id/trackId — the caller assigns those (existing id for
- * `left`, a fresh id for `right`), matching how splitAtPlayhead does it today.
+ * doesn't actually fall strictly inside the clip. The one split used by both
+ * `splitAtPlayhead` (store.ts) and auto-cut-silence, which calls it many times
+ * per job. The two returned pieces keep the original's id/trackId — the
+ * caller re-ids `right` (existing id for `left`, a fresh id for `right`).
+ * A karaoke clip's word timings rebase onto the right piece's start like its
+ * keyframes do, so both halves keep highlighting in sync with the audio.
  */
 export function splitClipAt<T extends SplittableClip>(clip: T, atSec: number): SplitResult<T> | undefined {
   if (atSec <= clip.startSec + 1e-4 || atSec >= clip.startSec + clip.durationSec - 1e-4) return undefined
@@ -182,7 +185,8 @@ export function splitClipAt<T extends SplittableClip>(clip: T, atSec: number): S
       inSec: clip.inSec + offset * (clip.speed ?? 1),
       fadeInSec: 0,
       fadeOutSec: Math.min(clip.fadeOutSec ?? 0, rightDur),
-      keyframes: kf?.right
+      keyframes: kf?.right,
+      ...(clip.text?.words ? { text: { ...clip.text, words: shiftWords(clip.text.words, -offset) } } : {})
     }
   }
 }

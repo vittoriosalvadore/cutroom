@@ -79,10 +79,12 @@ export interface Settings {
   /** Normalize the exported mix to this loudness (LUFS), or 'off' = as mixed. */
   exportLoudness: ExportLoudness
   // --- AI subtitles ---
-  /** Whisper model size (tiny = fast .. small = accurate). */
+  /** Whisper model size (tiny = fast .. small = accurate .. medium = best, slow). */
   transcribeModel: TranscribeModel
   /** Spoken language of the audio, or 'auto' to detect it. */
   transcribeLanguage: TranscribeLanguage
+  /** Transcribe with per-word timing for a karaoke highlight. */
+  transcribeKaraoke: boolean
   // --- appearance ---
   theme: ThemePreset
   /** Accent colour (hex). Drives all primary + selection state. */
@@ -117,6 +119,7 @@ export const DEFAULT_SETTINGS: Settings = {
   // Accuracy first (users judge subtitles by it); Balanced/Fast are one pick away.
   transcribeModel: 'small',
   transcribeLanguage: defaultTranscribeLanguage(typeof navigator === 'undefined' ? undefined : navigator.language),
+  transcribeKaraoke: false,
   theme: 'graphite',
   accent: '#4c8dff',
   density: 'comfortable',
@@ -154,6 +157,7 @@ export function sanitize(raw: unknown): Partial<Settings> {
   bool('reduceMotion')
   bool('useProxies')
   bool('autoProxy')
+  bool('transcribeKaraoke')
   const fade = clampNum(o.defaultFadeSec, 0.1, 2)
   if (fade !== undefined) out.defaultFadeSec = fade
   const crf = clampNum(o.exportCrf, 14, 28)
@@ -212,6 +216,7 @@ function pick(s: Settings): Settings {
     exportLoudness: s.exportLoudness,
     transcribeModel: s.transcribeModel,
     transcribeLanguage: s.transcribeLanguage,
+    transcribeKaraoke: s.transcribeKaraoke,
     theme: s.theme,
     accent: s.accent,
     density: s.density,

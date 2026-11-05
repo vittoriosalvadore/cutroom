@@ -261,6 +261,29 @@ export interface Project {
 
 export type TextAlign = 'left' | 'center' | 'right'
 
+/** How a karaoke subtitle marks the word being sung: 'pop' enlarges it,
+ *  'underline' underlines it, 'fill-wipe' puts a highlight box behind it. */
+export type KaraokeStyle = 'pop' | 'underline' | 'fill-wipe'
+
+export const KARAOKE_STYLES: readonly KaraokeStyle[] = ['pop', 'underline', 'fill-wipe']
+
+/** Highlight colour used when a karaoke clip doesn't set its own. */
+export const DEFAULT_KARAOKE_COLOR = '#ffd23f'
+
+/**
+ * A transcribed word's timing, CLIP-relative: seconds from the owning clip's
+ * startSec (the same convention as keyframes). Moving a clip carries its words
+ * along; edits that move the clip's head instead (split, head trim) rebase them
+ * like keyframes, so a word keeps its place against the audio. A word that
+ * started before such a cut is kept with a negative time: entries map 1:1, in
+ * order, to the whitespace-separated words of `content`.
+ */
+export interface WordTiming {
+  text: string
+  startSec: number
+  endSec: number
+}
+
 /** A title or subtitle's content and look. */
 export interface TextProps {
   content: string
@@ -282,6 +305,13 @@ export interface TextProps {
   boxColor: string
   /** Box alpha 0..1. 0 = no box. */
   boxOpacity: number
+  /** Per-word timing for a karaoke highlight. Absent for plain / imported
+   *  subtitles, which render exactly as before. */
+  words?: WordTiming[]
+  /** Active-word highlight colour (hex). Default DEFAULT_KARAOKE_COLOR. */
+  karaokeColor?: string
+  /** Active-word highlight style. Default 'pop'. */
+  karaokeStyle?: KaraokeStyle
 }
 
 /** Green/blue-screen key. Removes pixels near `color`. */

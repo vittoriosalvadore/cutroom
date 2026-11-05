@@ -1668,3 +1668,22 @@ kbd {
 .modal-body .modal-note + .export-options {
   margin-top: var(--sp-5);
 }
+/* AI Subtitles: karaoke (word timing) toggle, full width under the pickers */
+.transcribe-karaoke {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-4);
+  font-size: var(--fs-12);
+  color: var(--text);
+  cursor: pointer;
+}
+.transcribe-karaoke input {
+  margin: 1px 0 0;
+}
+.transcribe-karaoke small {
+  display: block;
+  margin-top: var(--sp-1);
+  font-size: var(--fs-11);
+  color: var(--muted);
+}
