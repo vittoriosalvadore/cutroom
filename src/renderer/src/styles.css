@@ -555,6 +555,10 @@ input[type='color']:hover {
 .thumb.image {
   background: #5a4a86;
 }
+/* real poster frame (see MediaThumb): keep the tile's colour as a backdrop */
+.thumb.has-poster {
+  background-repeat: no-repeat;
+}
 .meta {
   min-width: 0;
 }

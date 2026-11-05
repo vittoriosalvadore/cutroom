@@ -211,6 +211,12 @@ export default function SettingsModal() {
                   onChange={(v) => s.set({ showWaveforms: v })}
                 />
                 <Toggle
+                  label={t('Show thumbnails')}
+                  desc={t('Draw frame thumbnails on video and image clips.')}
+                  checked={s.showThumbnails}
+                  onChange={(v) => s.set({ showThumbnails: v })}
+                />
+                <Toggle
                   label={t('Audio scrubbing')}
                   desc={t('Play short audio snippets while dragging the playhead or shuttling with J/L.')}
                   checked={s.audioScrub}

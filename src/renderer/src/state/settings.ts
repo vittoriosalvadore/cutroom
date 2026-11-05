@@ -57,6 +57,8 @@ export interface Settings {
   defaultFadeSec: number
   /** Draw audio waveforms on timeline clips. */
   showWaveforms: boolean
+  /** Draw frame thumbnails (filmstrips) on video and image clips. */
+  showThumbnails: boolean
   /** Play short audio snippets while scrubbing the playhead or shuttling off 1×. */
   audioScrub: boolean
   // --- export ---
@@ -97,6 +99,7 @@ export const DEFAULT_SETTINGS: Settings = {
   snapping: true,
   defaultFadeSec: 0.5,
   showWaveforms: true,
+  showThumbnails: true,
   audioScrub: true,
   exportPreset: 'medium',
   exportCrf: 20,
@@ -139,6 +142,7 @@ export function sanitize(raw: unknown): Partial<Settings> {
   bool('showPlaceholders')
   bool('snapping')
   bool('showWaveforms')
+  bool('showThumbnails')
   bool('audioScrub')
   bool('showScopes')
   bool('reduceMotion')
@@ -188,6 +192,7 @@ function pick(s: Settings): Settings {
     snapping: s.snapping,
     defaultFadeSec: s.defaultFadeSec,
     showWaveforms: s.showWaveforms,
+    showThumbnails: s.showThumbnails,
     audioScrub: s.audioScrub,
     exportPreset: s.exportPreset,
     exportCrf: s.exportCrf,

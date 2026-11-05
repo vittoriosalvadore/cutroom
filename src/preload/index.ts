@@ -219,6 +219,9 @@ const api = {
   denoiseStart: (sourcePath: string): Promise<DenoiseResult> => ipcRenderer.invoke('denoise:start', sourcePath),
   /** Light mono copy of a video's audio, used only for audio-scrub grains. */
   scrubAudioStart: (sourcePath: string): Promise<DenoiseResult> => ipcRenderer.invoke('scrubAudio:start', sourcePath),
+  /** A filmstrip of evenly spaced frames for timeline/Media Bin thumbnails (cached on disk). */
+  thumbStrip: (sourcePath: string, durationSec: number): Promise<{ ok: boolean; path?: string; count?: number; error?: string }> =>
+    ipcRenderer.invoke('thumbs:strip', sourcePath, durationSec),
 
   // --- proxies (optimized preview media) ---
   /** Finished proxies for these sources (null = none). Never creates one. */

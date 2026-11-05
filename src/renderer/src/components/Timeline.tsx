@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import { useEditor } from '../state/store'
 import { useSettings } from '../state/settings'
 import { audioCacheVersion, getAudioEntry, PEAKS_PER_SEC, subscribeAudioCache } from '../lib/audioCache'
+import { ensureThumbs, getThumbStrip, subscribeThumbs, thumbsVersion, tileIndexAt } from '../lib/thumbCache'
 import { computeTrim, snapMove, snapTime } from '../lib/editing'
 import { roundRectPath } from '../lib/canvas'
 import { clipSpeed } from '../lib/clipTime'
@@ -279,6 +280,7 @@ export default function Timeline() {
   const addAudioTrack = useEditor((s) => s.addAudioTrack)
   const addVideoTrack = useEditor((s) => s.addVideoTrack)
   const showWaveforms = useSettings((s) => s.showWaveforms)
+  const showThumbnails = useSettings((s) => s.showThumbnails)
   const snapping = useSettings((s) => s.snapping)
   const themeSig = useSettings((s) => `${s.theme}|${s.accent}`)
   const isPlaying = useEditor((s) => s.isPlaying)
@@ -286,6 +288,15 @@ export default function Timeline() {
   // Redraw when audio decode finishes so waveforms appear.
   const [audioVersion, setAudioVersion] = useState(0)
   useEffect(() => subscribeAudioCache(() => setAudioVersion(audioCacheVersion())), [])
+
+  // Filmstrip thumbnails: request them for every video/image source in the
+  // project (cached per source, so this is cheap) and redraw as they arrive.
+  const [thumbVersion, setThumbVersion] = useState(0)
+  useEffect(() => subscribeThumbs(() => setThumbVersion(thumbsVersion())), [])
+  useEffect(() => {
+    if (!showThumbnails) return
+    for (const m of Object.values(project.media)) ensureThumbs(m)
+  }, [project.media, showThumbnails])
 
   // --- two-layer rendering ---
   // The static layer (lanes, ruler, clips, waveforms, labels) only changes when
@@ -301,6 +312,8 @@ export default function Timeline() {
     marker: string | null
     audioVer: number
     wf: boolean
+    thumbVer: number
+    thumbs: boolean
     theme: string
     bw: number
     bh: number
@@ -487,6 +500,39 @@ export default function Timeline() {
         }
         sctx.fillStyle = grad
         sctx.fill()
+
+        // Filmstrip: frames of the source along the clip (video), or the
+        // picture itself (image). Tiles follow the clip's source mapping, so a
+        // trimmed / sped-up clip shows the frames it actually plays.
+        const strip =
+          showThumbnails && lane.kind === 'video' && !isTitle && !isSubtitle && media && media.kind !== 'audio'
+            ? getThumbStrip(media.id)
+            : null
+        if (strip && ch >= 18) {
+          sctx.save()
+          roundRectPath(sctx, x, cy, cw, ch, 6)
+          sctx.clip()
+          const tw = Math.max(8, (ch * strip.tileW) / strip.tileH)
+          const speed = clipSpeed(clip)
+          const visStart = Math.max(0, GUTTER - x)
+          const visEnd = Math.min(cw, w - x)
+          sctx.globalAlpha = 0.9
+          for (let dx = Math.floor(visStart / tw) * tw; dx < visEnd; dx += tw) {
+            const srcT = clip.inSec + ((dx + tw / 2) / pxPerSec) * speed
+            const idx = media && media.kind === 'video' ? tileIndexAt(srcT, media.durationSec, strip.count) : 0
+            sctx.drawImage(strip.img, idx * strip.tileW, 0, strip.tileW, strip.tileH, x + dx, cy, tw, ch)
+          }
+          sctx.globalAlpha = 1
+          // Darken the top band so the clip name stays readable over the frames.
+          const shade = sctx.createLinearGradient(0, cy, 0, cy + Math.min(22, ch))
+          shade.addColorStop(0, 'rgba(0,0,0,0.6)')
+          shade.addColorStop(1, 'rgba(0,0,0,0)')
+          sctx.fillStyle = shade
+          sctx.fillRect(x, cy, cw, Math.min(22, ch))
+          sctx.restore()
+          roundRectPath(sctx, x, cy, cw, ch, 6) // restore the clip outline for the stroke below
+        }
+
         sctx.lineWidth = selected ? 2 : 1
         sctx.strokeStyle = selected ? TL_COLORS.clipStrokeSel : TL_COLORS.clipStrokeIdle
         sctx.stroke()
@@ -678,6 +724,8 @@ export default function Timeline() {
         sig.marker !== selectedMarkerId ||
         sig.audioVer !== audioVersion ||
         sig.wf !== showWaveforms ||
+        sig.thumbVer !== thumbVersion ||
+        sig.thumbs !== showThumbnails ||
         sig.theme !== themeSig ||
         sig.bw !== bw ||
         sig.bh !== bh ||
@@ -698,6 +746,8 @@ export default function Timeline() {
           marker: selectedMarkerId,
           audioVer: audioVersion,
           wf: showWaveforms,
+          thumbVer: thumbVersion,
+          thumbs: showThumbnails,
           theme: themeSig,
           bw,
           bh,
@@ -768,7 +818,7 @@ export default function Timeline() {
     })
     ro.observe(container)
     return () => ro.disconnect()
-  }, [project, playhead, pxPerSec, selKey, selectedMarkerId, audioVersion, showWaveforms, themeSig, view, overlay])
+  }, [project, playhead, pxPerSec, selKey, selectedMarkerId, audioVersion, showWaveforms, thumbVersion, showThumbnails, themeSig, view, overlay])
 
   // --- pointer interactions (seek + drag-to-move clips) ---
   const localPoint = (e: React.PointerEvent | React.MouseEvent): { x: number; y: number } => {

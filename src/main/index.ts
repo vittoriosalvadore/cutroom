@@ -7,6 +7,7 @@ import { registerExportIpc } from './export'
 import { registerAudioMuxIpc } from './audioMux'
 import { registerDenoiseIpc } from './denoise'
 import { registerScrubAudioIpc } from './scrubAudio'
+import { registerThumbIpc, sweepStaleThumbPartials } from './thumbs'
 import { registerProxyIpc, sweepStaleProxyPartials } from './proxy'
 import { clearSessionLock, flagRecoveryPending, initProjectStore, registerProjectIpc } from './projectStore'
 import { readSettingsSync, registerSettingsIpc } from './settings'
@@ -241,6 +242,7 @@ function registerIpc(): void {
   registerAudioMuxIpc()
   registerDenoiseIpc()
   registerScrubAudioIpc()
+  registerThumbIpc()
   // Preview proxies (optimized media) in userData/proxies.
   registerProxyIpc()
 
@@ -287,6 +289,7 @@ app.whenReady().then(() => {
   initProjectStore() // detect a prior crash + mark this session active
   sweepStaleTemps() // temp media left behind by a crashed/killed session
   sweepStaleProxyPartials() // half-written proxies from a crashed/killed session
+  sweepStaleThumbPartials() // half-written thumbnail strips, likewise
   registerIpc()
   createWindow()
 

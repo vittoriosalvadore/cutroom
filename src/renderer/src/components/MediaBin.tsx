@@ -10,6 +10,7 @@ import {
   subscribeProxyCache
 } from '../lib/proxyCache'
 import type { MediaItem } from '../types'
+import { ensureThumbs, getThumbStrip, subscribeThumbs, thumbsVersion } from '../lib/thumbCache'
 
 const ICON: Record<string, string> = { video: '🎬', audio: '♪', image: '🖼' }
 // English labels (i18n keys) for the media kind shown under each name.
@@ -131,7 +132,7 @@ export default function MediaBin() {
             title={t('Double-click to add at the playhead')}
             onDoubleClick={() => onAdd(m.id, m.kind)}
           >
-            <div className={`thumb ${m.kind}`}>{ICON[m.kind] ?? '🎬'}</div>
+            <MediaThumb media={m} />
             <div className="meta">
               <div className="name">{m.name}</div>
               <div className="sub">
@@ -146,4 +147,27 @@ export default function MediaBin() {
       </div>
     </aside>
   )
+}
+
+/** Poster for a bin item: a frame from the middle of a video (from its
+ *  filmstrip) or the image itself; the kind icon until it's ready. */
+function MediaThumb({ media }: { media: MediaItem }) {
+  const show = useSettings((s) => s.showThumbnails)
+  const [, setVersion] = useState(thumbsVersion())
+  useEffect(() => subscribeThumbs(() => setVersion(thumbsVersion())), [])
+  useEffect(() => {
+    if (show) ensureThumbs(media)
+  }, [media, show])
+  const strip = show ? getThumbStrip(media.id) : null
+  if (!strip) return <div className={`thumb ${media.kind}`}>{ICON[media.kind] ?? '🎬'}</div>
+  const mid = Math.floor(strip.count / 2)
+  const style: React.CSSProperties =
+    strip.count > 1
+      ? {
+          backgroundImage: `url("${strip.url}")`,
+          backgroundSize: `${strip.count * 100}% 100%`,
+          backgroundPosition: `${(mid / (strip.count - 1)) * 100}% 0`
+        }
+      : { backgroundImage: `url("${strip.url}")`, backgroundSize: 'cover', backgroundPosition: 'center' }
+  return <div className={`thumb ${media.kind} has-poster`} style={style} />
 }
