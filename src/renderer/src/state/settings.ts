@@ -33,6 +33,9 @@ import {
 
 export type ThemePreset = 'graphite' | 'midnight' | 'slate' | 'contrast'
 export type Density = 'comfortable' | 'compact'
+/** Integrated loudness targets for export: YouTube/Spotify, Apple, EBU R128 broadcast. */
+export const EXPORT_LOUDNESS = ['off', '-14', '-16', '-23'] as const
+export type ExportLoudness = (typeof EXPORT_LOUDNESS)[number]
 export type ExportPreset = 'ultrafast' | 'veryfast' | 'fast' | 'medium' | 'slow'
 
 export interface Settings {
@@ -73,6 +76,8 @@ export interface Settings {
   exportBitrateMbps: number
   /** Auto = first working hardware encoder, else software. */
   exportEncoder: EncoderChoice
+  /** Normalize the exported mix to this loudness (LUFS), or 'off' = as mixed. */
+  exportLoudness: ExportLoudness
   // --- AI subtitles ---
   /** Whisper model size (tiny = fast .. small = accurate). */
   transcribeModel: TranscribeModel
@@ -108,6 +113,7 @@ export const DEFAULT_SETTINGS: Settings = {
   exportQualityMode: 'crf',
   exportBitrateMbps: BITRATE_CHOICES[1],
   exportEncoder: 'auto',
+  exportLoudness: 'off',
   // Accuracy first (users judge subtitles by it); Balanced/Fast are one pick away.
   transcribeModel: 'small',
   transcribeLanguage: defaultTranscribeLanguage(typeof navigator === 'undefined' ? undefined : navigator.language),
@@ -164,6 +170,8 @@ export function sanitize(raw: unknown): Partial<Settings> {
   if (mbps !== undefined) out.exportBitrateMbps = mbps
   const encoder = oneOf(o.exportEncoder, ENCODER_CHOICES)
   if (encoder) out.exportEncoder = encoder
+  const loud = oneOf(o.exportLoudness, EXPORT_LOUDNESS)
+  if (loud) out.exportLoudness = loud
   const tModel = oneOf(o.transcribeModel, TRANSCRIBE_MODEL_IDS)
   if (tModel) out.transcribeModel = tModel
   const tLang = oneOf(o.transcribeLanguage, TRANSCRIBE_LANGUAGES)
@@ -201,6 +209,7 @@ function pick(s: Settings): Settings {
     exportQualityMode: s.exportQualityMode,
     exportBitrateMbps: s.exportBitrateMbps,
     exportEncoder: s.exportEncoder,
+    exportLoudness: s.exportLoudness,
     transcribeModel: s.transcribeModel,
     transcribeLanguage: s.transcribeLanguage,
     theme: s.theme,

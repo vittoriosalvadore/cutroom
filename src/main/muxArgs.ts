@@ -282,7 +282,17 @@ export function planReverbs(clips: MuxClip[]): { trackId: string; reverb: Reverb
 }
 
 /** The full mux filtergraph (see buildMuxArgs). */
-export function buildMuxGraph(clips: MuxClip[], sampleRate: number): string {
+/**
+ * The master bus tail every graph ends with: optional loudness gain (a static
+ * volume, see loudnessGainDb), the brick-wall limiter, and apad so the audio
+ * always spans the video (-shortest / -t then trims it).
+ */
+export function masterTail(masterGainDb = 0): string {
+  const gain = Number.isFinite(masterGainDb) && Math.abs(masterGainDb) >= 0.01 ? `volume=${masterGainDb.toFixed(2)}dB,` : ''
+  return `${gain}alimiter=limit=0.97,apad`
+}
+
+export function buildMuxGraph(clips: MuxClip[], sampleRate: number, masterGainDb = 0): string {
   const { paths, prelude, labels } = planInputs(clips)
   // Projects with NO gate/duck use the original flat per-clip graph (verified,
   // byte-stable). Only when a track enables gate/duck do we switch to per-track
@@ -290,8 +300,8 @@ export function buildMuxGraph(clips: MuxClip[], sampleRate: number): string {
   // off another track.
   const usesTrackFx = clips.some((c) => c.gate || c.duck || c.eq || c.comp || c.reverb)
   const graph = usesTrackFx
-    ? buildFxGraph(clips, labels, sampleRate, paths.length + 1)
-    : buildFlatGraph(clips, labels, sampleRate)
+    ? buildFxGraph(clips, labels, sampleRate, paths.length + 1, masterGainDb)
+    : buildFlatGraph(clips, labels, sampleRate, masterGainDb)
   return [...prelude, graph].join(';')
 }
 
@@ -329,7 +339,7 @@ export function buildMuxArgs(opts: BuildMuxArgsOptions): string[] {
  * then clips it back to the exact video length. Without apad, audio that ends
  * before the timeline would truncate the whole export.
  */
-function buildFlatGraph(clips: MuxClip[], labels: string[], sampleRate: number): string {
+function buildFlatGraph(clips: MuxClip[], labels: string[], sampleRate: number, masterGainDb = 0): string {
   const chains = clips.map((c, i) => {
     const vol = (c.volume ?? 1) * dbToLinear(c.trackGainDb ?? 0)
     let chain =
@@ -354,10 +364,10 @@ function buildFlatGraph(clips: MuxClip[], labels: string[], sampleRate: number):
 
   let graph = chains.join(';')
   if (clips.length === 1) {
-    graph += `;[a0]alimiter=limit=0.97,apad[aout]`
+    graph += `;[a0]${masterTail(masterGainDb)}[aout]`
   } else {
     const labels = clips.map((_, i) => `[a${i}]`).join('')
-    graph += `;${labels}amix=inputs=${clips.length}:normalize=0:duration=longest,alimiter=limit=0.97,apad[aout]`
+    graph += `;${labels}amix=inputs=${clips.length}:normalize=0:duration=longest,${masterTail(masterGainDb)}[aout]`
   }
   return graph
 }
@@ -375,7 +385,7 @@ function buildFlatGraph(clips: MuxClip[], labels: string[], sampleRate: number):
  * the preview chain), on its own dry/wet split; `irBase` is the FFmpeg input
  * index of the first reverb IR.
  */
-function buildFxGraph(clips: MuxClip[], labels: string[], sampleRate: number, irBase: number): string {
+function buildFxGraph(clips: MuxClip[], labels: string[], sampleRate: number, irBase: number, masterGainDb = 0): string {
   const G: string[] = []
   const irInput = new Map(planReverbs(clips).map((r, j) => [r.trackId, { input: irBase + j, reverb: r.reverb }]))
 
@@ -528,9 +538,58 @@ function buildFxGraph(clips: MuxClip[], labels: string[], sampleRate: number, ir
   // 6. sum track terminals -> limiter -> pad
   const terms = order.map((_, k) => `[t_${k}]`).join('')
   if (order.length === 1) {
-    G.push(`[t_0]alimiter=limit=0.97,apad[aout]`)
+    G.push(`[t_0]${masterTail(masterGainDb)}[aout]`)
   } else {
-    G.push(`${terms}amix=inputs=${order.length}:normalize=0:duration=longest,alimiter=limit=0.97,apad[aout]`)
+    G.push(`${terms}amix=inputs=${order.length}:normalize=0:duration=longest,${masterTail(masterGainDb)}[aout]`)
   }
   return G.join(';')
+}
+
+// --- loudness normalization (export option) ------------------------------------
+
+/** Accepted export loudness targets (integrated LUFS). */
+export const LOUDNESS_TARGETS = [-14, -16, -23] as const
+
+/** Graph suffix that measures the finished mix with loudnorm (first pass). */
+export function loudnessProbeGraph(graph: string): string {
+  return `${graph};[aout]loudnorm=I=-16:TP=-1:LRA=11:print_format=json[meas]`
+}
+
+/**
+ * Args for the measuring pass: the same inputs (video, sources, reverb IRs) in
+ * the same order as the real mux, the probe graph from a script file, audio
+ * only, written nowhere. Capped at the video length like the mux.
+ */
+export function buildLoudnessProbeArgs(opts: {
+  silentPath: string
+  clips: MuxClip[]
+  irPaths?: string[]
+  filterScriptPath: string
+  durationSec?: number
+}): string[] {
+  const args: string[] = ['-y', '-hide_banner', '-nostats', '-i', opts.silentPath]
+  for (const p of planInputs(opts.clips).paths) args.push('-i', p)
+  for (const p of opts.irPaths ?? []) args.push('-i', p)
+  args.push('-filter_complex_script', opts.filterScriptPath, '-map', '[meas]')
+  if (opts.durationSec && Number.isFinite(opts.durationSec) && opts.durationSec > 0) args.push('-t', opts.durationSec.toFixed(3))
+  args.push('-f', 'null', '-')
+  return args
+}
+
+/** Integrated loudness ("input_i") from loudnorm's JSON report, or null. */
+export function parseLoudnormInputI(stderr: string): number | null {
+  const m = /"input_i"\s*:\s*"(-?[\d.]+|-?inf)"/.exec(stderr)
+  if (!m) return null
+  const v = Number(m[1])
+  return Number.isFinite(v) ? v : null
+}
+
+/**
+ * Static gain that moves a mix measured at `measuredLufs` to `targetLufs`.
+ * Silence (no measurement) gets no gain; boosts are capped so a near-silent
+ * mix isn't amplified into noise (the limiter still guards the peaks).
+ */
+export function loudnessGainDb(measuredLufs: number | null, targetLufs: number): number {
+  if (measuredLufs === null || measuredLufs < -70) return 0
+  return Math.max(-30, Math.min(20, targetLufs - measuredLufs))
 }

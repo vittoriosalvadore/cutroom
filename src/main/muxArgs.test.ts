@@ -1,9 +1,14 @@
 import { describe, it, expect } from 'vitest'
 import {
+  buildLoudnessProbeArgs,
   buildMuxArgs,
   buildMuxGraph,
+  loudnessGainDb,
+  loudnessProbeGraph,
+  masterTail,
   panFilter,
   panGains,
+  parseLoudnormInputI,
   planReverbs,
   speedFilter,
   stereoPanFilter,
@@ -427,5 +432,30 @@ describe('buildMuxArgs reverb', () => {
     expect(planReverbs([clip({ reverb: { ...reverb, mix: 0 } })])).toEqual([])
     const off = buildMuxGraph([clip({ reverb: { ...reverb, mix: 0 } })], 48000)
     expect(off).not.toContain('afir')
+  })
+})
+
+describe('loudness normalization', () => {
+  it('inserts a static gain before the limiter only when asked', () => {
+    expect(masterTail()).toBe('alimiter=limit=0.97,apad')
+    expect(masterTail(3.456)).toBe('volume=3.46dB,alimiter=limit=0.97,apad')
+    expect(buildMuxGraph([clip({})], 48000, -2)).toContain('volume=-2.00dB,alimiter=limit=0.97,apad[aout]')
+  })
+
+  it('measures the finished mix with the same inputs as the mux', () => {
+    const args = buildLoudnessProbeArgs({ silentPath: '/t/s.mp4', clips: [clip({}), clip({ path: '/b.wav' })], filterScriptPath: '/t/g.txt', durationSec: 8 })
+    expect(args.filter((a) => a === '-i')).toHaveLength(3)
+    expect(args[args.indexOf('-map') + 1]).toBe('[meas]')
+    expect(args.slice(-3)).toEqual(['-f', 'null', '-'])
+    expect(loudnessProbeGraph('G')).toBe('G;[aout]loudnorm=I=-16:TP=-1:LRA=11:print_format=json[meas]')
+  })
+
+  it('parses loudnorm JSON and computes a capped gain', () => {
+    const report = '[Parsed_loudnorm_0 @ 0x1]\n{\n\t"input_i" : "-23.45",\n\t"input_tp" : "-5.10"\n}'
+    expect(parseLoudnormInputI(report)).toBeCloseTo(-23.45)
+    expect(parseLoudnormInputI('{"input_i" : "-inf"}')).toBeNull()
+    expect(loudnessGainDb(-23.45, -14)).toBeCloseTo(9.45)
+    expect(loudnessGainDb(-60, -14)).toBe(20)
+    expect(loudnessGainDb(null, -14)).toBe(0)
   })
 })

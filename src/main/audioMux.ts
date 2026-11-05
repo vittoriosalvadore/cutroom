@@ -5,7 +5,17 @@ import { extname, join } from 'path'
 import { tmpdir } from 'os'
 import { ffmpegPath, releaseTemp, trackProcess, trackTemp } from './ffmpeg'
 import { isLocalFilePath, isOwnTempFile } from './paths'
-import { buildMuxArgs, buildMuxGraph, planReverbs, type MuxClip } from './muxArgs'
+import {
+  buildLoudnessProbeArgs,
+  buildMuxArgs,
+  buildMuxGraph,
+  LOUDNESS_TARGETS,
+  loudnessGainDb,
+  loudnessProbeGraph,
+  parseLoudnormInputI,
+  planReverbs,
+  type MuxClip
+} from './muxArgs'
 import { encodeWavFloat32, generateReverbIR } from '../shared/reverb'
 
 // ---------------------------------------------------------------------------
@@ -24,6 +34,8 @@ interface MuxOptions {
   clips: MuxClip[]
   /** Length of the exported video in seconds. */
   durationSec?: number
+  /** Normalize the mix to this integrated loudness (LUFS); absent = as mixed. */
+  loudnessLufs?: number
 }
 
 const PROBE_TIMEOUT_MS = 15000
@@ -62,7 +74,7 @@ function hasAudioStream(path: string): Promise<boolean> {
   })
 }
 
-function runFfmpeg(args: string[]): Promise<{ ok: boolean; error?: string }> {
+function runFfmpeg(args: string[]): Promise<{ ok: boolean; error?: string; stderr?: string }> {
   return new Promise((resolve) => {
     const proc = trackProcess(spawn(ffmpegPath as string, args, { stdio: ['ignore', 'ignore', 'pipe'] }))
     let stderr = ''
@@ -72,7 +84,11 @@ function runFfmpeg(args: string[]): Promise<{ ok: boolean; error?: string }> {
     })
     proc.on('error', (err) => resolve({ ok: false, error: err.message }))
     proc.on('close', (code) =>
-      resolve(code === 0 ? { ok: true } : { ok: false, error: `FFmpeg audio mux exited ${code}.\n${stderr.slice(-700)}` })
+      resolve(
+        code === 0
+          ? { ok: true, stderr } // the tail carries loudnorm's JSON report on a measuring pass
+          : { ok: false, error: `FFmpeg audio mux exited ${code}.\n${stderr.slice(-700)}` }
+      )
     )
   })
 }
@@ -113,7 +129,6 @@ async function runMux(opts: MuxOptions): Promise<{ ok: boolean; error?: string }
       // The graph goes in a script file: a long timeline's graph blows past the
       // Windows 32K command-line limit when passed inline.
       trackTemp(scriptPath)
-      await writeFile(scriptPath, buildMuxGraph(audible, opts.sampleRate), 'utf-8')
       // One IR per reverb track, in planReverbs order (the graph's input order).
       for (const { reverb } of planReverbs(audible)) {
         const irPath = tempPath('reverb.wav')
@@ -121,7 +136,26 @@ async function runMux(opts: MuxOptions): Promise<{ ok: boolean; error?: string }
         irPaths.push(irPath)
         await writeFile(irPath, encodeWavFloat32(generateReverbIR(reverb, opts.sampleRate), opts.sampleRate))
       }
-      result = await runFfmpeg(
+      // Loudness normalization: measure the finished mix once, then apply one
+      // static gain before the limiter (dynamics untouched, deterministic).
+      let masterGainDb = 0
+      const target = LOUDNESS_TARGETS.find((t) => t === opts.loudnessLufs)
+      if (target !== undefined) {
+        await writeFile(scriptPath, loudnessProbeGraph(buildMuxGraph(audible, opts.sampleRate)), 'utf-8')
+        const probe = await runFfmpeg(
+          buildLoudnessProbeArgs({
+            silentPath: opts.silentPath,
+            clips: audible,
+            irPaths,
+            filterScriptPath: scriptPath,
+            durationSec: opts.durationSec
+          })
+        )
+        if (!probe.ok) return { ok: false, error: probe.error }
+        masterGainDb = loudnessGainDb(parseLoudnormInputI(probe.stderr ?? ''), target)
+      }
+      await writeFile(scriptPath, buildMuxGraph(audible, opts.sampleRate, masterGainDb), 'utf-8')
+      const mux = await runFfmpeg(
         buildMuxArgs({
           silentPath: opts.silentPath,
           outputPath: partPath,
@@ -134,6 +168,7 @@ async function runMux(opts: MuxOptions): Promise<{ ok: boolean; error?: string }
           container: extname(opts.silentPath).toLowerCase() === '.webm' ? 'webm' : 'mp4'
         })
       )
+      result = { ok: mux.ok, error: mux.error }
     }
     if (result.ok) await rename(partPath, opts.outputPath)
     return result

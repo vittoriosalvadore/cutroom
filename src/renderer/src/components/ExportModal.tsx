@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useEditor } from '../state/store'
-import { useSettings } from '../state/settings'
+import { useSettings, type ExportLoudness } from '../state/settings'
 import { useT } from '../lib/i18n'
 import { exportTimeline, timelineDuration, type ExportProgress } from '../lib/exporter'
 import {
@@ -256,6 +256,20 @@ export default function ExportModal() {
                     {HW_FAMILY_LABEL[f]}
                   </option>
                 ))}
+              </select>
+            </label>
+            <label className="export-opt export-opt-wide" title={t('Measures the finished mix and applies one gain so it lands at the chosen loudness. The preview is not changed.')}>
+              <span>{t('Loudness')}</span>
+              <select
+                className="insp-select"
+                disabled={locked}
+                value={settings.exportLoudness}
+                onChange={(e) => settings.set({ exportLoudness: e.target.value as ExportLoudness })}
+              >
+                <option value="off">{t('As mixed (no normalization)')}</option>
+                <option value="-14">{t('−14 LUFS (YouTube, Spotify)')}</option>
+                <option value="-16">{t('−16 LUFS (Apple Music, podcasts)')}</option>
+                <option value="-23">{t('−23 LUFS (TV broadcast, EBU R128)')}</option>
               </select>
             </label>
           </div>

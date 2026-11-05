@@ -146,6 +146,8 @@ export interface MuxAudioOptions {
   clips: AudioClipPlanEntry[]
   /** Length of the exported video in seconds (caps the padded soundtrack). */
   durationSec?: number
+  /** Normalize the mix to this integrated loudness (LUFS): -14, -16 or -23. */
+  loudnessLufs?: number
 }
 
 /** Result of saving a project. */
