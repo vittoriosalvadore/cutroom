@@ -4,7 +4,7 @@ import { useSettings } from './state/settings'
 import { probeAudio, probeImage, probeVideo } from './lib/probe'
 import { ensureAudioDecoded } from './lib/audioCache'
 import { ensureScrubAudio } from './lib/scrubAudioCache'
-import { serializeProject } from './lib/projectFile'
+import { projectFileLabel, serializeProject } from './lib/projectFile'
 import { timelineDuration } from './lib/exporter'
 import { createNewProject, openProject, saveProject } from './lib/projectIO'
 import { useT } from './lib/i18n'
@@ -209,10 +209,13 @@ function useLastResortCrashNet(): void {
 /** Reflect the project name and unsaved state in the window title. */
 function useDocumentTitle(): void {
   const name = useEditor((s) => s.project.name)
+  const filePath = useEditor((s) => s.projectFilePath)
   const dirty = useEditor((s) => s.project !== s.savedProject)
   useEffect(() => {
-    document.title = `${dirty ? '• ' : ''}${name} — Cutroom`
-  }, [name, dirty])
+    // A saved project is known by its file name (like every editor's title bar).
+    const shown = filePath ? projectFileLabel(filePath) : name
+    document.title = `${dirty ? '• ' : ''}${shown} — Cutroom`
+  }, [name, filePath, dirty])
 }
 
 /**

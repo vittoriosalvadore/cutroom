@@ -243,3 +243,9 @@ export function deserializeProject(json: string): DeserializeResult {
   const raw = wrapped ? (data as Record<string, unknown>).project : data
   return validateProject(raw)
 }
+
+/** Window-title label for a project file: "C:\\cuts\\My Edit.cutroom.json" -> "My Edit". */
+export function projectFileLabel(filePath: string): string {
+  const base = filePath.split(/[\\/]/).pop() ?? filePath
+  return base.replace(/\.cutroom\.json$/i, '').replace(/\.json$/i, '') || base
+}

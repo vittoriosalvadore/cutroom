@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { serializeProject, deserializeProject, FILE_VERSION } from './projectFile'
+import { serializeProject, deserializeProject, FILE_VERSION, projectFileLabel } from './projectFile'
 import type { Project } from '../types'
 
 function sample(): Project {
@@ -202,5 +202,13 @@ describe('project (de)serialize', () => {
     expect(c?.r).toEqual([{ x: 0, y: 0 }, { x: 1, y: 1 }])
     expect(r.project.clips.c2.effects).toBeDefined()
     expect(r.project.clips.c2.effects && 'curves' in r.project.clips.c2.effects).toBe(false)
+  })
+})
+
+describe('projectFileLabel', () => {
+  it('shows the file name without the project extension, on any OS', () => {
+    expect(projectFileLabel('C:\\cuts\\My Edit.cutroom.json')).toBe('My Edit')
+    expect(projectFileLabel('/home/v/clip.json')).toBe('clip')
+    expect(projectFileLabel('/home/v/.cutroom.json')).toBe('.cutroom.json')
   })
 })

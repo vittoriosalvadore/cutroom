@@ -504,6 +504,10 @@ export class Compositor {
     this.images.set(media.id, entry)
 
     const img = new Image()
+    // cutroom:// is a different origin from the renderer: request in CORS mode
+    // (the protocol answers Access-Control-Allow-Origin: *) so the decoded
+    // image can be uploaded to WebGL without tainting the context.
+    img.crossOrigin = 'anonymous'
     img.onload = () => {
       entry.tex = this.uploadTexture(img)
       entry.w = img.naturalWidth
