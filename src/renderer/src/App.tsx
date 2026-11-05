@@ -23,6 +23,7 @@ import SettingsModal from './components/SettingsModal'
 import AutoReframeModal from './components/AutoReframeModal'
 import AutoCutSilenceModal from './components/AutoCutSilenceModal'
 import ShortcutsModal, { useShortcutsPanel } from './components/ShortcutsModal'
+import SceneDetectModal from './components/SceneDetectModal'
 
 /**
  * Drives the playhead while playing. Uses requestAnimationFrame and reads the
@@ -267,7 +268,16 @@ function isTextEditingTarget(el: EventTarget | null): boolean {
 /** True while any modal dialog is up (store-driven or self-managed). */
 function isModalOpen(): boolean {
   const st = useEditor.getState()
-  if (st.exportOpen || st.transcribeOpen || st.settingsOpen || st.reframeOpen || st.autoCutSilenceOpen) return true
+  if (
+    st.exportOpen ||
+    st.transcribeOpen ||
+    st.settingsOpen ||
+    st.reframeOpen ||
+    st.autoCutSilenceOpen ||
+    st.sceneDetectOpen
+  ) {
+    return true
+  }
   // Self-managed modals (e.g. RecoveryModal) keep their open state locally;
   // every modal renders a .modal-backdrop, so the DOM is the catch-all.
   return document.querySelector('.modal-backdrop') !== null
@@ -492,6 +502,7 @@ export default function App() {
       <AutoReframeModal />
       <AutoCutSilenceModal />
       <ShortcutsModal />
+      <SceneDetectModal />
     </div>
   )
 }

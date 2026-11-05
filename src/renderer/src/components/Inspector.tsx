@@ -995,6 +995,16 @@ export default function Inspector() {
                   🎯 {t('AI Reframe')}
                 </button>
               )}
+              {media?.kind === 'video' && (
+                <button
+                  className="btn small"
+                  title={t('Find hard cuts and split the clip at each one')}
+                  data-no-snapshot // only opens the modal; Apply records its own step
+                  onClick={() => useEditor.getState().setSceneDetectOpen(true)}
+                >
+                  🎬 {t('Detect Scenes')}
+                </button>
+              )}
             </div>
             <details className="insp-crop">
               <summary>{t('Crop')}</summary>

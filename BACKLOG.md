@@ -125,3 +125,7 @@ All previously listed candidates have shipped (see Done). Add new ideas here.
   main makes a 720p short-GOP H.264 copy in `userData/proxies/<hash(path,size,mtime)>.mp4` (queued one at a
   time, progress %, rotation baked, duration-checked); the preview decodes it when "Use proxies" is on,
   export always reads the original. Never saved in projects; Options shows/clears the cache.
+- **Scene detection** — Inspector → Transform → 🎬 Detect Scenes: 16-bin RGB histograms sampled every
+  ~0.5 s of footage flag jumps over a threshold; each is bisected to the first timeline frame of the new
+  shot (speed-aware, read where the export samples) and dropped if adjacent frames barely differ (pans,
+  fades). Review list with Keep boxes, then Split / Split + markers / Markers only as one undo step.

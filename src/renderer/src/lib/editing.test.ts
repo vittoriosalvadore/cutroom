@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import {
+  alignSplitTimes,
   computeCrossfade,
   computeTrim,
   rippleShift,
@@ -129,6 +130,29 @@ describe('splitClipAt', () => {
     expect(r.left.fadeOutSec).toBe(0)
     expect(r.right.fadeInSec).toBe(0)
     expect(r.right.fadeOutSec).toBeCloseTo(3) // min(3, rightDur=3)
+  })
+})
+
+describe('alignSplitTimes', () => {
+  const clip = { startSec: 2, durationSec: 4 } // spans [2, 6)
+
+  it('snaps each time to the nearest frame boundary and sorts', () => {
+    expect(alignSplitTimes(clip, [4.51, 3.01], 25)).toEqual([3, 4.52]) // 75.25 -> 75, 112.75 -> 113 frames
+    expect(alignSplitTimes(clip, [3.02], 30)).toEqual([91 / 30]) // 90.6 frames: nearest, not truncated
+  })
+  it('drops times that would leave a sliver at either clip edge', () => {
+    expect(alignSplitTimes(clip, [2.05, 5.95], 30)).toEqual([])
+    expect(alignSplitTimes(clip, [2 + MIN_CLIP_SEC, 6 - MIN_CLIP_SEC], 30)).toEqual([2.1, 5.9])
+  })
+  it('drops a time too close to the previous kept one', () => {
+    expect(alignSplitTimes(clip, [3, 3.04, 3.2], 30)).toEqual([3, 3.2])
+  })
+  it('never leaves a piece under two frames at a low frame rate', () => {
+    // At 10 fps MIN_CLIP_SEC is a single frame; two frames (0.2s) is the floor.
+    expect(alignSplitTimes(clip, [2.1, 3, 3.1, 5.8], 10)).toEqual([3, 5.8])
+  })
+  it('ignores non-finite times and falls back to 30 fps', () => {
+    expect(alignSplitTimes(clip, [NaN, Infinity, 3], 0)).toEqual([3])
   })
 })
 

@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { useEditor } from './store'
 import { resolveDuck } from './selectors'
 import { defaultTrackGate } from '../types'
-import type { Project, Track, TrackDuck } from '../types'
+import { evalKeyframes } from '../lib/keyframes'
+import type { Clip, Project, Track, TrackDuck } from '../types'
 
 function makeProject(): Project {
   return {
@@ -540,6 +541,124 @@ describe('auto-cut selection', () => {
     const s = useEditor.getState()
     expect([...s.selectedClipIds]).toEqual(['c1'])
     expect(s.selectedClipId).toBe('c1')
+  })
+})
+
+describe('scene-detect batch split', () => {
+  /** c1's pieces (c1 spans [0,5) on v1), in timeline order. */
+  const pieces = (): Clip[] =>
+    Object.values(useEditor.getState().project.clips)
+      .filter((c) => c.startSec < 5)
+      .sort((a, b) => a.startSec - b.startSec)
+
+  it('splitClipAtTimes splits into N+1 pieces, nothing lost and nothing rippled', () => {
+    useEditor.getState().splitClipAtTimes('c1', [3, 1]) // order doesn't matter
+    expect(pieces().map((c) => [c.startSec, c.durationSec, c.inSec])).toEqual([
+      [0, 1, 0],
+      [1, 2, 1],
+      [3, 2, 3]
+    ])
+    expect(useEditor.getState().project.clips.c2.startSec).toBe(5) // a split never ripples
+    expect(useEditor.getState().project.clips.c3.startSec).toBe(10)
+  })
+
+  it('rebases each piece in-point through the clip speed', () => {
+    useEditor.getState().setSpeed('c1', 2)
+    useEditor.getState().splitClipAtTimes('c1', [1, 3])
+    expect(pieces().map((c) => c.inSec)).toEqual([0, 2, 6]) // 1s and 2s of timeline at 2x
+    expect(pieces().every((c) => c.speed === 2)).toBe(true)
+  })
+
+  it('is a single undo step regardless of split count', () => {
+    useEditor.getState().splitClipAtTimes('c1', [1, 2, 3, 4])
+    expect(pieces()).toHaveLength(5)
+    expect(useEditor.getState().past.length).toBe(1)
+    useEditor.getState().undo()
+    expect(useEditor.getState().project.clips.c1).toEqual({
+      id: 'c1',
+      trackId: 'v1',
+      mediaId: 'm1',
+      startSec: 0,
+      durationSec: 5,
+      inSec: 0
+    })
+    expect(Object.keys(useEditor.getState().project.clips)).toHaveLength(3) // back to c1/c2/c3
+  })
+
+  it('snaps to the project frame grid and never leaves a sliver piece', () => {
+    // 1.012s -> frame 30, 2.02s -> frame 61 (fps 30); 2.05 is too close to that
+    // cut, 0.03 / 4.99 hug the clip edges.
+    useEditor.getState().splitClipAtTimes('c1', [0.03, 1.012, 2.02, 2.05, 4.99])
+    expect(pieces().map((c) => c.startSec)).toEqual([0, 1, 61 / 30])
+  })
+
+  it('is a no-op (no history) when no time lands usefully inside the clip', () => {
+    expect(() => useEditor.getState().splitClipAtTimes('c1', [20, 0.02, 4.99])).not.toThrow()
+    expect(useEditor.getState().past.length).toBe(0)
+    expect(useEditor.getState().project.clips.c1.durationSec).toBe(5)
+  })
+
+  it('keeps keyframes continuous across every piece and fades on the outer ones', () => {
+    useEditor.setState((st) => ({
+      project: {
+        ...st.project,
+        clips: {
+          ...st.project.clips,
+          c1: {
+            ...st.project.clips.c1,
+            fadeInSec: 0.5,
+            fadeOutSec: 0.5,
+            keyframes: {
+              scale: [
+                { t: 0, v: 1, ease: 'linear' },
+                { t: 4, v: 5, ease: 'linear' }
+              ]
+            }
+          }
+        }
+      }
+    }))
+    const original = useEditor.getState().project.clips.c1.keyframes!.scale!
+    useEditor.getState().splitClipAtTimes('c1', [1, 3])
+    const ps = pieces()
+    expect(ps.map((c) => [c.fadeInSec, c.fadeOutSec])).toEqual([
+      [0.5, 0],
+      [0, 0],
+      [0, 0.5]
+    ])
+    // Each piece animates exactly as the unsplit clip did at the same timeline time.
+    for (const t of [0, 0.5, 1, 2.2, 3, 3.9, 4.5]) {
+      const p = ps.find((c) => t >= c.startSec && t < c.startSec + c.durationSec)!
+      expect(evalKeyframes(p.keyframes!.scale!, t - p.startSec)).toBeCloseTo(evalKeyframes(original, t))
+    }
+  })
+
+  it('keeps the selection on the head piece, which keeps the clip id', () => {
+    useEditor.getState().selectClip('c1')
+    useEditor.getState().splitClipAtTimes('c1', [1, 3])
+    const s = useEditor.getState()
+    expect(s.selectedClipId).toBe('c1')
+    expect([...s.selectedClipIds]).toEqual(['c1'])
+    expect(s.project.clips.c1.durationSec).toBe(1)
+  })
+
+  it('with markers, also drops a marker at each split in the same undo step', () => {
+    useEditor.getState().splitClipAtTimes('c1', [1, 3], { markers: true })
+    expect((useEditor.getState().project.markers ?? []).map((m) => m.timeSec)).toEqual([1, 3])
+    expect(useEditor.getState().past.length).toBe(1)
+    useEditor.getState().undo()
+    expect(useEditor.getState().project.markers ?? []).toEqual([])
+    expect(pieces()).toHaveLength(1)
+  })
+
+  it('addMarkers marks every time in one undo step, skipping times already marked', () => {
+    useEditor.getState().addMarker(3)
+    useEditor.getState().addMarkers([3.01, 1, 4])
+    expect(useEditor.getState().project.markers!.map((m) => m.timeSec)).toEqual([1, 3, 4])
+    expect(useEditor.getState().past.length).toBe(2) // addMarker + one for the whole batch
+    useEditor.getState().addMarkers([1, 4]) // all already marked: no-op, no history
+    expect(useEditor.getState().past.length).toBe(2)
+    expect(Object.keys(useEditor.getState().project.clips)).toHaveLength(3) // markers only: nothing split
   })
 })
 

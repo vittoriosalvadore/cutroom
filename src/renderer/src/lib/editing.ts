@@ -187,6 +187,36 @@ export function splitClipAt<T extends SplittableClip>(clip: T, atSec: number): S
   }
 }
 
+/**
+ * Clean a batch of split times for one clip (e.g. detected scene cuts): each
+ * snaps to the nearest frame boundary of `fps`, then any time that would leave
+ * a piece shorter than MIN_CLIP_SEC (and never under two frames) — against
+ * either clip edge or the previous kept time — is dropped, so a batch split
+ * can't shave sliver clips off. Returns the kept times, ascending.
+ */
+export function alignSplitTimes(
+  clip: { startSec: number; durationSec: number },
+  atSecs: number[],
+  fps: number
+): number[] {
+  const f = fps > 0 ? fps : 30
+  const minPiece = Math.max(MIN_CLIP_SEC, 2 / f) - 1e-6
+  const end = clip.startSec + clip.durationSec
+  const snapped = atSecs
+    .filter((t) => Number.isFinite(t))
+    .map((t) => Math.round(t * f) / f)
+    .sort((a, b) => a - b)
+  const kept: number[] = []
+  let prev = clip.startSec
+  for (const t of snapped) {
+    if (t - prev >= minPiece && end - t >= minPiece) {
+      kept.push(t)
+      prev = t
+    }
+  }
+  return kept
+}
+
 /** Minimal ripple-delete input. */
 export interface RippleClip {
   trackId: string

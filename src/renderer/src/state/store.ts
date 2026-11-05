@@ -9,6 +9,7 @@ import type {
   ColorCorrection,
   CurveChannel,
   CurvePoint,
+  Marker,
   MediaItem,
   MediaKind,
   Project,
@@ -36,6 +37,7 @@ import {
   defaultTrackReverb
 } from '../types'
 import {
+  alignSplitTimes,
   computeCrossfade,
   mergeRemovedRanges,
   MIN_CLIP_SEC,
@@ -201,6 +203,12 @@ interface EditorState {
    *  are given in ORIGINAL (pre-cut) timeline positions; later ranges are
    *  re-targeted internally as earlier cuts ripple-shift the timeline. */
   applySilenceCuts: (clipId: string, ranges: Array<{ startSec: number; endSec: number }>) => void
+  /** Split a clip at every given ABSOLUTE timeline time (e.g. scene-detect
+   *  cuts), content preserved — plain splits, no ripple. Times are cleaned by
+   *  alignSplitTimes first (snapped to the project frame grid; none leaving a
+   *  sliver piece). `markers` also drops a marker at each split. One recorded
+   *  history step for the whole batch. */
+  splitClipAtTimes: (clipId: string, atSecs: number[], opts?: { markers?: boolean }) => void
   /** Crossfade a clip with its nearest adjacent/overlapping same-track neighbor. */
   crossfadeWithNeighbor: (clipId: string) => void
   selectClip: (clipId: string | null) => void
@@ -225,6 +233,9 @@ interface EditorState {
 
   // --- markers ---
   addMarker: (timeSec?: number) => void
+  /** Add a point marker at each time (e.g. scene-detect cuts) in one undo step;
+   *  times near an existing marker are skipped, like addMarker. */
+  addMarkers: (timesSec: number[]) => void
   removeMarker: (markerId: string) => void
   updateMarker: (markerId: string, patch: { label?: string; color?: string; timeSec?: number }) => void
   selectMarker: (markerId: string | null) => void
@@ -354,6 +365,10 @@ interface EditorState {
   // --- auto-cut silence ---
   autoCutSilenceOpen: boolean
   setAutoCutSilenceOpen: (open: boolean) => void
+
+  // --- scene detection ---
+  sceneDetectOpen: boolean
+  setSceneDetectOpen: (open: boolean) => void
 }
 
 const HISTORY_LIMIT = 100
@@ -488,6 +503,20 @@ function patchClip(project: Project, clipId: string, patch: Partial<Clip>): Proj
   const clip = project.clips[clipId]
   if (!clip) return project
   return { ...project, clips: { ...project.clips, [clipId]: { ...clip, ...patch } } }
+}
+
+/** A new marker this close to an existing one (incl. a region start) is a duplicate. */
+const MARKER_DEDUPE_SEC = 0.02
+
+/** `markers` plus a point marker at each time not already marked; sorted. */
+function withMarkersAt(markers: Marker[], times: number[]): Marker[] {
+  const out = [...markers]
+  for (const t of times) {
+    const at = Math.max(0, t)
+    if (out.some((m) => Math.abs(m.timeSec - at) < MARKER_DEDUPE_SEC)) continue
+    out.push({ id: uid('mk'), timeSec: at, color: defaultMarkerColor() })
+  }
+  return out.sort((a, b) => a.timeSec - b.timeSec)
 }
 
 /** Drop empty tracks, and return undefined when the whole map is empty (fast path). */
@@ -759,6 +788,30 @@ export const useEditor = create<EditorState>((set) => {
       }
     }),
 
+  splitClipAtTimes: (clipId, atSecs, opts) =>
+    set((s) => {
+      const clip = s.project.clips[clipId]
+      if (!clip) return {}
+      const times = alignSplitTimes(clip, atSecs, s.project.fps)
+      if (times.length === 0) return {}
+      // Ascending splits through splitClipAt (keyframes / fades / speed handled
+      // like splitAtPlayhead): each one lands in the right-hand piece the
+      // previous split left. The head keeps the clip's id, so a selection on it
+      // stays valid; every later piece gets a fresh id.
+      const clips = { ...s.project.clips }
+      let current = clip
+      for (const t of times) {
+        const piece = splitClipAt(current, t)
+        if (!piece) continue
+        clips[current.id] = piece.left
+        current = { ...piece.right, id: uid('c') }
+        clips[current.id] = current
+      }
+      const project = { ...s.project, clips }
+      if (opts?.markers) project.markers = withMarkersAt(s.project.markers ?? [], times)
+      return { ...recordHistory(s), project }
+    }),
+
   crossfadeWithNeighbor: (clipId) =>
     set((s) => {
       const clip = s.project.clips[clipId]
@@ -936,7 +989,7 @@ export const useEditor = create<EditorState>((set) => {
     set((s) => {
       const t = Math.max(0, timeSec ?? s.playheadSec)
       const markers = [...(s.project.markers ?? [])]
-      if (markers.some((m) => Math.abs(m.timeSec - t) < 0.02)) return {} // dedupe (incl. region starts)
+      if (markers.some((m) => Math.abs(m.timeSec - t) < MARKER_DEDUPE_SEC)) return {} // dedupe (incl. region starts)
       const id = uid('mk')
       markers.push({ id, timeSec: t, color: defaultMarkerColor() })
       markers.sort((a, b) => a.timeSec - b.timeSec)
@@ -949,6 +1002,14 @@ export const useEditor = create<EditorState>((set) => {
         selectedClipIds: new Set(),
         selectedTrackId: null
       }
+    }),
+
+  addMarkers: (timesSec) =>
+    set((s) => {
+      const before = s.project.markers ?? []
+      const markers = withMarkersAt(before, timesSec)
+      if (markers.length === before.length) return {} // every time already marked
+      return { ...recordHistory(s), project: { ...s.project, markers } }
     }),
 
   removeMarker: (markerId) =>
@@ -1488,6 +1549,9 @@ export const useEditor = create<EditorState>((set) => {
     }),
 
   autoCutSilenceOpen: false,
-  setAutoCutSilenceOpen: (open) => set({ autoCutSilenceOpen: open })
+  setAutoCutSilenceOpen: (open) => set({ autoCutSilenceOpen: open }),
+
+  sceneDetectOpen: false,
+  setSceneDetectOpen: (open) => set({ sceneDetectOpen: open })
   }
 })

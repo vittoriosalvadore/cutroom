@@ -1421,6 +1421,14 @@ kbd {
   color: var(--muted);
   line-height: var(--lh-normal);
 }
+/* Scene-detect candidate list: reuses .set-row per cut. */
+.scene-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 40vh;
+  overflow-y: auto;
+  margin-top: var(--sp-4);
+}
 /* toggle switch */
 .set-switch {
   flex-shrink: 0;
