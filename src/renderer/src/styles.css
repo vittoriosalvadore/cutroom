@@ -720,6 +720,16 @@ input[type='color']:hover {
   right: 8px;
   opacity: 0.75;
 }
+/* "Save frame" sits just left of the Scopes toggle */
+.monitor-still-btn {
+  position: absolute;
+  top: 8px;
+  right: 76px;
+  opacity: 0.75;
+}
+.monitor-still-btn:hover {
+  opacity: 1;
+}
 .monitor-scopes-btn:hover,
 .monitor-scopes-btn.active {
   opacity: 1;
@@ -832,6 +842,64 @@ input[type='color']:hover {
 .timeline-head .btn {
   white-space: nowrap;
   flex-shrink: 0;
+}
+/* the hint is a button that opens the shortcut list */
+.timeline-head button.hint {
+  background: none;
+  border: none;
+  padding: 0;
+  text-align: left;
+  font-family: inherit;
+  cursor: help;
+}
+.timeline-head button.hint:hover {
+  color: var(--text-2);
+}
+
+/* ---- keyboard shortcuts panel ---- */
+.shortcuts-modal {
+  width: min(760px, 92vw);
+}
+.shortcuts-body {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: var(--sp-6) var(--sp-8);
+  max-height: 70vh;
+  overflow: auto;
+}
+.shortcuts-group h4 {
+  margin: 0 0 var(--sp-3);
+  font-size: var(--fs-11);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-cap);
+  color: var(--muted);
+}
+.shortcuts-row {
+  display: flex;
+  gap: var(--sp-4);
+  align-items: baseline;
+  padding: 3px 0;
+  font-size: var(--fs-12);
+}
+.shortcuts-keys {
+  flex: 0 0 132px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+}
+.shortcuts-what {
+  color: var(--text-2);
+}
+kbd {
+  font-family: var(--font-mono);
+  font-size: var(--fs-11);
+  padding: 1px 6px;
+  border-radius: var(--r-xs);
+  border: 1px solid var(--line-strong);
+  border-bottom-width: 2px;
+  background: var(--sunken);
+  color: var(--text);
+  white-space: nowrap;
 }
 .timeline-canvas-wrap {
   position: relative;

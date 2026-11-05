@@ -186,6 +186,9 @@ const api = {
   getPathForFile: (f: File): string => webUtils.getPathForFile(f),
   /** Opens the native file picker and resolves to selected absolute paths. */
   openMedia: (): Promise<string[]> => ipcRenderer.invoke('dialog:openMedia'),
+  /** Save PNG bytes of a still frame to a user-chosen file. Resolves true if written. */
+  saveImage: (data: ArrayBuffer, suggestedName: string): Promise<boolean> =>
+    ipcRenderer.invoke('dialog:saveImage', data, suggestedName),
   /** Opens a subtitle file and resolves to its raw text, or null if cancelled. */
   openSubtitle: (): Promise<string | null> => ipcRenderer.invoke('dialog:openSubtitle'),
   /** Saves SRT text to a user-chosen file. Resolves true if written. */

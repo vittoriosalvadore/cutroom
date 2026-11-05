@@ -1,6 +1,6 @@
 import { app, shell, BrowserWindow, ipcMain, dialog, protocol } from 'electron'
-import { extname, join } from 'path'
-import { createReadStream } from 'fs'
+import { basename, extname, join } from 'path'
+import { createReadStream, existsSync } from 'fs'
 import { readFile, stat, writeFile } from 'fs/promises'
 import { Readable } from 'stream'
 import { registerExportIpc } from './export'
@@ -226,6 +226,34 @@ function registerIpc(): void {
   })
 
   // Export subtitle text to an .srt file. Returns true if written.
+  // Save a still frame (PNG bytes rendered by the renderer). Returns true if written.
+  ipcMain.handle('dialog:saveImage', async (_event, data: unknown, suggestedName: unknown) => {
+    if (!(data instanceof ArrayBuffer) || data.byteLength === 0 || data.byteLength > 512 * 1024 * 1024) return false
+    const name = typeof suggestedName === 'string' && suggestedName ? suggestedName : 'frame.png'
+    const result = await dialog.showSaveDialog({
+      title: 'Save frame as PNG',
+      defaultPath: name,
+      filters: [{ name: 'PNG image', extensions: ['png'] }]
+    })
+    if (result.canceled || !result.filePath) return false
+    const appended = extname(result.filePath).toLowerCase() !== '.png'
+    const target = appended ? `${result.filePath}.png` : result.filePath
+    // The dialog only checked the name as typed; ask before replacing the .png.
+    if (appended && existsSync(target)) {
+      const { response } = await dialog.showMessageBox({
+        type: 'warning',
+        buttons: ['Replace', 'Cancel'],
+        defaultId: 1,
+        cancelId: 1,
+        message: `"${basename(target)}" already exists.`,
+        detail: 'Do you want to replace it?'
+      })
+      if (response !== 0) return false
+    }
+    await writeFile(target, Buffer.from(data))
+    return true
+  })
+
   ipcMain.handle('dialog:saveSubtitle', async (_event, content: string) => {
     const result = await dialog.showSaveDialog({
       title: 'Export subtitles (SRT)',

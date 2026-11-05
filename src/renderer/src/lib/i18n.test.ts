@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { LANGUAGES, dictionary, interpolate, interpolateParts, translate, type Lang } from './i18n'
+import { SHORTCUT_STRINGS } from '../components/ShortcutsModal'
 
 const OTHER: Exclude<Lang, 'en'>[] = ['es', 'fr', 'de']
 const SRC = join(__dirname, '..')
@@ -53,7 +54,9 @@ const DYNAMIC_KEYS = [
   'Vertical 1080×1920 (Reels/TikTok)',
   'High quality master',
   'Small file 720p',
-  'The hardware encoder failed, so this export used the software encoder.'
+  'The hardware encoder failed, so this export used the software encoder.',
+  // the keyboard shortcut panel's rows (components/ShortcutsModal)
+  ...SHORTCUT_STRINGS
 ]
 
 const placeholders = (s: string): string[] => [...s.matchAll(/\{(\w+)\}/g)].map((m) => m[1]).sort()

@@ -11,6 +11,7 @@ import { useT } from '../lib/i18n'
 import { ScopeSampler } from '../lib/scopeSampler'
 import { SCOPE_INTERVAL_MS, shouldSample } from '../lib/scopes'
 import Scopes, { type ScopesHandle } from './Scopes'
+import { captureFramePng, frameFileName } from '../lib/frameGrab'
 import { proxyCacheVersion, proxyPreviewPath, subscribeProxyCache } from '../lib/proxyCache'
 import type { Project } from '../types'
 
@@ -254,6 +255,21 @@ export default function Preview() {
     safeFrame(compRef.current, audioRef.current, l.project, l.playhead, l.isPlaying, tap)
   }, [showScopes, exportOpen])
 
+  // "Save frame": full-size still of the frame under the playhead.
+  const [grabbing, setGrabbing] = useState(false)
+  const saveFrame = async (): Promise<void> => {
+    const st = useEditor.getState()
+    setGrabbing(true)
+    try {
+      const png = await captureFramePng(st.project, st.playheadSec)
+      await window.cutroom.saveImage(png, frameFileName(st.project.name, st.playheadSec))
+    } catch (e) {
+      window.alert(t('Could not save the frame: {error}', { error: e instanceof Error ? e.message : String(e) }))
+    } finally {
+      setGrabbing(false)
+    }
+  }
+
   return (
     <section className={`preview ${showScopes ? 'with-scopes' : ''}`}>
       <div className="monitor-inner">
@@ -268,6 +284,15 @@ export default function Preview() {
           {project.width}×{project.height} · {project.fps} fps · {playhead.toFixed(2)}s
           {previewQuality !== 'full' && ` · ${t('Preview')} ${previewQuality === 'half' ? '½' : '¼'}`}
         </div>
+        <button
+          className="btn small monitor-still-btn"
+          title={t('Save this frame as a PNG image (full resolution, exactly as exported)')}
+          aria-label={t('Save frame')}
+          disabled={grabbing}
+          onClick={() => void saveFrame()}
+        >
+          📷
+        </button>
         <button
           className={`btn small monitor-scopes-btn ${showScopes ? 'active' : ''}`}
           title={showScopes ? t('Hide scopes') : t('Show scopes (histogram, waveform, vectorscope)')}

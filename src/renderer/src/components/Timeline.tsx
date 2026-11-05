@@ -9,6 +9,7 @@ import { clipSpeed } from '../lib/clipTime'
 import { timelineDuration } from '../lib/exporter'
 import { clampScrollSec, clampScrollY, fitZoom, followPlayhead, scrollExtentSec, zoomAnchoredScroll } from '../lib/timelineScroll'
 import ScrollBar from './ScrollBar'
+import { useShortcutsPanel } from './ShortcutsModal'
 import { canRemoveTrack, clipsInMarquee, trackDropTarget } from '../lib/tracks'
 import { removeTrackWithConfirm } from '../lib/trackActions'
 import { useT } from '../lib/i18n'
@@ -1156,9 +1157,13 @@ export default function Timeline() {
     <section className="timeline">
       <div className="timeline-head">
         <span>{t('Timeline')}</span>
-        <span className="hint" title={hint}>
+        <button
+          className="hint"
+          title={`${hint}\n\n${t('Click for all keyboard shortcuts (?)')}`}
+          onClick={() => useShortcutsPanel.getState().setOpen(true)}
+        >
           {hint}
-        </span>
+        </button>
         <button
           className="btn small"
           title={t('Zoom to fit the whole timeline')}

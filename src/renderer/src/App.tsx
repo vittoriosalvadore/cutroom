@@ -22,6 +22,7 @@ import TranscribeModal from './components/TranscribeModal'
 import SettingsModal from './components/SettingsModal'
 import AutoReframeModal from './components/AutoReframeModal'
 import AutoCutSilenceModal from './components/AutoCutSilenceModal'
+import ShortcutsModal, { useShortcutsPanel } from './components/ShortcutsModal'
 
 /**
  * Drives the playhead while playing. Uses requestAnimationFrame and reads the
@@ -376,6 +377,8 @@ function useShortcuts(): void {
         }
       } else if (e.key === 'Home') {
         st.setPlayhead(0)
+      } else if (e.key === '?') {
+        useShortcutsPanel.getState().setOpen(true)
       }
     }
     window.addEventListener('keydown', onKey)
@@ -488,6 +491,7 @@ export default function App() {
       <SettingsModal />
       <AutoReframeModal />
       <AutoCutSilenceModal />
+      <ShortcutsModal />
     </div>
   )
 }
