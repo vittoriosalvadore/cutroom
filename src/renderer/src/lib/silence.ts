@@ -86,3 +86,42 @@ export function findSilences(buffer: AudioBuffer, opts: FindSilencesOptions): Si
   }
   return merged
 }
+
+/**
+ * Pick a silence threshold from the recording itself, Recut-style: measure the
+ * level of every 20 ms window (loudest channel), take the quiet end of the
+ * distribution as the room's noise floor (10th percentile) and the loud end as
+ * the voice (90th), and set the threshold a third of the way up from the
+ * floor. Speech over a quiet room lands well below the words but clear of
+ * breaths and hum. Returns dBFS, clamped to a sensible range; analyses only
+ * [fromSec, toSec) of the buffer (the clip's used span).
+ */
+export function estimateThresholdDb(buffer: AudioBuffer, fromSec = 0, toSec = Infinity): number {
+  const nch = Math.max(1, buffer.numberOfChannels || 1)
+  const channels: Float32Array[] = []
+  for (let ch = 0; ch < nch; ch++) channels.push(buffer.getChannelData(ch))
+  const win = buffer.sampleRate / ANALYSIS_WINDOWS_PER_SEC
+  const first = Math.max(0, Math.floor((fromSec * buffer.sampleRate) / win))
+  const last = Math.min(Math.ceil(buffer.length / win), Math.ceil((Math.min(toSec, buffer.length / buffer.sampleRate) * buffer.sampleRate) / win))
+  const levels: number[] = []
+  for (let i = first; i < last; i++) {
+    const start = Math.floor(i * win)
+    const end = Math.min(buffer.length, Math.floor((i + 1) * win))
+    const n = Math.max(1, end - start)
+    let maxMeanSq = 0
+    for (const data of channels) {
+      let sumSq = 0
+      for (let j = start; j < end; j++) sumSq += data[j] * data[j]
+      maxMeanSq = Math.max(maxMeanSq, sumSq / n)
+    }
+    // Digital silence would be -Infinity; treat it as a very quiet floor.
+    levels.push(maxMeanSq > 0 ? 10 * Math.log10(maxMeanSq) : -100)
+  }
+  if (levels.length === 0) return -40
+  levels.sort((a, b) => a - b)
+  const pct = (p: number): number => levels[Math.min(levels.length - 1, Math.floor(p * (levels.length - 1)))]
+  const floor = Math.max(-90, pct(0.1))
+  const voice = pct(0.9)
+  const threshold = voice - floor < 6 ? floor + 3 : floor + (voice - floor) / 3
+  return Math.round(Math.max(-70, Math.min(-15, threshold)))
+}

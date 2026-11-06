@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { findSilences } from './silence'
+import { estimateThresholdDb, findSilences } from './silence'
 
 /** A minimal AudioBuffer stand-in — only getChannelData/duration/length are
  *  used by findSilences, so a real AudioBuffer isn't needed in a node test env. */
@@ -102,5 +102,40 @@ describe('findSilences', () => {
       numberOfChannels: 2
     } as unknown as AudioBuffer
     expect(findSilences(buf, OPTS)).toEqual([])
+  })
+})
+
+describe('estimateThresholdDb', () => {
+  // Speech-like bursts at ~-12 dBFS over a ~-60 dBFS room tone, 50% of the time.
+  const sr = 8000
+  const make = (): AudioBuffer => {
+    const data = new Float32Array(sr * 10)
+    for (let i = 0; i < data.length; i++) {
+      const t = i / sr
+      const speaking = Math.floor(t * 2) % 2 === 0
+      data[i] = speaking ? 0.35 * Math.sin(2 * Math.PI * 220 * t) : 0.0014 * Math.sin(2 * Math.PI * 50 * t)
+    }
+    return { sampleRate: sr, length: data.length, numberOfChannels: 1, getChannelData: () => data } as unknown as AudioBuffer
+  }
+
+  it('lands between the room tone and the voice', () => {
+    const th = estimateThresholdDb(make())
+    expect(th).toBeGreaterThan(-60)
+    expect(th).toBeLessThan(-20)
+  })
+
+  it('the estimated threshold finds the pauses', () => {
+    const buf = make()
+    const ranges = findSilences(buf, { thresholdDb: estimateThresholdDb(buf), minSilenceSec: 0.3, minClipSec: 0.2 })
+    expect(ranges.length).toBe(10)
+    expect(ranges[0].startSec).toBeCloseTo(0.5, 1)
+  })
+
+  it('falls back to a sane value on digital silence', () => {
+    const data = new Float32Array(8000)
+    const buf = { sampleRate: 8000, length: 8000, numberOfChannels: 1, getChannelData: () => data } as unknown as AudioBuffer
+    const th = estimateThresholdDb(buf)
+    expect(th).toBeGreaterThanOrEqual(-70)
+    expect(th).toBeLessThanOrEqual(-15)
   })
 })

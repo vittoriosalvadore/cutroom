@@ -4,6 +4,7 @@ import {
   alignSplitTimes,
   computeCrossfade,
   computeTrim,
+  cutSpanAllTracks,
   rippleShift,
   mergeRemovedRanges,
   rippleShiftMarkers,
@@ -260,5 +261,36 @@ describe('computeCrossfade', () => {
     const r = computeCrossfade({ startSec: 0, durationSec: 1 }, { startSec: 0.4, durationSec: 5 })
     // existing overlap 0.6, but clamp to e duration 1 -> stays 0.6
     expect(r.overlap).toBeCloseTo(0.6)
+  })
+})
+
+describe('cutSpanAllTracks', () => {
+  let n = 0
+  const id = (): string => `n${++n}`
+  const v = { id: 'v', trackId: 'V1', startSec: 0, durationSec: 10, inSec: 0 }
+  const a = { id: 'a', trackId: 'A1', startSec: 0, durationSec: 10, inSec: 0 }
+  const t = { id: 't', trackId: 'S', startSec: 4, durationSec: 2, inSec: 0 }
+  const after = { id: 'x', trackId: 'A1', startSec: 12, durationSec: 2, inSec: 0 }
+
+  it('removes the span from every track and closes the gap on all of them', () => {
+    const out = cutSpanAllTracks([v, a, t, after], 3, 5, id)
+    const byTrack = (tr: string) => out.filter((c) => c.trackId === tr).sort((p, q) => p.startSec - q.startSec)
+    // camera and mic: same cut, still in sync
+    for (const tr of ['V1', 'A1']) {
+      const [l, r] = byTrack(tr)
+      expect(l).toMatchObject({ startSec: 0, durationSec: 3, inSec: 0 })
+      expect(r).toMatchObject({ startSec: 3, durationSec: 5, inSec: 5 })
+    }
+    // a subtitle straddling the span keeps only its part after the cut
+    expect(byTrack('S')).toEqual([expect.objectContaining({ id: 't', startSec: 3, durationSec: 1 })])
+    // a later clip moves left by the span length
+    expect(out.find((c) => c.id === 'x')!.startSec).toBe(10)
+  })
+
+  it('keeps ids stable for the left piece and handles edges', () => {
+    const out = cutSpanAllTracks([v], 0, 2, id)
+    expect(out).toEqual([expect.objectContaining({ id: 'v', startSec: 0, durationSec: 8, inSec: 2 })])
+    expect(cutSpanAllTracks([v], 9.99995, 12, id)).toEqual([v]) // span starts at the clip's end
+    expect(cutSpanAllTracks([v], 2, 2, id)).toEqual([v]) // empty span: no-op
   })
 })

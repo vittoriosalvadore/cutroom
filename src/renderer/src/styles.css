@@ -1687,3 +1687,17 @@ kbd {
   font-size: var(--fs-11);
   color: var(--muted);
 }
+
+/* checkbox rows inside modal bodies (e.g. Auto-Cut Silence options) */
+.modal-check {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  margin: var(--sp-3) 0;
+  font-size: var(--fs-12);
+  color: var(--text-2);
+  cursor: pointer;
+}
+.modal-check input {
+  accent-color: var(--accent);
+}

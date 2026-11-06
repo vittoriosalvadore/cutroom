@@ -39,6 +39,7 @@ import {
 } from '../types'
 import {
   alignSplitTimes,
+  cutSpanAllTracks,
   computeCrossfade,
   mergeRemovedRanges,
   MIN_CLIP_SEC,
@@ -207,6 +208,8 @@ interface EditorState {
    *  are given in ORIGINAL (pre-cut) timeline positions; later ranges are
    *  re-targeted internally as earlier cuts ripple-shift the timeline. */
   applySilenceCuts: (clipId: string, ranges: Array<{ startSec: number; endSec: number }>) => void
+  /** Recut-style: remove each timeline span from EVERY track and close the gap on all of them. */
+  applySilenceCutsAllTracks: (ranges: Array<{ startSec: number; endSec: number }>) => void
   /** Split a clip at every given ABSOLUTE timeline time (e.g. scene-detect
    *  cuts), content preserved — plain splits, no ripple. Times are cleaned by
    *  alignSplitTimes first (snapped to the project frame grid; none leaving a
@@ -777,6 +780,27 @@ export const useEditor = create<EditorState>((set) => {
         project: { ...s.project, clips, markers },
         // A range starting at a clip's head deletes that clip id outright.
         ...pruneSelection(s, removedIds(s.project.clips, clips))
+      }
+    }),
+
+  applySilenceCutsAllTracks: (ranges) =>
+    set((s) => {
+      // Last span first: cutting it never moves the earlier spans, so every
+      // range applies at its original (detected) position. One history step.
+      let clips = Object.values(s.project.clips)
+      let markers = s.project.markers ?? []
+      const spans = [...ranges].filter((r) => r.endSec - r.startSec > 1e-4).sort((a, b) => b.startSec - a.startSec)
+      for (const r of spans) {
+        clips = cutSpanAllTracks(clips, r.startSec, r.endSec, () => uid('c'))
+        markers = rippleShiftMarkers(markers, r.startSec, r.endSec - r.startSec)
+      }
+      if (spans.length === 0) return {}
+      const nextClips: EditorState['project']['clips'] = {}
+      for (const c of clips) nextClips[c.id] = c
+      return {
+        ...recordHistory(s),
+        project: { ...s.project, clips: nextClips, markers },
+        ...pruneSelection(s, removedIds(s.project.clips, nextClips))
       }
     }),
 

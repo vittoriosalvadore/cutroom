@@ -255,6 +255,38 @@ describe('transform & keyframes', () => {
     expect(last.startSec + last.durationSec).toBeCloseTo(13) // was 15, minus 2s removed
   })
 
+  it('applySilenceCutsAllTracks cuts every track in sync, in one undo step', () => {
+    // add a mic clip on an audio track under c1..c2: [0,10)
+    const audio = { id: 'a1', kind: 'audio' as const, name: 'A1', height: 52, muted: false, hidden: false }
+    useEditor.setState((s) => ({
+      project: {
+        ...s.project,
+        tracks: [...s.project.tracks, audio],
+        clips: { ...s.project.clips, mic: { id: 'mic', trackId: audio.id, mediaId: 'm1', startSec: 0, durationSec: 10, inSec: 0 } }
+      },
+      past: []
+    }))
+    useEditor.getState().addMarker(12)
+    useEditor.setState({ past: [] })
+    useEditor.getState().applySilenceCutsAllTracks([
+      { startSec: 1, endSec: 2 },
+      { startSec: 7, endSec: 8 }
+    ])
+    const clips = Object.values(useEditor.getState().project.clips)
+    const end = (tr: string): number => Math.max(...clips.filter((c) => c.trackId === tr).map((c) => c.startSec + c.durationSec))
+    expect(end('v1')).toBeCloseTo(13) // video: 15 - 2
+    expect(end(audio.id)).toBeCloseTo(8) // mic: 10 - 2, same cuts -> still in sync
+    // the mic piece after the first cut reads source 2s at timeline 1s, like the video
+    const micAt1 = clips.find((c) => c.trackId === audio.id && Math.abs(c.startSec - 1) < 1e-6)!
+    const vidAt1 = clips.find((c) => c.trackId === 'v1' && Math.abs(c.startSec - 1) < 1e-6)!
+    expect(micAt1.inSec).toBeCloseTo(2)
+    expect(vidAt1.inSec).toBeCloseTo(2)
+    expect(useEditor.getState().project.markers![0].timeSec).toBeCloseTo(10)
+    expect(useEditor.getState().past.length).toBe(1)
+    useEditor.getState().undo()
+    expect(useEditor.getState().project.clips.mic.durationSec).toBe(10)
+  })
+
   it('applySilenceCuts is a single undo step regardless of range count', () => {
     useEditor.getState().applySilenceCuts('c1', [
       { startSec: 1, endSec: 2 },

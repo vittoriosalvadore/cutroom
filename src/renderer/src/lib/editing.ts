@@ -313,3 +313,49 @@ export function shiftTimeForRanges(t: number, ranges: RemovedRange[]): number {
   }
   return Math.max(0, t - shift)
 }
+
+/**
+ * Remove the timeline span [startSec, endSec) from EVERY track at once and
+ * close the gap on all of them, the way Recut-style silence removal keeps a
+ * camera track and a separate microphone track in sync. Clips straddling an
+ * edge are split there (through splitClipAt, so keyframes / fades / speed /
+ * karaoke words follow); pieces inside the span are dropped; everything after
+ * it moves left by its length. The left piece keeps the clip's id, a right
+ * piece gets one from `newId`. Pure: returns a new clip list.
+ */
+export function cutSpanAllTracks<T extends SplittableClip & { id: string; trackId: string }>(
+  clips: T[],
+  startSec: number,
+  endSec: number,
+  newId: () => string
+): T[] {
+  const dur = endSec - startSec
+  if (!(dur > 1e-4)) return clips
+  const out: T[] = []
+  for (const c of clips) {
+    const cEnd = c.startSec + c.durationSec
+    if (cEnd <= startSec + 1e-4) {
+      out.push(c) // entirely before the span
+      continue
+    }
+    if (c.startSec >= endSec - 1e-4) {
+      out.push({ ...c, startSec: Math.max(0, c.startSec - dur) }) // entirely after: close the gap
+      continue
+    }
+    // Overlaps the span: keep what lies before it and what lies after it.
+    let rest: T = c
+    const atStart = c.startSec < startSec ? splitClipAt(c, startSec) : undefined
+    if (atStart) {
+      out.push(atStart.left)
+      rest = atStart.right
+    }
+    if (rest.startSec + rest.durationSec <= endSec + 1e-4) continue // the rest ends inside: dropped
+    const atEnd = splitClipAt(rest, endSec)
+    out.push(
+      atEnd
+        ? { ...atEnd.right, id: atStart ? newId() : rest.id, startSec }
+        : { ...rest, startSec: Math.max(0, rest.startSec - dur) } // starts right at the span's end
+    )
+  }
+  return out
+}

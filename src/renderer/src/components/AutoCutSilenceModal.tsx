@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useEditor } from '../state/store'
-import { detectSilenceRanges, totalRemovedSec, type SilenceCutRange } from '../lib/autoCutSilence'
+import { detectSilenceCuts, totalRemovedSec, type SilenceCutRange } from '../lib/autoCutSilence'
 import { interpolateParts, useT } from '../lib/i18n'
 
 type Status = 'idle' | 'detecting' | 'preview' | 'error'
@@ -14,14 +14,24 @@ export default function AutoCutSilenceModal() {
     return c?.mediaId ? s.project.media[c.mediaId] : null
   })
   const applySilenceCuts = useEditor((s) => s.applySilenceCuts)
+  const applySilenceCutsAllTracks = useEditor((s) => s.applySilenceCutsAllTracks)
 
   const [thresholdDb, setThresholdDb] = useState(-40)
   const [minSilenceSec, setMinSilenceSec] = useState(0.4)
   const [paddingSec, setPaddingSec] = useState(0.12)
+  // Recut-style defaults: the threshold comes from the recording's own noise
+  // floor, and the cut removes the span from every track (camera + mic in sync).
+  const [autoThreshold, setAutoThreshold] = useState(true)
+  const [allTracks, setAllTracks] = useState(true)
   const [status, setStatus] = useState<Status>('idle')
   // Detected ranges are tied to the clip they were computed for, so Apply cuts
   // THAT clip even if the selection changed since.
-  const [result, setResult] = useState<{ clipId: string; ranges: SilenceCutRange[] } | null>(null)
+  const [result, setResult] = useState<{
+    clipId: string
+    ranges: SilenceCutRange[]
+    allTracks: boolean
+    thresholdDb: number
+  } | null>(null)
   const [error, setError] = useState<string | null>(null)
   // Bumped whenever a run is superseded (close / back / new run); a detection
   // that resolves with a stale token is dropped instead of landing in the UI.
@@ -50,13 +60,16 @@ export default function AutoCutSilenceModal() {
     setStatus('detecting')
     setError(null)
     try {
-      const found = await detectSilenceRanges(useEditor.getState().project, clip, {
+      const found = await detectSilenceCuts(useEditor.getState().project, clip, {
         thresholdDb,
         minSilenceSec,
-        paddingSec
+        paddingSec,
+        autoThreshold,
+        allTracks
       })
       if (token !== runToken.current) return // cancelled / superseded
-      setResult({ clipId, ranges: found })
+      setResult({ clipId, ranges: found.ranges, allTracks, thresholdDb: found.thresholdDb })
+      if (autoThreshold) setThresholdDb(found.thresholdDb) // show what Auto picked
       setStatus('preview')
     } catch (e) {
       if (token !== runToken.current) return
@@ -67,7 +80,8 @@ export default function AutoCutSilenceModal() {
 
   const apply = (): void => {
     if (!result) return
-    applySilenceCuts(result.clipId, result.ranges)
+    if (result.allTracks) applySilenceCutsAllTracks(result.ranges)
+    else applySilenceCuts(result.clipId, result.ranges)
     runToken.current++
     setStatus('idle')
     setResult(null)
@@ -113,6 +127,13 @@ export default function AutoCutSilenceModal() {
                 )}{' '}
                 {t('Nothing has been changed yet — Apply commits the cut as one undo step.')}
               </p>
+              <p className="modal-note">
+                {t('Threshold used: {db} dB', { db: result?.thresholdDb ?? thresholdDb })}
+                {' · '}
+                {result?.allTracks
+                  ? t('Cuts every track, only where all of them are quiet.')
+                  : t('Cuts this clip only.')}
+              </p>
               {ranges.length === 0 && (
                 <p className="modal-note">
                   {t('Nothing under the threshold — try a higher threshold or shorter minimum.')}
@@ -129,20 +150,38 @@ export default function AutoCutSilenceModal() {
                   { name: <strong key="name">{media?.name}</strong> }
                 )}
               </p>
+              <label className="modal-check">
+                <input
+                  type="checkbox"
+                  checked={autoThreshold}
+                  disabled={detecting}
+                  onChange={(e) => setAutoThreshold(e.target.checked)}
+                />
+                {t('Automatic threshold (from the background noise)')}
+              </label>
               <label className="insp-field">
                 <span className="insp-label">
                   {t('Threshold')}
-                  <em>{thresholdDb} dB</em>
+                  <em>{autoThreshold ? t('Auto') : `${thresholdDb} dB`}</em>
                 </span>
                 <input
                   type="range"
-                  min={-60}
+                  min={-70}
                   max={-15}
                   step={1}
                   value={thresholdDb}
-                  disabled={detecting}
+                  disabled={detecting || autoThreshold}
                   onChange={(e) => setThresholdDb(Number(e.target.value))}
                 />
+              </label>
+              <label className="modal-check">
+                <input
+                  type="checkbox"
+                  checked={allTracks}
+                  disabled={detecting}
+                  onChange={(e) => setAllTracks(e.target.checked)}
+                />
+                {t('Cut all tracks together (keeps camera and microphone in sync)')}
               </label>
               <label className="insp-field">
                 <span className="insp-label">
