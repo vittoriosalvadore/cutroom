@@ -10,6 +10,8 @@
 //     startSec". Trimming changes numbers, never the underlying file.
 // ---------------------------------------------------------------------------
 
+import { REVERB_DEFAULTS } from '../../shared/reverb'
+
 export type MediaKind = 'video' | 'audio' | 'image'
 export type TrackKind = 'video' | 'audio'
 /** What a clip represents. 'media' references a file; 'title'/'subtitle' own text. */
@@ -52,6 +54,8 @@ export interface Track {
   eq?: TrackEQ
   /** Audio: per-track compressor. Absent = disabled. Audio tracks only. */
   comp?: TrackComp
+  /** Audio: per-track convolution reverb. Absent = disabled. Audio tracks only. */
+  reverb?: TrackReverb
 }
 
 /** Per-track 3-band EQ (low shelf 120Hz, mid peak 1kHz, high shelf 8kHz), in dB. */
@@ -70,6 +74,27 @@ export interface TrackComp {
   attackMs: number
   releaseMs: number
   makeupDb: number
+}
+
+/**
+ * Per-track convolution reverb. The impulse response is generated from
+ * decay / pre-delay / tone by src/shared/reverb.ts, identically for the
+ * preview ConvolverNode and the export's FFmpeg afir.
+ */
+export interface TrackReverb {
+  enabled: boolean
+  /** Wet amount 0..1 (equal-power dry/wet crossfade). */
+  mix: number
+  /** RT60 decay time in seconds. */
+  decaySec: number
+  /** Gap before the reverb tail, in ms. */
+  preDelayMs: number
+  /** 0 = dark .. 1 = bright. */
+  tone: number
+}
+
+export function defaultTrackReverb(): TrackReverb {
+  return { enabled: false, ...REVERB_DEFAULTS }
 }
 
 export function defaultTrackEQ(): TrackEQ {
@@ -236,6 +261,29 @@ export interface Project {
 
 export type TextAlign = 'left' | 'center' | 'right'
 
+/** How a karaoke subtitle marks the word being sung: 'pop' enlarges it,
+ *  'underline' underlines it, 'fill-wipe' puts a highlight box behind it. */
+export type KaraokeStyle = 'pop' | 'underline' | 'fill-wipe'
+
+export const KARAOKE_STYLES: readonly KaraokeStyle[] = ['pop', 'underline', 'fill-wipe']
+
+/** Highlight colour used when a karaoke clip doesn't set its own. */
+export const DEFAULT_KARAOKE_COLOR = '#ffd23f'
+
+/**
+ * A transcribed word's timing, CLIP-relative: seconds from the owning clip's
+ * startSec (the same convention as keyframes). Moving a clip carries its words
+ * along; edits that move the clip's head instead (split, head trim) rebase them
+ * like keyframes, so a word keeps its place against the audio. A word that
+ * started before such a cut is kept with a negative time: entries map 1:1, in
+ * order, to the whitespace-separated words of `content`.
+ */
+export interface WordTiming {
+  text: string
+  startSec: number
+  endSec: number
+}
+
 /** A title or subtitle's content and look. */
 export interface TextProps {
   content: string
@@ -257,6 +305,13 @@ export interface TextProps {
   boxColor: string
   /** Box alpha 0..1. 0 = no box. */
   boxOpacity: number
+  /** Per-word timing for a karaoke highlight. Absent for plain / imported
+   *  subtitles, which render exactly as before. */
+  words?: WordTiming[]
+  /** Active-word highlight colour (hex). Default DEFAULT_KARAOKE_COLOR. */
+  karaokeColor?: string
+  /** Active-word highlight style. Default 'pop'. */
+  karaokeStyle?: KaraokeStyle
 }
 
 /** Green/blue-screen key. Removes pixels near `color`. */
@@ -293,7 +348,21 @@ export interface Effects {
   chroma: ChromaKey
   /** Primary colour correction. Omitted / neutral = no grade. */
   color?: ColorCorrection
+  /** RGB curves, applied after the primary grade. Omitted / identity = no curves. */
+  curves?: ColorCurves
 }
+
+/** One curve control point; input level x -> output level y, both 0..1. */
+export interface CurvePoint {
+  x: number
+  y: number
+}
+
+/** 'master' is applied to R, G and B alike, before the per-channel curves. */
+export type CurveChannel = 'master' | 'r' | 'g' | 'b'
+
+/** Per-clip RGB curves: sorted control points per channel (see lib/curves.ts). */
+export type ColorCurves = Record<CurveChannel, CurvePoint[]>
 
 export function defaultChroma(): ChromaKey {
   return { enabled: false, color: '#00d000', similarity: 0.4, smoothness: 0.1, spill: 0.25 }

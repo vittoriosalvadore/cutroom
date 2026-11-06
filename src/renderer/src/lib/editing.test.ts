@@ -1,9 +1,14 @@
 import { describe, it, expect } from 'vitest'
+import { defaultSubtitleText } from '../types'
 import {
+  alignSplitTimes,
   computeCrossfade,
   computeTrim,
+  cutSpanAllTracks,
   rippleShift,
+  mergeRemovedRanges,
   rippleShiftMarkers,
+  shiftTimeForRanges,
   snapMove,
   snapTime,
   splitClipAt,
@@ -35,6 +40,10 @@ describe('snapMove', () => {
   })
   it('returns raw start when nothing is close', () => {
     expect(snapMove(2.5, 2, [5], PX)).toBe(2.5)
+  })
+  it('prefers a real start snap over float noise on the (unsnapped) end edge', () => {
+    // 0.1 + 0.2 - 0.2 !== 0.1 in floating point; that must not count as an end snap.
+    expect(snapMove(0.1, 0.2, [0.12], PX)).toBe(0.12)
   })
 })
 
@@ -124,6 +133,51 @@ describe('splitClipAt', () => {
     expect(r.right.fadeInSec).toBe(0)
     expect(r.right.fadeOutSec).toBeCloseTo(3) // min(3, rightDur=3)
   })
+  it('rebases karaoke word timings onto the right piece, keeping every word', () => {
+    const text = {
+      ...defaultSubtitleText('one two three'),
+      words: [
+        { text: 'one', startSec: 0, endSec: 1 },
+        { text: 'two', startSec: 1, endSec: 2 },
+        { text: 'three', startSec: 2.5, endSec: 3.5 }
+      ]
+    }
+    const r = splitClipAt({ ...clip, text }, 3.5)! // offset 1.5
+    expect(r.left.text).toBe(text) // left keeps its origin: untouched
+    expect(r.right.text!.content).toBe('one two three')
+    // All three words survive (the renderer pairs them with the text by position).
+    expect(r.right.text!.words!.map((w) => [w.text, w.startSec, w.endSec])).toEqual([
+      ['one', -1.5, -0.5],
+      ['two', -0.5, 0.5],
+      ['three', 1, 2]
+    ])
+  })
+  it('adds no text to clips that have none', () => {
+    expect(splitClipAt(clip, 3)!.right).not.toHaveProperty('text')
+  })
+})
+
+describe('alignSplitTimes', () => {
+  const clip = { startSec: 2, durationSec: 4 } // spans [2, 6)
+
+  it('snaps each time to the nearest frame boundary and sorts', () => {
+    expect(alignSplitTimes(clip, [4.51, 3.01], 25)).toEqual([3, 4.52]) // 75.25 -> 75, 112.75 -> 113 frames
+    expect(alignSplitTimes(clip, [3.02], 30)).toEqual([91 / 30]) // 90.6 frames: nearest, not truncated
+  })
+  it('drops times that would leave a sliver at either clip edge', () => {
+    expect(alignSplitTimes(clip, [2.05, 5.95], 30)).toEqual([])
+    expect(alignSplitTimes(clip, [2 + MIN_CLIP_SEC, 6 - MIN_CLIP_SEC], 30)).toEqual([2.1, 5.9])
+  })
+  it('drops a time too close to the previous kept one', () => {
+    expect(alignSplitTimes(clip, [3, 3.04, 3.2], 30)).toEqual([3, 3.2])
+  })
+  it('never leaves a piece under two frames at a low frame rate', () => {
+    // At 10 fps MIN_CLIP_SEC is a single frame; two frames (0.2s) is the floor.
+    expect(alignSplitTimes(clip, [2.1, 3, 3.1, 5.8], 10)).toEqual([3, 5.8])
+  })
+  it('ignores non-finite times and falls back to 30 fps', () => {
+    expect(alignSplitTimes(clip, [NaN, Infinity, 3], 0)).toEqual([3])
+  })
 })
 
 describe('rippleShift', () => {
@@ -147,20 +201,48 @@ describe('rippleShift', () => {
 })
 
 describe('rippleShiftMarkers', () => {
-  it('shifts point markers at/after the removed start', () => {
-    const markers = [{ timeSec: 2 }, { timeSec: 5 }, { timeSec: 10 }]
+  it('shifts point markers at/after the removed end; one at the start stays put', () => {
+    const markers = [{ timeSec: 2 }, { timeSec: 5 }, { timeSec: 8 }, { timeSec: 10 }]
     const r = rippleShiftMarkers(markers, 5, 3)
-    expect(r.map((m) => m.timeSec)).toEqual([2, 2, 7])
+    expect(r.map((m) => m.timeSec)).toEqual([2, 5, 5, 7])
+  })
+  it('collapses a marker inside the removed range onto the range start (not before it)', () => {
+    const r = rippleShiftMarkers([{ timeSec: 6.5 }], 5, 3)
+    expect(r[0].timeSec).toBe(5)
   })
   it('shifts both endpoints of a region marker', () => {
     const markers = [{ timeSec: 6, endSec: 9 }]
     const r = rippleShiftMarkers(markers, 5, 3)
-    expect(r[0]).toEqual({ timeSec: 3, endSec: 6 })
+    expect(r[0]).toEqual({ timeSec: 5, endSec: 6 })
   })
   it('leaves markers strictly before the removed range untouched', () => {
     const markers = [{ timeSec: 1, endSec: 4 }]
     const r = rippleShiftMarkers(markers, 5, 3)
     expect(r[0]).toEqual({ timeSec: 1, endSec: 4 })
+  })
+})
+
+describe('mergeRemovedRanges / shiftTimeForRanges', () => {
+  it('unions overlapping and touching ranges into sorted spans', () => {
+    const merged = mergeRemovedRanges([
+      { startSec: 10, durationSec: 2 },
+      { startSec: 0, durationSec: 5 },
+      { startSec: 3, durationSec: 4 }, // overlaps the first
+      { startSec: 12, durationSec: 1 } // touches [10,12)
+    ])
+    expect(merged).toEqual([
+      { startSec: 0, durationSec: 7 },
+      { startSec: 10, durationSec: 3 }
+    ])
+  })
+  it('removes parallel (cross-track) deletions from the timeline only once', () => {
+    const merged = mergeRemovedRanges([
+      { startSec: 5, durationSec: 5 },
+      { startSec: 5, durationSec: 5 }
+    ])
+    expect(shiftTimeForRanges(12, merged)).toBe(7)
+    expect(shiftTimeForRanges(7, merged)).toBe(5)
+    expect(shiftTimeForRanges(3, merged)).toBe(3)
   })
 })
 
@@ -179,5 +261,36 @@ describe('computeCrossfade', () => {
     const r = computeCrossfade({ startSec: 0, durationSec: 1 }, { startSec: 0.4, durationSec: 5 })
     // existing overlap 0.6, but clamp to e duration 1 -> stays 0.6
     expect(r.overlap).toBeCloseTo(0.6)
+  })
+})
+
+describe('cutSpanAllTracks', () => {
+  let n = 0
+  const id = (): string => `n${++n}`
+  const v = { id: 'v', trackId: 'V1', startSec: 0, durationSec: 10, inSec: 0 }
+  const a = { id: 'a', trackId: 'A1', startSec: 0, durationSec: 10, inSec: 0 }
+  const t = { id: 't', trackId: 'S', startSec: 4, durationSec: 2, inSec: 0 }
+  const after = { id: 'x', trackId: 'A1', startSec: 12, durationSec: 2, inSec: 0 }
+
+  it('removes the span from every track and closes the gap on all of them', () => {
+    const out = cutSpanAllTracks([v, a, t, after], 3, 5, id)
+    const byTrack = (tr: string) => out.filter((c) => c.trackId === tr).sort((p, q) => p.startSec - q.startSec)
+    // camera and mic: same cut, still in sync
+    for (const tr of ['V1', 'A1']) {
+      const [l, r] = byTrack(tr)
+      expect(l).toMatchObject({ startSec: 0, durationSec: 3, inSec: 0 })
+      expect(r).toMatchObject({ startSec: 3, durationSec: 5, inSec: 5 })
+    }
+    // a subtitle straddling the span keeps only its part after the cut
+    expect(byTrack('S')).toEqual([expect.objectContaining({ id: 't', startSec: 3, durationSec: 1 })])
+    // a later clip moves left by the span length
+    expect(out.find((c) => c.id === 'x')!.startSec).toBe(10)
+  })
+
+  it('keeps ids stable for the left piece and handles edges', () => {
+    const out = cutSpanAllTracks([v], 0, 2, id)
+    expect(out).toEqual([expect.objectContaining({ id: 'v', startSec: 0, durationSec: 8, inSec: 2 })])
+    expect(cutSpanAllTracks([v], 9.99995, 12, id)).toEqual([v]) // span starts at the clip's end
+    expect(cutSpanAllTracks([v], 2, 2, id)).toEqual([v]) // empty span: no-op
   })
 })

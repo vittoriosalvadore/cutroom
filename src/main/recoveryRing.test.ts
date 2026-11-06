@@ -88,4 +88,11 @@ describe('recoveryRing', () => {
     const found = await findNewestValid(TMP, (raw) => (raw === 'good' ? raw : null))
     expect(found).toBe('good')
   })
+
+  it('leaves no temp files behind', async () => {
+    await writeRing(TMP, 'one')
+    await writeRing(TMP, 'two')
+    const { readdir } = await import('fs/promises')
+    expect((await readdir(TMP)).filter((f) => f.endsWith('.tmp'))).toEqual([])
+  })
 })

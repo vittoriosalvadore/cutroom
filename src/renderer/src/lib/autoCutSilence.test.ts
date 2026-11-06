@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { rangesToTimeline, totalRemovedSec, type SilenceCutRange } from './autoCutSilence'
+import { rangesToTimeline, speechSpans, subtractRanges, totalRemovedSec, type SilenceCutRange } from './autoCutSilence'
 
 describe('rangesToTimeline', () => {
   const clip = { startSec: 10, inSec: 0, speed: 1 }
@@ -58,3 +58,26 @@ describe('totalRemovedSec', () => {
   })
 })
 
+
+describe('multi-track silence helpers', () => {
+  it('subtracts speech from candidate cuts and drops slivers', () => {
+    const base = [{ startSec: 1, endSec: 3 }, { startSec: 5, endSec: 6 }]
+    const speech = [{ startSec: 1.5, endSec: 2 }, { startSec: 5.8, endSec: 7 }]
+    expect(subtractRanges(base, speech, 0.4)).toEqual([
+      { startSec: 1, endSec: 1.5 },
+      { startSec: 2, endSec: 3 },
+      { startSec: 5, endSec: 5.8 }
+    ])
+    expect(subtractRanges(base, speech, 0.6)).toEqual([
+      { startSec: 2, endSec: 3 },
+      { startSec: 5, endSec: 5.8 }
+    ])
+  })
+
+  it('speech is a clip span minus its silences', () => {
+    expect(speechSpans({ startSec: 10, durationSec: 5 }, [{ startSec: 11, endSec: 12 }])).toEqual([
+      { startSec: 10, endSec: 11 },
+      { startSec: 12, endSec: 15 }
+    ])
+  })
+})

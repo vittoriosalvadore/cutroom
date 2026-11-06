@@ -1,8 +1,10 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { useEditor } from './store'
 import { resolveDuck } from './selectors'
 import { defaultTrackGate } from '../types'
-import type { Project, Track, TrackDuck } from '../types'
+import { evalKeyframes } from '../lib/keyframes'
+import type { Clip, Project, Track, TrackDuck } from '../types'
+import { activeWordIndex } from '../lib/karaoke'
 
 function makeProject(): Project {
   return {
@@ -253,6 +255,38 @@ describe('transform & keyframes', () => {
     expect(last.startSec + last.durationSec).toBeCloseTo(13) // was 15, minus 2s removed
   })
 
+  it('applySilenceCutsAllTracks cuts every track in sync, in one undo step', () => {
+    // add a mic clip on an audio track under c1..c2: [0,10)
+    const audio = { id: 'a1', kind: 'audio' as const, name: 'A1', height: 52, muted: false, hidden: false }
+    useEditor.setState((s) => ({
+      project: {
+        ...s.project,
+        tracks: [...s.project.tracks, audio],
+        clips: { ...s.project.clips, mic: { id: 'mic', trackId: audio.id, mediaId: 'm1', startSec: 0, durationSec: 10, inSec: 0 } }
+      },
+      past: []
+    }))
+    useEditor.getState().addMarker(12)
+    useEditor.setState({ past: [] })
+    useEditor.getState().applySilenceCutsAllTracks([
+      { startSec: 1, endSec: 2 },
+      { startSec: 7, endSec: 8 }
+    ])
+    const clips = Object.values(useEditor.getState().project.clips)
+    const end = (tr: string): number => Math.max(...clips.filter((c) => c.trackId === tr).map((c) => c.startSec + c.durationSec))
+    expect(end('v1')).toBeCloseTo(13) // video: 15 - 2
+    expect(end(audio.id)).toBeCloseTo(8) // mic: 10 - 2, same cuts -> still in sync
+    // the mic piece after the first cut reads source 2s at timeline 1s, like the video
+    const micAt1 = clips.find((c) => c.trackId === audio.id && Math.abs(c.startSec - 1) < 1e-6)!
+    const vidAt1 = clips.find((c) => c.trackId === 'v1' && Math.abs(c.startSec - 1) < 1e-6)!
+    expect(micAt1.inSec).toBeCloseTo(2)
+    expect(vidAt1.inSec).toBeCloseTo(2)
+    expect(useEditor.getState().project.markers![0].timeSec).toBeCloseTo(10)
+    expect(useEditor.getState().past.length).toBe(1)
+    useEditor.getState().undo()
+    expect(useEditor.getState().project.clips.mic.durationSec).toBe(10)
+  })
+
   it('applySilenceCuts is a single undo step regardless of range count', () => {
     useEditor.getState().applySilenceCuts('c1', [
       { startSec: 1, endSec: 2 },
@@ -402,5 +436,516 @@ describe('markers', () => {
     expect(useEditor.getState().project.markers!.length).toBe(0)
     useEditor.getState().undo()
     expect(useEditor.getState().project.markers!.length).toBe(1)
+  })
+})
+
+describe('head-trim drag (applyTrim with origin)', () => {
+  it('derives keyframes/fades from the drag-start clip, so trimming in and back out is lossless', () => {
+    const st = useEditor.getState()
+    st.setKeyframe('c1', 'scale', 0, 1)
+    st.setKeyframe('c1', 'scale', 4, 5)
+    st.updateAudio('c1', { fadeInSec: 2, fadeOutSec: 2 })
+    const origin = useEditor.getState().project.clips.c1
+    // Simulated pointer moves: drag the head in to 4s (length 1s), then back to 0.
+    st.applyTrim('c1', { startSec: 2, durationSec: 3, inSec: 2 }, origin)
+    st.applyTrim('c1', { startSec: 4, durationSec: 1, inSec: 4 }, origin)
+    st.applyTrim('c1', { startSec: 0, durationSec: 5, inSec: 0 }, origin)
+    const c1 = useEditor.getState().project.clips.c1
+    expect(c1.keyframes!.scale!.map((k) => [k.t, k.v])).toEqual([
+      [0, 1],
+      [4, 5]
+    ])
+    expect(c1.fadeInSec).toBe(2)
+    expect(c1.fadeOutSec).toBe(2)
+  })
+
+  it('without origin still rebases off the current clip (2-arg behaviour)', () => {
+    const st = useEditor.getState()
+    st.setKeyframe('c1', 'scale', 4, 5)
+    st.applyTrim('c1', { startSec: 1, durationSec: 4, inSec: 1 })
+    expect(useEditor.getState().project.clips.c1.keyframes!.scale!.at(-1)!.t).toBe(3)
+  })
+})
+
+describe('dirty tracking', () => {
+  it('loadProject marks a normal open clean and a recovered project dirty', () => {
+    const st = useEditor.getState()
+    st.loadProject(makeProject(), '/x.cutroom')
+    expect(useEditor.getState().project).toBe(useEditor.getState().savedProject)
+    st.loadProject(makeProject(), '/x.cutroom', { dirty: true })
+    expect(useEditor.getState().project).not.toBe(useEditor.getState().savedProject)
+  })
+
+  it('undo back to the saved state reads clean again', () => {
+    const st = useEditor.getState()
+    st.loadProject(makeProject(), null)
+    st.removeClip('c2')
+    expect(useEditor.getState().project).not.toBe(useEditor.getState().savedProject)
+    st.undo()
+    expect(useEditor.getState().project).toBe(useEditor.getState().savedProject)
+    st.redo()
+    st.undo()
+    expect(useEditor.getState().project).toBe(useEditor.getState().savedProject)
+  })
+
+  it('setMediaInfo with already-known values leaves the project untouched', () => {
+    const st = useEditor.getState()
+    st.loadProject(makeProject(), null)
+    st.setMediaInfo('m1', { durationSec: 100 })
+    st.setMediaInfo('m1', { durationSec: 100, width: undefined })
+    expect(useEditor.getState().project).toBe(useEditor.getState().savedProject)
+    st.setMediaInfo('m1', { width: 1280 })
+    expect(useEditor.getState().project.media.m1.width).toBe(1280)
+  })
+
+  it('markSaved marks the captured (written) project, not later edits', () => {
+    const clearRecoveryRing = vi.fn()
+    vi.stubGlobal('window', { cutroom: { clearRecoveryRing } })
+    try {
+      const written = useEditor.getState().project
+      useEditor.getState().removeClip('c3') // edit lands while the save is in flight
+      useEditor.getState().markSaved('/x.cutroom', written)
+      const s = useEditor.getState()
+      expect(s.savedProject).toBe(written)
+      expect(s.project).not.toBe(s.savedProject) // the later edit is still unsaved
+      expect(clearRecoveryRing).not.toHaveBeenCalled()
+      useEditor.getState().markSaved('/x.cutroom')
+      expect(useEditor.getState().savedProject).toBe(useEditor.getState().project)
+      expect(clearRecoveryRing).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe('setMediaInfo placeholder extension', () => {
+  it('extends a 5s pre-probe clip to the real duration but stops at the next clip', () => {
+    const p = makeProject()
+    p.media.m2 = { id: 'm2', name: 'b.wav', path: '/b.wav', kind: 'audio', durationSec: 0 }
+    p.tracks.push({ id: 'a1', kind: 'audio', name: 'A1', height: 52, muted: false, hidden: false })
+    p.clips = {
+      a: { id: 'a', trackId: 'a1', mediaId: 'm2', startSec: 0, durationSec: 5, inSec: 0 },
+      b: { id: 'b', trackId: 'a1', mediaId: 'm2', startSec: 8, durationSec: 5, inSec: 0 },
+      other: { id: 'other', trackId: 'v1', mediaId: 'm1', startSec: 6, durationSec: 1, inSec: 0 }
+    }
+    useEditor.setState({ project: p })
+    useEditor.getState().setMediaInfo('m2', { durationSec: 30 })
+    const clips = useEditor.getState().project.clips
+    expect(clips.a.durationSec).toBe(8) // capped at b's start (other lanes don't count)
+    expect(clips.b.durationSec).toBe(30) // nothing after it on the lane
+  })
+})
+
+describe('ripple markers across tracks', () => {
+  it('rippleDeleteSelected removes parallel cross-track time once and collapses inner markers', () => {
+    const p = makeProject()
+    p.tracks.push({ id: 'a1', kind: 'audio', name: 'A1', height: 52, muted: false, hidden: false })
+    p.clips.a = { id: 'a', trackId: 'a1', mediaId: 'm1', startSec: 5, durationSec: 5, inSec: 0 }
+    p.markers = [
+      { id: 'in', timeSec: 7 },
+      { id: 'after', timeSec: 12 }
+    ]
+    useEditor.setState({ project: p })
+    const st = useEditor.getState()
+    st.setClipSelection(['c2', 'a']) // [5,10) on both V1 and A1
+    st.rippleDeleteSelected()
+    const m = Object.fromEntries(useEditor.getState().project.markers!.map((x) => [x.id, x.timeSec]))
+    expect(m.after).toBe(7) // 12 - 5, not 12 - 10
+    expect(m.in).toBe(5) // inside the removed span -> its start
+  })
+})
+
+describe('auto-cut selection', () => {
+  it('prunes a selection that pointed at a clip the cut deleted', () => {
+    const st = useEditor.getState()
+    st.selectClip('c2')
+    // A range starting exactly at c2's head deletes the c2 id itself.
+    st.applySilenceCuts('c2', [{ startSec: 5, endSec: 6 }])
+    const s = useEditor.getState()
+    expect(s.project.clips.c2).toBeUndefined()
+    expect(s.selectedClipId).toBeNull()
+    expect(s.selectedClipIds.size).toBe(0)
+  })
+
+  it('cutSilenceRange also prunes the selection', () => {
+    const st = useEditor.getState()
+    st.setClipSelection(['c1', 'c2'])
+    st.cutSilenceRange('c2', { startSec: 5, endSec: 6 })
+    const s = useEditor.getState()
+    expect([...s.selectedClipIds]).toEqual(['c1'])
+    expect(s.selectedClipId).toBe('c1')
+  })
+})
+
+describe('scene-detect batch split', () => {
+  /** c1's pieces (c1 spans [0,5) on v1), in timeline order. */
+  const pieces = (): Clip[] =>
+    Object.values(useEditor.getState().project.clips)
+      .filter((c) => c.startSec < 5)
+      .sort((a, b) => a.startSec - b.startSec)
+
+  it('splitClipAtTimes splits into N+1 pieces, nothing lost and nothing rippled', () => {
+    useEditor.getState().splitClipAtTimes('c1', [3, 1]) // order doesn't matter
+    expect(pieces().map((c) => [c.startSec, c.durationSec, c.inSec])).toEqual([
+      [0, 1, 0],
+      [1, 2, 1],
+      [3, 2, 3]
+    ])
+    expect(useEditor.getState().project.clips.c2.startSec).toBe(5) // a split never ripples
+    expect(useEditor.getState().project.clips.c3.startSec).toBe(10)
+  })
+
+  it('rebases each piece in-point through the clip speed', () => {
+    useEditor.getState().setSpeed('c1', 2)
+    useEditor.getState().splitClipAtTimes('c1', [1, 3])
+    expect(pieces().map((c) => c.inSec)).toEqual([0, 2, 6]) // 1s and 2s of timeline at 2x
+    expect(pieces().every((c) => c.speed === 2)).toBe(true)
+  })
+
+  it('is a single undo step regardless of split count', () => {
+    useEditor.getState().splitClipAtTimes('c1', [1, 2, 3, 4])
+    expect(pieces()).toHaveLength(5)
+    expect(useEditor.getState().past.length).toBe(1)
+    useEditor.getState().undo()
+    expect(useEditor.getState().project.clips.c1).toEqual({
+      id: 'c1',
+      trackId: 'v1',
+      mediaId: 'm1',
+      startSec: 0,
+      durationSec: 5,
+      inSec: 0
+    })
+    expect(Object.keys(useEditor.getState().project.clips)).toHaveLength(3) // back to c1/c2/c3
+  })
+
+  it('snaps to the project frame grid and never leaves a sliver piece', () => {
+    // 1.012s -> frame 30, 2.02s -> frame 61 (fps 30); 2.05 is too close to that
+    // cut, 0.03 / 4.99 hug the clip edges.
+    useEditor.getState().splitClipAtTimes('c1', [0.03, 1.012, 2.02, 2.05, 4.99])
+    expect(pieces().map((c) => c.startSec)).toEqual([0, 1, 61 / 30])
+  })
+
+  it('is a no-op (no history) when no time lands usefully inside the clip', () => {
+    expect(() => useEditor.getState().splitClipAtTimes('c1', [20, 0.02, 4.99])).not.toThrow()
+    expect(useEditor.getState().past.length).toBe(0)
+    expect(useEditor.getState().project.clips.c1.durationSec).toBe(5)
+  })
+
+  it('keeps keyframes continuous across every piece and fades on the outer ones', () => {
+    useEditor.setState((st) => ({
+      project: {
+        ...st.project,
+        clips: {
+          ...st.project.clips,
+          c1: {
+            ...st.project.clips.c1,
+            fadeInSec: 0.5,
+            fadeOutSec: 0.5,
+            keyframes: {
+              scale: [
+                { t: 0, v: 1, ease: 'linear' },
+                { t: 4, v: 5, ease: 'linear' }
+              ]
+            }
+          }
+        }
+      }
+    }))
+    const original = useEditor.getState().project.clips.c1.keyframes!.scale!
+    useEditor.getState().splitClipAtTimes('c1', [1, 3])
+    const ps = pieces()
+    expect(ps.map((c) => [c.fadeInSec, c.fadeOutSec])).toEqual([
+      [0.5, 0],
+      [0, 0],
+      [0, 0.5]
+    ])
+    // Each piece animates exactly as the unsplit clip did at the same timeline time.
+    for (const t of [0, 0.5, 1, 2.2, 3, 3.9, 4.5]) {
+      const p = ps.find((c) => t >= c.startSec && t < c.startSec + c.durationSec)!
+      expect(evalKeyframes(p.keyframes!.scale!, t - p.startSec)).toBeCloseTo(evalKeyframes(original, t))
+    }
+  })
+
+  it('keeps the selection on the head piece, which keeps the clip id', () => {
+    useEditor.getState().selectClip('c1')
+    useEditor.getState().splitClipAtTimes('c1', [1, 3])
+    const s = useEditor.getState()
+    expect(s.selectedClipId).toBe('c1')
+    expect([...s.selectedClipIds]).toEqual(['c1'])
+    expect(s.project.clips.c1.durationSec).toBe(1)
+  })
+
+  it('with markers, also drops a marker at each split in the same undo step', () => {
+    useEditor.getState().splitClipAtTimes('c1', [1, 3], { markers: true })
+    expect((useEditor.getState().project.markers ?? []).map((m) => m.timeSec)).toEqual([1, 3])
+    expect(useEditor.getState().past.length).toBe(1)
+    useEditor.getState().undo()
+    expect(useEditor.getState().project.markers ?? []).toEqual([])
+    expect(pieces()).toHaveLength(1)
+  })
+
+  it('addMarkers marks every time in one undo step, skipping times already marked', () => {
+    useEditor.getState().addMarker(3)
+    useEditor.getState().addMarkers([3.01, 1, 4])
+    expect(useEditor.getState().project.markers!.map((m) => m.timeSec)).toEqual([1, 3, 4])
+    expect(useEditor.getState().past.length).toBe(2) // addMarker + one for the whole batch
+    useEditor.getState().addMarkers([1, 4]) // all already marked: no-op, no history
+    expect(useEditor.getState().past.length).toBe(2)
+    expect(Object.keys(useEditor.getState().project.clips)).toHaveLength(3) // markers only: nothing split
+  })
+})
+
+describe('streamed subtitle import', () => {
+  it('records one undo step for the first batch and none for follow-ups', () => {
+    const st = useEditor.getState()
+    st.importSubtitles([{ startSec: 0, endSec: 1, text: 'a' }], { recordHistory: true })
+    for (let i = 1; i < 150; i++) st.importSubtitles([{ startSec: i, endSec: i + 1, text: `c${i}` }], { recordHistory: false })
+    expect(useEditor.getState().past.length).toBe(1)
+    useEditor.getState().undo()
+    expect(Object.values(useEditor.getState().project.clips).some((c) => c.role === 'subtitle')).toBe(false)
+  })
+})
+
+describe('karaoke subtitles (word timing through edits)', () => {
+  // One card at 10..14 s whose words are sung at 10, 11 and 12.5 s on the timeline.
+  const words = [
+    { text: 'one', startSec: 0, endSec: 1 },
+    { text: 'two', startSec: 1, endSec: 2 },
+    { text: 'three', startSec: 2.5, endSec: 3.5 }
+  ]
+  const addKaraoke = (): string => {
+    useEditor.getState().importSubtitles([{ startSec: 10, endSec: 14, text: 'one two three', words }])
+    return Object.values(useEditor.getState().project.clips).find((c) => c.role === 'subtitle')!.id
+  }
+  const subtitles = (): Clip[] => Object.values(useEditor.getState().project.clips).filter((c) => c.role === 'subtitle')
+  /** The word lit at absolute time t — whichever subtitle piece covers t. */
+  const litAt = (t: number): string | null => {
+    const clip = subtitles().find((c) => t >= c.startSec && t < c.startSec + c.durationSec)
+    const w = clip?.text?.words
+    if (!clip || !w) return null
+    const i = activeWordIndex(w, t - clip.startSec)
+    return i < 0 ? null : w[i].text
+  }
+  const SAMPLES = [10, 10.5, 10.99, 11, 11.7, 12.4, 12.5, 13, 13.9]
+
+  it('importSubtitles puts the cue words on the subtitle clip (plain cues stay plain)', () => {
+    addKaraoke()
+    useEditor.getState().importSubtitles([{ startSec: 20, endSec: 21, text: 'plain' }])
+    const [k, plain] = subtitles().sort((a, b) => a.startSec - b.startSec)
+    expect(k.text!.words).toEqual(words)
+    expect(plain.text).not.toHaveProperty('words')
+  })
+
+  it('splitAtPlayhead keeps every word lit at the same moment on both halves', () => {
+    addKaraoke()
+    const before = SAMPLES.map(litAt)
+    expect(before).toEqual(['one', 'one', 'one', 'two', 'two', 'two', 'three', 'three', 'three'])
+    useEditor.getState().setPlayhead(11.7) // mid-"two"
+    useEditor.getState().splitAtPlayhead()
+    expect(subtitles()).toHaveLength(2)
+    expect(SAMPLES.map(litAt)).toEqual(before)
+    // Both halves keep the full text and all three words (paired by position).
+    for (const c of subtitles()) expect(c.text!.words!.map((w) => w.text)).toEqual(['one', 'two', 'three'])
+  })
+
+  it('a head trim rebases the words so the highlight stays on the audio', () => {
+    const id = addKaraoke()
+    const kept = SAMPLES.filter((t) => t >= 11.5)
+    const before = kept.map(litAt)
+    // computeTrim keeps inSec for text clips: only the start/duration move.
+    useEditor.getState().applyTrim(id, { startSec: 11.5, durationSec: 2.5, inSec: 0 })
+    expect(kept.map(litAt)).toEqual(before)
+    expect(litAt(11.5)).toBe('two') // the word in progress at the new head
+  })
+
+  it('a head-trim drag (with origin) in and back out restores the exact timings', () => {
+    const id = addKaraoke()
+    const origin = useEditor.getState().project.clips[id]
+    const st = useEditor.getState()
+    st.applyTrim(id, { startSec: 12, durationSec: 2, inSec: 0 }, origin)
+    st.applyTrim(id, { startSec: 9, durationSec: 5, inSec: 0 }, origin) // past the original head
+    expect(litAt(9.5)).toBeNull() // before the first word: nothing lit yet
+    expect(litAt(10)).toBe('one')
+    st.applyTrim(id, { startSec: 10, durationSec: 4, inSec: 0 }, origin)
+    expect(useEditor.getState().project.clips[id].text!.words).toEqual(words)
+  })
+
+  it('a tail trim leaves the words (and the text object) untouched', () => {
+    const id = addKaraoke()
+    const text = useEditor.getState().project.clips[id].text
+    useEditor.getState().applyTrim(id, { startSec: 10, durationSec: 3, inSec: 0 })
+    expect(useEditor.getState().project.clips[id].text).toBe(text)
+  })
+
+  it('moving the clip carries its words along', () => {
+    const id = addKaraoke()
+    useEditor.getState().moveClip(id, 20)
+    expect(useEditor.getState().project.clips[id].text!.words).toEqual(words)
+    expect([20, 21, 22.5].map(litAt)).toEqual(['one', 'two', 'three'])
+  })
+})
+
+describe('track management', () => {
+  const withTracks = (): void => {
+    const p = makeProject()
+    p.tracks = [
+      { id: 'v1', kind: 'video', name: 'V1', height: 68, muted: false, hidden: false },
+      { id: 'v2', kind: 'video', name: 'V2', height: 68, muted: false, hidden: false },
+      { id: 'a1', kind: 'audio', name: 'A1', height: 52, muted: false, hidden: false },
+      {
+        id: 'a2',
+        kind: 'audio',
+        name: 'A2',
+        height: 52,
+        muted: false,
+        hidden: false,
+        duck: { enabled: true, triggerTrackId: 'a1', thresholdDb: -30, ratio: 8, attackMs: 20, releaseMs: 250 }
+      }
+    ]
+    p.clips.c3 = { ...p.clips.c3, trackId: 'v2' }
+    p.clips.c4 = { id: 'c4', trackId: 'a1', mediaId: 'm1', startSec: 0, durationSec: 5, inSec: 0 }
+    useEditor.setState({ project: p, past: [], future: [], selectedTrackId: null })
+  }
+  const ids = (): string[] => useEditor.getState().project.tracks.map((t) => t.id)
+
+  it('addVideoTrack inserts above the topmost video track, undoably', () => {
+    useEditor.getState().addVideoTrack()
+    const tracks = useEditor.getState().project.tracks
+    expect(tracks[0].kind).toBe('video')
+    expect(tracks[0].name).toBe('V2')
+    expect(tracks[1].id).toBe('v1')
+    useEditor.getState().undo()
+    expect(ids()).toEqual(['v1'])
+  })
+
+  it('removeTrack deletes its clips, prunes selection and dangling duck triggers', () => {
+    withTracks()
+    useEditor.getState().setClipSelection(['c1', 'c3'])
+    useEditor.getState().removeTrack('v2')
+    let s = useEditor.getState()
+    expect(ids()).toEqual(['v1', 'a1', 'a2'])
+    expect(s.project.clips.c3).toBeUndefined()
+    expect([...s.selectedClipIds]).toEqual(['c1'])
+
+    useEditor.getState().selectTrack('a1')
+    useEditor.getState().removeTrack('a1')
+    s = useEditor.getState()
+    expect(s.project.clips.c4).toBeUndefined()
+    expect(s.project.tracks.find((t) => t.id === 'a2')!.duck!.triggerTrackId).toBeNull()
+    expect(s.selectedTrackId).toBeNull()
+
+    // One undo step per removal, restoring the clips and the ducker link.
+    useEditor.getState().undo()
+    s = useEditor.getState()
+    expect(s.project.clips.c4).toBeDefined()
+    expect(s.project.tracks.find((t) => t.id === 'a2')!.duck!.triggerTrackId).toBe('a1')
+    useEditor.getState().undo()
+    expect(ids()).toEqual(['v1', 'v2', 'a1', 'a2'])
+    expect(useEditor.getState().project.clips.c3.trackId).toBe('v2')
+  })
+
+  it('refuses to remove the last video (or audio) track', () => {
+    useEditor.getState().removeTrack('v1')
+    expect(ids()).toEqual(['v1'])
+    expect(useEditor.getState().past.length).toBe(0)
+  })
+
+  it('moveTrack reorders (stacking order) as one undo step; no-op records nothing', () => {
+    withTracks()
+    useEditor.getState().moveTrack('v2', 0)
+    expect(ids()).toEqual(['v2', 'v1', 'a1', 'a2'])
+    expect(useEditor.getState().past.length).toBe(1)
+    useEditor.getState().moveTrack('v2', 0)
+    expect(useEditor.getState().past.length).toBe(1)
+    useEditor.getState().undo()
+    expect(ids()).toEqual(['v1', 'v2', 'a1', 'a2'])
+    useEditor.getState().redo()
+    expect(ids()).toEqual(['v2', 'v1', 'a1', 'a2'])
+  })
+
+  it('setTrackHeight clamps and pairs with snapshot for a single undo', () => {
+    useEditor.getState().snapshot()
+    useEditor.getState().setTrackHeight('v1', 120)
+    useEditor.getState().setTrackHeight('v1', 5000)
+    expect(useEditor.getState().project.tracks[0].height).toBe(200)
+    useEditor.getState().setTrackHeight('v1', 1)
+    expect(useEditor.getState().project.tracks[0].height).toBe(36)
+    useEditor.getState().undo()
+    expect(useEditor.getState().project.tracks[0].height).toBe(68)
+  })
+
+  it('undoing an added track clears it from the track selection', () => {
+    useEditor.getState().addVideoTrack()
+    const added = useEditor.getState().project.tracks[0].id
+    useEditor.getState().selectTrack(added)
+    useEditor.getState().undo()
+    expect(useEditor.getState().selectedTrackId).toBeNull()
+  })
+})
+
+describe('shuttle transport', () => {
+  it('setShuttle plays at the rate; setPlaying (Space / K) resets it to 1×', () => {
+    const st = useEditor.getState()
+    st.setShuttle(-2)
+    expect(useEditor.getState().isPlaying).toBe(true)
+    expect(useEditor.getState().shuttleRate).toBe(-2)
+    st.setPlaying(false)
+    expect(useEditor.getState().isPlaying).toBe(false)
+    expect(useEditor.getState().shuttleRate).toBe(1)
+    st.setShuttle(4)
+    st.setPlaying(true)
+    expect(useEditor.getState().shuttleRate).toBe(1)
+  })
+})
+
+describe('RGB curves', () => {
+  const S = [
+    { x: 0, y: 0 },
+    { x: 0.25, y: 0.15 },
+    { x: 0.75, y: 0.85 },
+    { x: 1, y: 1 }
+  ]
+  const DIAG = [
+    { x: 0, y: 0 },
+    { x: 1, y: 1 }
+  ]
+
+  it('setCurvePoints stores one channel and leaves the others at identity', () => {
+    useEditor.getState().setCurvePoints('c1', 'master', S)
+    const curves = useEditor.getState().project.clips.c1.effects?.curves
+    expect(curves?.master).toEqual(S)
+    expect(curves?.r).toEqual(DIAG)
+  })
+
+  it('keeps points that merely render as identity (mid-drag), drops exact defaults', () => {
+    const onDiag = [{ x: 0, y: 0 }, { x: 0.5, y: 0.5 }, { x: 1, y: 1 }]
+    useEditor.getState().setCurvePoints('c1', 'g', onDiag)
+    expect(useEditor.getState().project.clips.c1.effects?.curves?.g).toEqual(onDiag)
+    useEditor.getState().setCurvePoints('c1', 'g', DIAG)
+    expect(useEditor.getState().project.clips.c1.effects?.curves).toBeUndefined()
+  })
+
+  it('a drag gesture (snapshot + many moves) is one undo step', () => {
+    const st = useEditor.getState()
+    st.snapshot()
+    for (let i = 1; i <= 5; i++) st.setCurvePoints('c1', 'r', [{ x: 0, y: 0 }, { x: 0.5, y: 0.5 + i * 0.05 }, { x: 1, y: 1 }])
+    expect(useEditor.getState().past).toHaveLength(1)
+    useEditor.getState().undo()
+    expect(useEditor.getState().project.clips.c1.effects?.curves).toBeUndefined()
+  })
+
+  it('resetCurves resets one channel or all', () => {
+    const st = useEditor.getState()
+    st.setCurvePoints('c1', 'master', S)
+    st.setCurvePoints('c1', 'b', S)
+    st.resetCurves('c1', 'b')
+    const curves = useEditor.getState().project.clips.c1.effects?.curves
+    expect(curves?.b).toEqual(DIAG)
+    expect(curves?.master).toEqual(S)
+    useEditor.getState().resetCurves('c1', 'master')
+    expect(useEditor.getState().project.clips.c1.effects?.curves).toBeUndefined()
+    st.setCurvePoints('c1', 'r', S)
+    useEditor.getState().resetCurves('c1')
+    expect(useEditor.getState().project.clips.c1.effects?.curves).toBeUndefined()
   })
 })

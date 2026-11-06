@@ -1,4 +1,4 @@
-import type { Track, TrackDuck } from '../types'
+import type { Track, TrackDuck, TrackReverb } from '../types'
 
 /**
  * The effective ducking config for `track`, or null when ducking cannot apply:
@@ -16,4 +16,16 @@ export function resolveDuck(track: Track, tracks: Track[]): TrackDuck | null {
   const trig = tracks.find((t) => t.id === d.triggerTrackId)
   if (!trig || trig.muted || trig.kind !== 'audio') return null
   return d
+}
+
+/**
+ * The effective reverb for `track`, or null when it cannot apply: not an audio
+ * track, disabled, or a zero mix. Shared by the preview graph (audioPool) and
+ * the export plan (exporter), like resolveDuck.
+ */
+export function resolveReverb(track: Track): TrackReverb | null {
+  if (track.kind !== 'audio') return null
+  const r = track.reverb
+  if (!r || !r.enabled || !(r.mix > 0)) return null
+  return r
 }

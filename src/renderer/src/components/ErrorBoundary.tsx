@@ -1,6 +1,7 @@
 import { Component, type ErrorInfo, type ReactNode } from 'react'
 import { useEditor } from '../state/store'
 import { serializeProject } from '../lib/projectFile'
+import { t } from '../lib/i18n'
 
 // A render crash must not lose work. On catch we flush the current project to the
 // recovery file and flag a pending recovery, then show a reload screen instead of
@@ -37,11 +38,11 @@ export default class ErrorBoundary extends Component<Props, State> {
       return (
         <div className="crash-screen">
           <div className="crash-card">
-            <h2>Something went wrong</h2>
-            <p>Your work has been saved to recovery. Reload to pick up where you left off.</p>
+            <h2>{t('Something went wrong')}</h2>
+            <p>{t('Your work has been saved to recovery. Reload to pick up where you left off.')}</p>
             <pre className="crash-detail">{this.state.error.message}</pre>
             <button className="btn primary" onClick={() => window.location.reload()}>
-              Reload
+              {t('Reload')}
             </button>
           </div>
         </div>

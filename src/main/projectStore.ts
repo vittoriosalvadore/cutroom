@@ -3,6 +3,7 @@ import { existsSync, unlinkSync, writeFileSync } from 'fs'
 import { readFile, rename, unlink, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { writeRing, findNewestValid, clearRing } from './recoveryRing'
+import { isLocalFilePath } from './paths'
 
 // ---------------------------------------------------------------------------
 // Project file IO + crash recovery (main process).
@@ -57,10 +58,28 @@ export function clearSessionLock(): void {
   }
 }
 
+let tmpCounter = 0
+
 async function writeAtomic(path: string, data: string): Promise<void> {
-  const tmp = `${path}.tmp`
-  await writeFile(tmp, data, 'utf-8')
-  await rename(tmp, path)
+  tmpCounter += 1
+  const tmp = `${path}.${process.pid}.${tmpCounter}.tmp`
+  try {
+    await writeFile(tmp, data, 'utf-8')
+    await rename(tmp, path)
+  } catch (e) {
+    await unlink(tmp).catch(() => undefined)
+    throw e
+  }
+}
+
+// Recovery writes can overlap (debounced autosave, window.onerror flush, the
+// error boundary). Run them one at a time so ring rotations never interleave.
+let recoveryQueue: Promise<unknown> = Promise.resolve()
+
+function queueRecovery<T>(task: () => Promise<T>): Promise<T> {
+  const run = recoveryQueue.then(task, task)
+  recoveryQueue = run.catch(() => undefined)
+  return run
 }
 
 export function registerProjectIpc(): void {
@@ -76,6 +95,11 @@ export function registerProjectIpc(): void {
         })
         if (r.canceled || !r.filePath) return { ok: false, canceled: true }
         filePath = r.filePath
+      }
+      // A renderer-supplied path (the project's savedPath) must be a local
+      // project file — never an arbitrary file to overwrite.
+      if (!isLocalFilePath(filePath) || !filePath.toLowerCase().endsWith('.json')) {
+        return { ok: false, error: 'Invalid project path.' }
       }
       await writeAtomic(filePath, args.json)
       return { ok: true, filePath }
@@ -106,7 +130,7 @@ export function registerProjectIpc(): void {
   // Autosave the recovery snapshot into the rotating ring (silent, no dialog).
   ipcMain.handle('project:writeRecovery', async (_e, json: string) => {
     try {
-      await writeRing(recoveryDir, json)
+      await queueRecovery(() => writeRing(recoveryDir, json))
       return true
     } catch {
       return false
@@ -124,7 +148,9 @@ export function registerProjectIpc(): void {
   // snapshot so a single bad write can't lose everything.
   ipcMain.handle('project:checkRecovery', async () => {
     try {
-      if (!recoveryDir || !existsSync(recoveryFile)) return { available: false }
+      // No early return on a missing primary: a crash between rotation steps
+      // can leave only backups, which findNewestValid below still walks.
+      if (!recoveryDir) return { available: false }
       if (!previousCrash && !existsSync(pendingFile)) return { available: false }
 
       const validate = (
@@ -167,7 +193,7 @@ export function registerProjectIpc(): void {
   ipcMain.handle('project:clearRecovery', async () => {
     try {
       if (existsSync(pendingFile)) await unlink(pendingFile)
-      if (recoveryDir) await clearRing(recoveryDir)
+      if (recoveryDir) await queueRecovery(() => clearRing(recoveryDir))
     } catch {
       /* non-fatal */
     }
@@ -181,7 +207,7 @@ export function registerProjectIpc(): void {
   ipcMain.handle('project:clearRecoveryRing', async () => {
     try {
       if (existsSync(pendingFile)) await unlink(pendingFile)
-      if (recoveryDir) await clearRing(recoveryDir)
+      if (recoveryDir) await queueRecovery(() => clearRing(recoveryDir))
     } catch {
       /* non-fatal */
     }

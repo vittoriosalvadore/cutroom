@@ -221,8 +221,8 @@ export function withTransformProp(transform: ClipTransform, prop: AnimProp, v: n
 /**
  * Partition keyframe tracks at a clip-relative `offset` (a split). The left half
  * keeps keys before the cut, the right half keeps keys after it rebased to start
- * at 0; both get a boundary key holding the value AT the cut, so neither side
- * pops. Returns trimmed maps (omit empty so the identity fast path is preserved).
+ * at 0; both get a boundary key holding the value AT the cut (with the easing
+ * of the segment it splits), so neither side pops. Returns trimmed maps (omit empty so the identity fast path is preserved).
  */
 export function splitTracksAt(
   keyframes: Partial<Record<AnimProp, Keyframe[]>>,
@@ -236,8 +236,13 @@ export function splitTracksAt(
     const valAt = evalKeyframes(track, offset)
     const lkeys = track.filter((kf) => kf.t < offset - KEY_EPS)
     const rkeys = track.filter((kf) => kf.t > offset + KEY_EPS).map((kf) => ({ ...kf, t: kf.t - offset }))
-    lkeys.push({ t: offset, v: valAt, ease: 'smooth' })
-    rkeys.unshift({ t: 0, v: valAt, ease: 'smooth' })
+    // Boundary keys inherit the easing of the segment the cut falls in (the last
+    // key at/before it), so a hold or linear animation stays hold/linear rather
+    // than turning into a smooth ramp on the right-hand piece.
+    let seg = track[0]
+    for (const kf of track) if (kf.t <= offset + KEY_EPS) seg = kf
+    lkeys.push({ t: offset, v: valAt, ease: seg.ease })
+    rkeys.unshift({ t: 0, v: valAt, ease: seg.ease })
     left[key] = lkeys
     right[key] = rkeys
   }

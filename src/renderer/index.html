@@ -5,9 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Cutroom</title>
     <!--
-      NOTE: A strict Content-Security-Policy is intentionally omitted during
-      development because Vite's HMR injects inline scripts. It will be added
-      before the first packaged build (see roadmap: "Hardening").
+      The Content-Security-Policy is injected at build time (cspPlugin in
+      electron.vite.config.ts); dev omits it because Vite's HMR injects inline
+      scripts.
     -->
   </head>
   <body>

@@ -1,5 +1,6 @@
-import type { AnimProp, Keyframe } from '../types'
+import type { AnimProp, Keyframe, TextProps } from '../types'
 import { splitTracksAt } from './keyframes'
+import { shiftWords } from './karaoke'
 
 // ---------------------------------------------------------------------------
 // Pure timeline-editing math: snapping and clip trimming. No DOM/state deps, so
@@ -16,6 +17,20 @@ export interface ClipBounds {
 /** A clip can never be trimmed shorter than this. */
 export const MIN_CLIP_SEC = 0.1
 
+/** Nearest candidate within `thresholdSec`, or null when nothing is close enough. */
+function nearestCandidate(value: number, candidates: number[], thresholdSec: number): number | null {
+  let best: number | null = null
+  let bestDist = thresholdSec
+  for (const c of candidates) {
+    const d = Math.abs(c - value)
+    if (d <= bestDist) {
+      bestDist = d
+      best = c
+    }
+  }
+  return best
+}
+
 /**
  * Snap a time to the nearest candidate within `thresholdPx` (converted to
  * seconds via the zoom). Returns the snapped time, or the input if nothing is
@@ -27,19 +42,7 @@ export function snapTime(
   pxPerSec: number,
   thresholdPx = 8
 ): number {
-  const thresholdSec = thresholdPx / pxPerSec
-  let best = value
-  let bestDist = thresholdSec
-  let found = false
-  for (const c of candidates) {
-    const d = Math.abs(c - value)
-    if (d <= bestDist) {
-      bestDist = d
-      best = c
-      found = true
-    }
-  }
-  return found ? best : value
+  return nearestCandidate(value, candidates, thresholdPx / pxPerSec) ?? value
 }
 
 /**
@@ -54,15 +57,18 @@ export function snapMove(
   pxPerSec: number,
   thresholdPx = 8
 ): number {
-  const snapStart = snapTime(rawStart, candidates, pxPerSec, thresholdPx)
-  const snapByEnd = snapTime(rawStart + durationSec, candidates, pxPerSec, thresholdPx) - durationSec
-  const startMoved = snapStart !== rawStart
-  const endMoved = snapByEnd !== rawStart
-  if (startMoved && endMoved) {
+  const thresholdSec = thresholdPx / pxPerSec
+  // Track whether each edge actually snapped explicitly: comparing the result
+  // against rawStart would misfire on float noise ((a + d) - d !== a).
+  const startHit = nearestCandidate(rawStart, candidates, thresholdSec)
+  const endHit = nearestCandidate(rawStart + durationSec, candidates, thresholdSec)
+  const snapStart = startHit ?? rawStart
+  const snapByEnd = endHit != null ? endHit - durationSec : rawStart
+  if (startHit != null && endHit != null) {
     return Math.abs(snapStart - rawStart) <= Math.abs(snapByEnd - rawStart) ? snapStart : snapByEnd
   }
-  if (startMoved) return snapStart
-  if (endMoved) return snapByEnd
+  if (startHit != null) return snapStart
+  if (endHit != null) return snapByEnd
   return rawStart
 }
 
@@ -142,6 +148,7 @@ export interface SplittableClip {
   fadeInSec?: number
   fadeOutSec?: number
   keyframes?: Partial<Record<AnimProp, Keyframe[]>>
+  text?: TextProps
 }
 
 export interface SplitResult<T> {
@@ -151,11 +158,12 @@ export interface SplitResult<T> {
 
 /**
  * Split one clip at absolute timeline time `atSec`. Returns undefined if atSec
- * doesn't actually fall strictly inside the clip. Mirrors the inline split
- * logic `splitAtPlayhead` (store.ts) already applies at the playhead, factored
- * out so auto-cut-silence can call it many times per job. The two returned
- * pieces carry no id/trackId — the caller assigns those (existing id for
- * `left`, a fresh id for `right`), matching how splitAtPlayhead does it today.
+ * doesn't actually fall strictly inside the clip. The one split used by both
+ * `splitAtPlayhead` (store.ts) and auto-cut-silence, which calls it many times
+ * per job. The two returned pieces keep the original's id/trackId — the
+ * caller re-ids `right` (existing id for `left`, a fresh id for `right`).
+ * A karaoke clip's word timings rebase onto the right piece's start like its
+ * keyframes do, so both halves keep highlighting in sync with the audio.
  */
 export function splitClipAt<T extends SplittableClip>(clip: T, atSec: number): SplitResult<T> | undefined {
   if (atSec <= clip.startSec + 1e-4 || atSec >= clip.startSec + clip.durationSec - 1e-4) return undefined
@@ -177,9 +185,40 @@ export function splitClipAt<T extends SplittableClip>(clip: T, atSec: number): S
       inSec: clip.inSec + offset * (clip.speed ?? 1),
       fadeInSec: 0,
       fadeOutSec: Math.min(clip.fadeOutSec ?? 0, rightDur),
-      keyframes: kf?.right
+      keyframes: kf?.right,
+      ...(clip.text?.words ? { text: { ...clip.text, words: shiftWords(clip.text.words, -offset) } } : {})
     }
   }
+}
+
+/**
+ * Clean a batch of split times for one clip (e.g. detected scene cuts): each
+ * snaps to the nearest frame boundary of `fps`, then any time that would leave
+ * a piece shorter than MIN_CLIP_SEC (and never under two frames) — against
+ * either clip edge or the previous kept time — is dropped, so a batch split
+ * can't shave sliver clips off. Returns the kept times, ascending.
+ */
+export function alignSplitTimes(
+  clip: { startSec: number; durationSec: number },
+  atSecs: number[],
+  fps: number
+): number[] {
+  const f = fps > 0 ? fps : 30
+  const minPiece = Math.max(MIN_CLIP_SEC, 2 / f) - 1e-6
+  const end = clip.startSec + clip.durationSec
+  const snapped = atSecs
+    .filter((t) => Number.isFinite(t))
+    .map((t) => Math.round(t * f) / f)
+    .sort((a, b) => a - b)
+  const kept: number[] = []
+  let prev = clip.startSec
+  for (const t of snapped) {
+    if (t - prev >= minPiece && end - t >= minPiece) {
+      kept.push(t)
+      prev = t
+    }
+  }
+  return kept
 }
 
 /** Minimal ripple-delete input. */
@@ -215,7 +254,9 @@ export interface RippleMarker {
 
 /**
  * Shift markers/regions the same way rippleShift shifts clips: any time at/
- * after removedStartSec moves left by removedDurationSec. Ripple-delete today
+ * after the removed range's END moves left by removedDurationSec; a time
+ * INSIDE the removed range collapses to its start (the footage it pointed at is
+ * gone, so the nearest surviving spot is the cut point). Ripple-delete today
  * (store.ts) only shifts clips, never markers — silently desyncing marker
  * positions whenever something is ripple-deleted. Auto-cut-silence calls
  * ripple-delete far more densely than today's manual usage, so this fixes it.
@@ -225,6 +266,96 @@ export function rippleShiftMarkers<T extends RippleMarker>(
   removedStartSec: number,
   removedDurationSec: number
 ): T[] {
-  const shift = (t: number): number => (t >= removedStartSec - 1e-6 ? Math.max(0, t - removedDurationSec) : t)
+  const shift = (t: number): number => shiftTimeForRanges(t, [{ startSec: removedStartSec, durationSec: removedDurationSec }])
   return markers.map((m) => ({ ...m, timeSec: shift(m.timeSec), endSec: m.endSec != null ? shift(m.endSec) : m.endSec }))
+}
+
+/** A removed span of timeline: [startSec, startSec + durationSec). */
+export interface RemovedRange {
+  startSec: number
+  durationSec: number
+}
+
+/**
+ * Union possibly-overlapping removed ranges (e.g. clips deleted from several
+ * tracks at once) into sorted, non-overlapping spans. Markers live on the
+ * shared timeline, not a lane, so two clips deleted in parallel on V1 and A1
+ * remove that time ONCE, not twice.
+ */
+export function mergeRemovedRanges(ranges: RemovedRange[]): RemovedRange[] {
+  const sorted = ranges.filter((r) => r.durationSec > 0).sort((a, b) => a.startSec - b.startSec)
+  const out: RemovedRange[] = []
+  for (const r of sorted) {
+    const last = out[out.length - 1]
+    const end = r.startSec + r.durationSec
+    if (last && r.startSec <= last.startSec + last.durationSec + 1e-6) {
+      last.durationSec = Math.max(last.durationSec, end - last.startSec)
+    } else {
+      out.push({ startSec: r.startSec, durationSec: r.durationSec })
+    }
+  }
+  return out
+}
+
+/**
+ * Where time `t` lands after removing every range in `ranges` (which must be
+ * non-overlapping — see mergeRemovedRanges). Evaluated against the ORIGINAL
+ * positions in one pass, so the result is independent of range order: each
+ * range wholly before `t` pulls it left by its duration; a range containing `t`
+ * collapses it onto that range's start.
+ */
+export function shiftTimeForRanges(t: number, ranges: RemovedRange[]): number {
+  let shift = 0
+  for (const r of ranges) {
+    const end = r.startSec + r.durationSec
+    if (t >= end - 1e-6) shift += r.durationSec
+    else if (t > r.startSec) shift += t - r.startSec
+  }
+  return Math.max(0, t - shift)
+}
+
+/**
+ * Remove the timeline span [startSec, endSec) from EVERY track at once and
+ * close the gap on all of them, the way Recut-style silence removal keeps a
+ * camera track and a separate microphone track in sync. Clips straddling an
+ * edge are split there (through splitClipAt, so keyframes / fades / speed /
+ * karaoke words follow); pieces inside the span are dropped; everything after
+ * it moves left by its length. The left piece keeps the clip's id, a right
+ * piece gets one from `newId`. Pure: returns a new clip list.
+ */
+export function cutSpanAllTracks<T extends SplittableClip & { id: string; trackId: string }>(
+  clips: T[],
+  startSec: number,
+  endSec: number,
+  newId: () => string
+): T[] {
+  const dur = endSec - startSec
+  if (!(dur > 1e-4)) return clips
+  const out: T[] = []
+  for (const c of clips) {
+    const cEnd = c.startSec + c.durationSec
+    if (cEnd <= startSec + 1e-4) {
+      out.push(c) // entirely before the span
+      continue
+    }
+    if (c.startSec >= endSec - 1e-4) {
+      out.push({ ...c, startSec: Math.max(0, c.startSec - dur) }) // entirely after: close the gap
+      continue
+    }
+    // Overlaps the span: keep what lies before it and what lies after it.
+    let rest: T = c
+    const atStart = c.startSec < startSec ? splitClipAt(c, startSec) : undefined
+    if (atStart) {
+      out.push(atStart.left)
+      rest = atStart.right
+    }
+    if (rest.startSec + rest.durationSec <= endSec + 1e-4) continue // the rest ends inside: dropped
+    const atEnd = splitClipAt(rest, endSec)
+    out.push(
+      atEnd
+        ? { ...atEnd.right, id: atStart ? newId() : rest.id, startSec }
+        : { ...rest, startSec: Math.max(0, rest.startSec - dur) } // starts right at the span's end
+    )
+  }
+  return out
 }

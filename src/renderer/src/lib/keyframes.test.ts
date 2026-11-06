@@ -7,7 +7,8 @@ import {
   sampleOpacity,
   hasTransform,
   normalizeTransform,
-  rebaseTracks
+  rebaseTracks,
+  splitTracksAt
 } from './keyframes'
 import type { Clip, Keyframe } from '../types'
 
@@ -129,5 +130,21 @@ describe('rebaseTracks', () => {
   it('returns the input unchanged for ~zero delta', () => {
     const kf = { scale: [k(0, 1)] }
     expect(rebaseTracks(kf, 0)).toBe(kf)
+  })
+})
+
+describe('splitTracksAt', () => {
+  it('gives boundary keys the easing of the segment the cut falls in', () => {
+    const { left, right } = splitTracksAt({ scale: [k(0, 1, 'hold'), k(4, 5, 'linear'), k(8, 9)] }, 2)
+    expect(left!.scale![1]).toEqual({ t: 2, v: 1, ease: 'hold' })
+    expect(right!.scale![0]).toEqual({ t: 0, v: 1, ease: 'hold' })
+    // The right piece still holds until the original t=4 key (now t=2).
+    expect(evalKeyframes(right!.scale!, 1.9)).toBe(1)
+  })
+  it('preserves a linear ramp exactly across the cut', () => {
+    const track = [k(0, 0, 'linear'), k(4, 100, 'linear')]
+    const { right } = splitTracksAt({ posX: track }, 1)
+    expect(right!.posX![0].ease).toBe('linear')
+    expect(evalKeyframes(right!.posX!, 1)).toBeCloseTo(evalKeyframes(track, 2))
   })
 })

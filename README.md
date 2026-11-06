@@ -40,6 +40,7 @@ Works on Windows and Linux. No subscription, no watermark, no cloud.
 
 **AI features**
 - **Auto-subtitles** — transcribe any clip locally with Whisper (no internet, no API key)
+- **Karaoke subtitles** — word-timed captions that highlight each word as it is sung (pop / underline / box), in the preview and the export
 - **Auto-reframe** — AI crop to 9:16, 1:1, or any aspect ratio
 
 **Other**

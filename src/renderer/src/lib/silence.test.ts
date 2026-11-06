@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { findSilences } from './silence'
+import { estimateThresholdDb, findSilences } from './silence'
 
 /** A minimal AudioBuffer stand-in — only getChannelData/duration/length are
  *  used by findSilences, so a real AudioBuffer isn't needed in a node test env. */
@@ -79,5 +79,63 @@ describe('findSilences', () => {
     // -40dB threshold -> linear ~0.01; a 0.001-amplitude tone should count as silent.
     const buf = makeBuffer(concat(tone(1, 0.5, SR), tone(0.5, 0.001, SR), tone(1, 0.5, SR)), SR)
     expect(findSilences(buf, OPTS).length).toBe(1)
+  })
+
+  it('does not drift on long files whose length is not a whole number of windows', () => {
+    // 600 s + 1 sample at 1 kHz: a floor(length/total) window would be 19 samples
+    // instead of 20, drifting ~25 s by the 500 s mark.
+    const buf = makeBuffer(concat(tone(500, 0.5, SR), tone(2, 0, SR), tone(98, 0.5, SR), tone(0.001, 0.5, SR)), SR)
+    const ranges = findSilences(buf, OPTS)
+    expect(ranges.length).toBe(1)
+    expect(ranges[0].startSec).toBeCloseTo(500, 2)
+    expect(ranges[0].endSec).toBeCloseTo(502, 2)
+  })
+
+  it('uses the loudest channel, so speech on channel 1 only is not silence', () => {
+    const left = concat(tone(1, 0.5, SR), tone(1, 0, SR), tone(1, 0.5, SR))
+    const right = tone(3, 0.5, SR)
+    const buf = {
+      getChannelData: (ch: number) => (ch === 0 ? left : right),
+      duration: 3,
+      length: left.length,
+      sampleRate: SR,
+      numberOfChannels: 2
+    } as unknown as AudioBuffer
+    expect(findSilences(buf, OPTS)).toEqual([])
+  })
+})
+
+describe('estimateThresholdDb', () => {
+  // Speech-like bursts at ~-12 dBFS over a ~-60 dBFS room tone, 50% of the time.
+  const sr = 8000
+  const make = (): AudioBuffer => {
+    const data = new Float32Array(sr * 10)
+    for (let i = 0; i < data.length; i++) {
+      const t = i / sr
+      const speaking = Math.floor(t * 2) % 2 === 0
+      data[i] = speaking ? 0.35 * Math.sin(2 * Math.PI * 220 * t) : 0.0014 * Math.sin(2 * Math.PI * 50 * t)
+    }
+    return { sampleRate: sr, length: data.length, numberOfChannels: 1, getChannelData: () => data } as unknown as AudioBuffer
+  }
+
+  it('lands between the room tone and the voice', () => {
+    const th = estimateThresholdDb(make())
+    expect(th).toBeGreaterThan(-60)
+    expect(th).toBeLessThan(-20)
+  })
+
+  it('the estimated threshold finds the pauses', () => {
+    const buf = make()
+    const ranges = findSilences(buf, { thresholdDb: estimateThresholdDb(buf), minSilenceSec: 0.3, minClipSec: 0.2 })
+    expect(ranges.length).toBe(10)
+    expect(ranges[0].startSec).toBeCloseTo(0.5, 1)
+  })
+
+  it('falls back to a sane value on digital silence', () => {
+    const data = new Float32Array(8000)
+    const buf = { sampleRate: 8000, length: 8000, numberOfChannels: 1, getChannelData: () => data } as unknown as AudioBuffer
+    const th = estimateThresholdDb(buf)
+    expect(th).toBeGreaterThanOrEqual(-70)
+    expect(th).toBeLessThanOrEqual(-15)
   })
 })

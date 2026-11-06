@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
 import { readMeterPeak } from '../lib/audioMeter'
+import { useT } from '../lib/i18n'
 
 // Map a linear peak (0..1) to a 0..100% bar on a -60..0 dB scale.
 function toPct(peak: number): number {
@@ -12,6 +13,7 @@ function toPct(peak: number): number {
 export default function Meter() {
   const fillRef = useRef<HTMLDivElement>(null)
   const peakRef = useRef<HTMLDivElement>(null)
+  const t = useT()
 
   useEffect(() => {
     let raf = 0
@@ -35,7 +37,7 @@ export default function Meter() {
   }, [])
 
   return (
-    <div className="meter" title="Master output level">
+    <div className="meter" title={t('Master output level')}>
       <div className="meter-fill" ref={fillRef} />
       <div className="meter-peak" ref={peakRef} />
     </div>

@@ -5,11 +5,17 @@
 // Input 0 is the silent video; inputs 1..N are the audible source files. Each
 // audio input is trimmed to its used span, re-timed, gained, faded, and delayed
 // to its timeline position, then all are summed (amix, no auto-normalize) and
-// brick-limited. Video is stream-copied (never re-encoded).
+// brick-limited. Video is stream-copied (never re-encoded); audio is AAC in MP4
+// or Opus in WebM, matching the pass-1 container.
 //
 // Filter order aresample -> atrim -> asetpts -> volume -> afade -> adelay is
 // mandatory; reordering produces wrong timing or silence.
+//
+// Reverb impulse responses (one float WAV per reverb track, written by
+// audioMux.ts from the shared generator) are extra inputs AFTER the sources.
 // ---------------------------------------------------------------------------
+
+import { clampReverb, reverbIRLength, reverbMixGains, type ReverbSettings } from '../shared/reverb'
 
 /** Resolved per-track gate (see renderer TrackGate). */
 export interface MuxGate {
@@ -33,6 +39,8 @@ export interface MuxEQ {
   midDb: number
   highDb: number
 }
+/** Per-track convolution reverb (see renderer TrackReverb); mix = wet 0..1. */
+export type MuxReverb = ReverbSettings
 /** Per-track compressor (see renderer TrackComp). */
 export interface MuxComp {
   thresholdDb: number
@@ -60,6 +68,14 @@ export interface MuxClip {
   duck?: MuxDuck
   eq?: MuxEQ
   comp?: MuxComp
+  reverb?: MuxReverb
+  /**
+   * The preview plays this clip through its <video> element's audio tap,
+   * straight into the master with no track panner (video-track clips that are
+   * not denoised). WebAudio up-mixes a mono tap at unity there, so the export
+   * does the same (see UNITY_UPMIX) instead of FFmpeg's −3 dB default.
+   */
+  directTap?: boolean
 }
 
 /**
@@ -92,11 +108,91 @@ export function panGains(pan: number): { left: number; right: number } {
   return { left: Math.cos(theta), right: Math.sin(theta) }
 }
 
+// ---------------------------------------------------------------------------
+// Mono vs stereo. FFmpeg converts mono to stereo (aformat, amix, -ac 2) at
+// −3 dB per side; WebAudio's channel up-mix is unity (L = R = mono), and its
+// StereoPannerNode has separate mono and stereo pan laws. The preview is the
+// reference, so wherever its signal path differs from FFmpeg's implicit
+// conversion the export spells the matrix out with a `pan` filter.
+//
+// The trick that makes one filter work without knowing the channel count:
+// `pan` silently drops terms naming a channel the input doesn't have. So in
+// `FL=FL+FC` a stereo input keeps FL (FC doesn't exist) and a mono input — whose
+// only channel is FC — gets FC. The aformat in front narrows anything else
+// (5.1, unordered 2-channel) to mono or stereo first, the way WebAudio's
+// 2-channel nodes down-mix (FFmpeg's float down-mix matrix is the same
+// L + 0.707·C + 0.707·Ls), and never touches a mono or stereo signal.
+// ---------------------------------------------------------------------------
+
+/** Narrows to mono|stereo without converting either (see above). */
+const MONO_OR_STEREO = 'aformat=channel_layouts=mono|stereo'
+
+/**
+ * Unity mono→stereo up-mix (L = R = mono), as a WebAudio node with
+ * channelCount 2 / 'explicit' (the dynamics worklet, the duck key input) or the
+ * master mix does it. Stereo passes through untouched.
+ */
+export const UNITY_UPMIX = `${MONO_OR_STEREO},pan=stereo|FL=FL+FC|FR=FR+FC`
+
+/**
+ * One `pan` filter reproducing WebAudio's StereoPannerNode for EITHER input:
+ * a mono input gets the mono equal-power law (panGains; −3 dB per side at
+ * centre), a stereo input the stereo law (see stereoPanFilter). Sample-exact
+ * for both, so the export follows whichever the preview's panner sees.
+ */
+export function panFilter(pan: number): string {
+  const p = Math.max(-1, Math.min(1, pan))
+  const m = panGains(p)
+  const x = p <= 0 ? p + 1 : p
+  const gl = Math.cos((x * Math.PI) / 2).toFixed(6)
+  const gr = Math.sin((x * Math.PI) / 2).toFixed(6)
+  const ml = m.left.toFixed(6)
+  const mr = m.right.toFixed(6)
+  return p <= 0
+    ? `${MONO_OR_STEREO},pan=stereo|FL=FL+${gl}*FR+${ml}*FC|FR=${gr}*FR+${mr}*FC`
+    : `${MONO_OR_STEREO},pan=stereo|FL=${gl}*FL+${ml}*FC|FR=FR+${gr}*FL+${mr}*FC`
+}
+
+/**
+ * `pan` filter for an already-STEREO signal that reproduces WebAudio's
+ * StereoPannerNode stereo-input algorithm exactly (the side being panned away
+ * from is folded into the other with an equal-power gain). Used for the reverb
+ * wet branch, which is always stereo in both preview and export.
+ */
+export function stereoPanFilter(pan: number): string {
+  const p = Math.max(-1, Math.min(1, pan))
+  const x = p <= 0 ? p + 1 : p
+  const gl = Math.cos((x * Math.PI) / 2).toFixed(5)
+  const gr = Math.sin((x * Math.PI) / 2).toFixed(5)
+  return p <= 0 ? `pan=stereo|c0=c0+${gl}*c1|c1=${gr}*c1` : `pan=stereo|c0=${gl}*c0|c1=c1+${gr}*c0`
+}
+
 export interface BuildMuxArgsOptions {
   silentPath: string
   outputPath: string
   sampleRate: number
   clips: MuxClip[]
+  /**
+   * Exact output length (the video's). apad makes the audio infinite so it
+   * always spans the video; -shortest alone is meant to cut it back, but with
+   * a stream-copied video FFmpeg 7 never stops, so the length is also set
+   * explicitly with -t.
+   */
+  durationSec?: number
+  /**
+   * When set, the filtergraph is passed as `-filter_complex_script <path>`
+   * (the caller writes `buildMuxGraph(...)` there) instead of inline. A long
+   * timeline's graph easily exceeds the Windows 32K command-line limit.
+   */
+  filterScriptPath?: string
+  /**
+   * Reverb IR WAV paths, one per `planReverbs(clips)` entry and in that order.
+   * They become inputs N+1.. after the sources; the graph's afir filters
+   * reference them by that index.
+   */
+  irPaths?: string[]
+  /** Output container (default mp4 = AAC). webm = Opus, which only runs at 48 kHz. */
+  container?: 'mp4' | 'webm'
 }
 
 function dbToLinear(db: number): number {
@@ -119,29 +215,119 @@ function clampFades(fadeInSec: number, fadeOutSec: number, durationSec: number):
   return [fi, fo]
 }
 
-export function buildMuxArgs(opts: BuildMuxArgsOptions): string[] {
-  const { silentPath, outputPath, sampleRate, clips } = opts
-  const args: string[] = ['-y', '-i', silentPath]
-  for (const c of clips) args.push('-i', c.path)
+/** Clamp to [lo, hi]; non-finite values fall back to `fallback`. */
+function clampNum(v: number, lo: number, hi: number, fallback: number): number {
+  return Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : fallback
+}
 
+// FFmpeg rejects out-of-range filter options and aborts the whole mux, while
+// the Inspector sliders allow e.g. attack = 0 ms. These mirror the option
+// ranges of agate / acompressor / sidechaincompress.
+/** Fixed-size blocks for both sidechaincompress inputs (see buildFxGraph). */
+const SC_BLOCKS = 'asetnsamples=n=1024:p=1'
+const MIN_THRESHOLD = 0.000976563
+const attackMs = (v: number, max: number): number => clampNum(v, 0.01, max, 20)
+const releaseMs = (v: number): number => clampNum(v, 0.01, 9000, 250)
+const ratio = (v: number): number => clampNum(v, 1, 20, 2)
+const threshold = (db: number): string => clampNum(dbToLinear(db), MIN_THRESHOLD, 1, 0.125).toFixed(6)
+
+/**
+ * One FFmpeg input per unique source path (inputs 1..N; 0 is the video). A
+ * source used by several clips is opened once and fanned out with asplit, so
+ * a cut-heavy timeline doesn't spawn one decoder (and one `-i`) per clip.
+ * Returns the unique paths, the asplit prelude chains, and each clip's source
+ * pad label. Single-use sources keep the plain `[k:a]` label.
+ */
+function planInputs(clips: MuxClip[]): { paths: string[]; prelude: string[]; labels: string[] } {
+  const paths: string[] = []
+  const users = new Map<string, number[]>()
+  clips.forEach((c, i) => {
+    if (!users.has(c.path)) {
+      users.set(c.path, [])
+      paths.push(c.path)
+    }
+    users.get(c.path)!.push(i)
+  })
+  const labels: string[] = new Array(clips.length)
+  const prelude: string[] = []
+  paths.forEach((p, k) => {
+    const input = k + 1
+    const idx = users.get(p)!
+    if (idx.length === 1) {
+      labels[idx[0]] = `[${input}:a]`
+      return
+    }
+    idx.forEach((i, j) => (labels[i] = `[s${input}_${j}]`))
+    prelude.push(`[${input}:a]asplit=${idx.length}${idx.map((_, j) => `[s${input}_${j}]`).join('')}`)
+  })
+  return { paths, prelude, labels }
+}
+
+/**
+ * The reverb tracks that need an impulse response, in the order their IR
+ * inputs are passed to FFmpeg (track first-seen order). Settings are clamped
+ * here (main never trusts the renderer's numbers); a zero mix is no reverb.
+ */
+export function planReverbs(clips: MuxClip[]): { trackId: string; reverb: ReverbSettings }[] {
+  const out: { trackId: string; reverb: ReverbSettings }[] = []
+  const seen = new Set<string>()
+  for (const c of clips) {
+    if (seen.has(c.trackId)) continue
+    seen.add(c.trackId)
+    if (!c.reverb) continue
+    const reverb = clampReverb(c.reverb)
+    if (reverb.mix > 0) out.push({ trackId: c.trackId, reverb })
+  }
+  return out
+}
+
+/** The full mux filtergraph (see buildMuxArgs). */
+/**
+ * The master bus tail every graph ends with: optional loudness gain (a static
+ * volume, see loudnessGainDb), the brick-wall limiter, and apad so the audio
+ * always spans the video (-shortest / -t then trims it).
+ */
+export function masterTail(masterGainDb = 0): string {
+  const gain = Number.isFinite(masterGainDb) && Math.abs(masterGainDb) >= 0.01 ? `volume=${masterGainDb.toFixed(2)}dB,` : ''
+  return `${gain}alimiter=limit=0.97,apad`
+}
+
+export function buildMuxGraph(clips: MuxClip[], sampleRate: number, masterGainDb = 0): string {
+  const { paths, prelude, labels } = planInputs(clips)
   // Projects with NO gate/duck use the original flat per-clip graph (verified,
   // byte-stable). Only when a track enables gate/duck do we switch to per-track
   // submixing, which is what lets a gate act on a track's mix and a ducker key
   // off another track.
-  const usesTrackFx = clips.some((c) => c.gate || c.duck || c.eq || c.comp)
-  const graph = usesTrackFx ? buildFxGraph(clips, sampleRate) : buildFlatGraph(clips, sampleRate)
+  const usesTrackFx = clips.some((c) => c.gate || c.duck || c.eq || c.comp || c.reverb)
+  const graph = usesTrackFx
+    ? buildFxGraph(clips, labels, sampleRate, paths.length + 1, masterGainDb)
+    : buildFlatGraph(clips, labels, sampleRate, masterGainDb)
+  return [...prelude, graph].join(';')
+}
 
+export function buildMuxArgs(opts: BuildMuxArgsOptions): string[] {
+  const { silentPath, outputPath, sampleRate, clips, filterScriptPath, durationSec } = opts
+  const args: string[] = ['-y', '-i', silentPath]
+  for (const p of planInputs(clips).paths) args.push('-i', p)
+  for (const p of opts.irPaths ?? []) args.push('-i', p)
+
+  if (filterScriptPath) args.push('-filter_complex_script', filterScriptPath)
+  else args.push('-filter_complex', buildMuxGraph(clips, sampleRate))
+
+  // The audio codec follows the container of the pass-1 video being copied:
+  // AAC in MP4, Opus in WebM (Opus only runs at 48 kHz, so it is resampled).
+  const webm = opts.container === 'webm'
   args.push(
-    '-filter_complex', graph,
     '-map', '0:v',
     '-map', '[aout]',
     '-c:v', 'copy',
-    '-c:a', 'aac',
-    '-b:a', '192k',
-    '-ar', String(sampleRate),
+    ...(webm ? ['-c:a', 'libopus', '-b:a', '160k', '-ar', '48000'] : ['-c:a', 'aac', '-b:a', '192k', '-ar', String(sampleRate)]),
     '-ac', '2',
     '-shortest',
-    '-movflags', '+faststart',
+    ...(durationSec && Number.isFinite(durationSec) && durationSec > 0 ? ['-t', durationSec.toFixed(3)] : []),
+    ...(webm ? [] : ['-movflags', '+faststart']),
+    // Explicit muxer: the caller may write to a `.part` name and rename on success.
+    '-f', webm ? 'webm' : 'mp4',
     outputPath
   )
   return args
@@ -153,12 +339,11 @@ export function buildMuxArgs(opts: BuildMuxArgsOptions): string[] {
  * then clips it back to the exact video length. Without apad, audio that ends
  * before the timeline would truncate the whole export.
  */
-function buildFlatGraph(clips: MuxClip[], sampleRate: number): string {
+function buildFlatGraph(clips: MuxClip[], labels: string[], sampleRate: number, masterGainDb = 0): string {
   const chains = clips.map((c, i) => {
-    const input = i + 1 // input 0 is the video
     const vol = (c.volume ?? 1) * dbToLinear(c.trackGainDb ?? 0)
     let chain =
-      `[${input}:a]aresample=${sampleRate},` +
+      `${labels[i]}aresample=${sampleRate},` +
       `atrim=start=${c.inSec.toFixed(3)}:end=${(c.inSec + clipSrcSpan(c)).toFixed(3)},` +
       `asetpts=PTS-STARTPTS,` +
       `${speedFilter(c.speed, sampleRate)}` +
@@ -168,20 +353,21 @@ function buildFlatGraph(clips: MuxClip[], sampleRate: number): string {
     if (fo > 0) {
       chain += `,afade=t=out:st=${Math.max(0, c.durationSec - fo).toFixed(3)}:d=${fo.toFixed(3)}`
     }
-    if (c.pan && Math.abs(c.pan) > 0.001) {
-      const { left, right } = panGains(c.pan)
-      chain += `,aformat=channel_layouts=stereo,pan=stereo|c0=${left.toFixed(5)}*c0|c1=${right.toFixed(5)}*c1`
-    }
+    // Pan per clip (no track bus here), with the preview panner's exact law
+    // for this source's channel count. Unpanned mono stays mono: the final
+    // -ac 2 up-mixes it at −3 dB, which is what a centred panner does to mono.
+    if (c.pan && Math.abs(c.pan) > 0.001) chain += `,${panFilter(c.pan)}`
+    if (c.directTap) chain += `,${UNITY_UPMIX}`
     chain += `,adelay=${Math.round(c.startSec * 1000)}:all=1[a${i}]`
     return chain
   })
 
   let graph = chains.join(';')
   if (clips.length === 1) {
-    graph += `;[a0]alimiter=limit=0.97,apad[aout]`
+    graph += `;[a0]${masterTail(masterGainDb)}[aout]`
   } else {
     const labels = clips.map((_, i) => `[a${i}]`).join('')
-    graph += `;${labels}amix=inputs=${clips.length}:normalize=0:duration=longest,alimiter=limit=0.97,apad[aout]`
+    graph += `;${labels}amix=inputs=${clips.length}:normalize=0:duration=longest,${masterTail(masterGainDb)}[aout]`
   }
   return graph
 }
@@ -191,17 +377,22 @@ function buildFlatGraph(clips: MuxClip[], sampleRate: number): string {
  * trackGain -> [gate] -> [duck] -> [pan], and the buses are summed. Each duck's
  * sidechain key is split from its trigger's PRE-duck bus (so even mutual A<->B
  * ducking stays a DAG), padded with apad so a short trigger can't truncate the
- * longer ducked track, and forced to stereo (sidechaincompress needs matching
- * layouts). dB levels -> linear; times stay in ms; ratio clamped to FFmpeg's 20.
+ * longer ducked track, and up-mixed to stereo at unity like the preview
+ * worklet's key input (sidechaincompress needs matching layouts). Tracks that
+ * run the preview worklet (EQ/gate/comp/duck) up-mix at unity the same way.
+ * dB levels -> linear; times stay in ms; every option is clamped to FFmpeg's
+ * accepted range. Reverb sits after the duck and before the pan (as in
+ * the preview chain), on its own dry/wet split; `irBase` is the FFmpeg input
+ * index of the first reverb IR.
  */
-function buildFxGraph(clips: MuxClip[], sampleRate: number): string {
+function buildFxGraph(clips: MuxClip[], labels: string[], sampleRate: number, irBase: number, masterGainDb = 0): string {
   const G: string[] = []
+  const irInput = new Map(planReverbs(clips).map((r, j) => [r.trackId, { input: irBase + j, reverb: r.reverb }]))
 
   // 1. per-clip -> [c{i}] (clip volume + fades only; trackGain & pan move to the bus)
   clips.forEach((c, i) => {
-    const input = i + 1
     let chain =
-      `[${input}:a]aresample=${sampleRate},` +
+      `${labels[i]}aresample=${sampleRate},` +
       `atrim=start=${c.inSec.toFixed(3)}:end=${(c.inSec + clipSrcSpan(c)).toFixed(3)},` +
       `asetpts=PTS-STARTPTS,` +
       `${speedFilter(c.speed, sampleRate)}` +
@@ -211,6 +402,7 @@ function buildFxGraph(clips: MuxClip[], sampleRate: number): string {
     if (fo > 0) {
       chain += `,afade=t=out:st=${Math.max(0, c.durationSec - fo).toFixed(3)}:d=${fo.toFixed(3)}`
     }
+    if (c.directTap) chain += `,${UNITY_UPMIX}`
     chain += `,adelay=${Math.round(c.startSec * 1000)}:all=1[c${i}]`
     G.push(chain)
   })
@@ -240,6 +432,10 @@ function buildFxGraph(clips: MuxClip[], sampleRate: number): string {
       idx.length === 1
         ? `${ins}volume=${dbToLinear(info.trackGainDb ?? 0).toFixed(4)}`
         : `${ins}amix=inputs=${idx.length}:normalize=0:duration=longest,volume=${dbToLinear(info.trackGainDb ?? 0).toFixed(4)}`
+    // A track with EQ/gate/comp/duck runs the preview's dynamics worklet,
+    // whose 2-channel explicit input up-mixes mono at unity: do the same, so
+    // the bus is stereo from here on (and the pan below uses the stereo law).
+    if (info.eq || info.gate || info.comp || info.duck) bus += `,${UNITY_UPMIX}`
     // EQ -> gate -> compressor (mirrors the preview worklet's signal flow). RBJ
     // shelving/peaking matches the worklet biquads; acompressor pairs with the
     // worklet's compressor (same knobs, perceptually matched).
@@ -251,15 +447,17 @@ function buildFxGraph(clips: MuxClip[], sampleRate: number): string {
     }
     if (info.gate) {
       bus +=
-        `,agate=threshold=${dbToLinear(info.gate.thresholdDb).toFixed(6)}` +
-        `:range=${dbToLinear(info.gate.rangeDb).toFixed(6)}` +
-        `:ratio=${info.gate.ratio}:attack=${info.gate.attackMs}:release=${info.gate.releaseMs}:detection=rms`
+        `,agate=threshold=${threshold(info.gate.thresholdDb)}` +
+        `:range=${clampNum(dbToLinear(info.gate.rangeDb), 0, 1, 0.06125).toFixed(6)}` +
+        `:ratio=${ratio(info.gate.ratio)}:attack=${attackMs(info.gate.attackMs, 9000)}` +
+        `:release=${releaseMs(info.gate.releaseMs)}:detection=rms`
     }
     if (info.comp) {
       bus +=
-        `,acompressor=threshold=${dbToLinear(info.comp.thresholdDb).toFixed(6)}` +
-        `:ratio=${info.comp.ratio}:attack=${info.comp.attackMs}:release=${info.comp.releaseMs}` +
-        `:makeup=${dbToLinear(info.comp.makeupDb).toFixed(4)}`
+        `,acompressor=threshold=${threshold(info.comp.thresholdDb)}` +
+        `:ratio=${ratio(info.comp.ratio)}:attack=${attackMs(info.comp.attackMs, 2000)}` +
+        `:release=${releaseMs(info.comp.releaseMs)}` +
+        `:makeup=${clampNum(dbToLinear(info.comp.makeupDb), 1, 64, 1).toFixed(4)}`
     }
     bus += `[bus_${k}]`
     G.push(bus)
@@ -288,19 +486,50 @@ function buildFxGraph(clips: MuxClip[], sampleRate: number): string {
     let term = consumers.has(k) ? `[main_${k}]` : `[bus_${k}]`
     const trigK = info.duck ? trackK.get(info.duck.triggerTrackId) : undefined
     if (info.duck && trigK !== undefined) {
-      const r = Math.min(20, info.duck.ratio)
-      G.push(`[key_${trigK}_${k}]aformat=channel_layouts=stereo,apad[kp_${trigK}_${k}]`)
-      G.push(`${term}aformat=channel_layouts=stereo[md_${k}]`)
+      // The key enters the preview worklet's 2-channel input too (unity
+      // up-mix); the ducked bus is already stereo (see step 2).
+      // Both sidechaincompress inputs are re-blocked to a fixed frame size: its
+      // output otherwise depends on how the two inputs' frames happen to
+      // arrive (each input decodes on its own thread in FFmpeg 7), so the same
+      // project could export a different glitch now and then. p=1 pads only
+      // the ducked track's final block with silence (the mix is padded anyway).
+      G.push(`[key_${trigK}_${k}]${UNITY_UPMIX},apad,${SC_BLOCKS}[kp_${trigK}_${k}]`)
+      G.push(`${term}${SC_BLOCKS}[mb_${k}]`)
       G.push(
-        `[md_${k}][kp_${trigK}_${k}]sidechaincompress=` +
-          `threshold=${dbToLinear(info.duck.thresholdDb).toFixed(6)}:ratio=${r}` +
-          `:attack=${info.duck.attackMs}:release=${info.duck.releaseMs}[dk_${k}]`
+        `[mb_${k}][kp_${trigK}_${k}]sidechaincompress=` +
+          `threshold=${threshold(info.duck.thresholdDb)}:ratio=${ratio(info.duck.ratio)}` +
+          `:attack=${attackMs(info.duck.attackMs, 2000)}:release=${releaseMs(info.duck.releaseMs)}[dk_${k}]`
       )
       term = `[dk_${k}]`
     }
-    if (info.pan && Math.abs(info.pan) > 0.001) {
-      const { left, right } = panGains(info.pan)
-      G.push(`${term}aformat=channel_layouts=stereo,pan=stereo|c0=${left.toFixed(5)}*c0|c1=${right.toFixed(5)}*c1[t_${k}]`)
+    const panned = !!info.pan && Math.abs(info.pan) > 0.001
+    const ir = irInput.get(tid)
+    if (ir) {
+      // Reverb: split -> dry (volume) + wet (afir with the shared IR, volume),
+      // each panned like the preview's two StereoPanners, then summed.
+      // Both branches only ever narrow to mono|stereo before their `pan`: an
+      // aformat=stereo on either would make FFmpeg convert the bus BEFORE the
+      // asplit (at swresample's -3 dB mono upmix) for both.
+      //  • wet: unity upmix (mono FC -> both sides at full level, as a WebAudio
+      //    ConvolverNode treats mono; stereo passes through), padded by the IR
+      //    length so the tail rings out past the last clip, convolved with
+      //    irnorm=-1:irgain=1 = no auto-gain (the IR is pre-normalized, see
+      //    shared/reverb.ts), then WebAudio's exact stereo pan law.
+      //  • dry: exactly the no-reverb terminal (the panner's mono or stereo
+      //    law, centred when unpanned), so a 0% mix changes nothing.
+      const { dry, wet } = reverbMixGains(ir.reverb.mix)
+      const padSec = reverbIRLength(ir.reverb, sampleRate) / sampleRate
+      G.push(`${term}asplit=2[rd_${k}][rw_${k}]`)
+      G.push(`[rw_${k}]${UNITY_UPMIX},apad=pad_dur=${padSec.toFixed(3)}[rx_${k}]`)
+      G.push(
+        `[rx_${k}][${ir.input}:a]afir=irnorm=-1:irgain=1,volume=${wet.toFixed(6)}` +
+          `${panned ? `,${stereoPanFilter(info.pan)}` : ''}[rwo_${k}]`
+      )
+      G.push(`[rd_${k}]volume=${dry.toFixed(6)},${panFilter(panned ? info.pan : 0)}[rdo_${k}]`)
+      G.push(`[rdo_${k}][rwo_${k}]amix=inputs=2:normalize=0:duration=longest[t_${k}]`)
+    } else if (panned) {
+      // The preview panner's exact law for the bus's channel count.
+      G.push(`${term}${panFilter(info.pan)}[t_${k}]`)
     } else {
       G.push(`${term}anull[t_${k}]`)
     }
@@ -309,9 +538,58 @@ function buildFxGraph(clips: MuxClip[], sampleRate: number): string {
   // 6. sum track terminals -> limiter -> pad
   const terms = order.map((_, k) => `[t_${k}]`).join('')
   if (order.length === 1) {
-    G.push(`[t_0]alimiter=limit=0.97,apad[aout]`)
+    G.push(`[t_0]${masterTail(masterGainDb)}[aout]`)
   } else {
-    G.push(`${terms}amix=inputs=${order.length}:normalize=0:duration=longest,alimiter=limit=0.97,apad[aout]`)
+    G.push(`${terms}amix=inputs=${order.length}:normalize=0:duration=longest,${masterTail(masterGainDb)}[aout]`)
   }
   return G.join(';')
+}
+
+// --- loudness normalization (export option) ------------------------------------
+
+/** Accepted export loudness targets (integrated LUFS). */
+export const LOUDNESS_TARGETS = [-14, -16, -23] as const
+
+/** Graph suffix that measures the finished mix with loudnorm (first pass). */
+export function loudnessProbeGraph(graph: string): string {
+  return `${graph};[aout]loudnorm=I=-16:TP=-1:LRA=11:print_format=json[meas]`
+}
+
+/**
+ * Args for the measuring pass: the same inputs (video, sources, reverb IRs) in
+ * the same order as the real mux, the probe graph from a script file, audio
+ * only, written nowhere. Capped at the video length like the mux.
+ */
+export function buildLoudnessProbeArgs(opts: {
+  silentPath: string
+  clips: MuxClip[]
+  irPaths?: string[]
+  filterScriptPath: string
+  durationSec?: number
+}): string[] {
+  const args: string[] = ['-y', '-hide_banner', '-nostats', '-i', opts.silentPath]
+  for (const p of planInputs(opts.clips).paths) args.push('-i', p)
+  for (const p of opts.irPaths ?? []) args.push('-i', p)
+  args.push('-filter_complex_script', opts.filterScriptPath, '-map', '[meas]')
+  if (opts.durationSec && Number.isFinite(opts.durationSec) && opts.durationSec > 0) args.push('-t', opts.durationSec.toFixed(3))
+  args.push('-f', 'null', '-')
+  return args
+}
+
+/** Integrated loudness ("input_i") from loudnorm's JSON report, or null. */
+export function parseLoudnormInputI(stderr: string): number | null {
+  const m = /"input_i"\s*:\s*"(-?[\d.]+|-?inf)"/.exec(stderr)
+  if (!m) return null
+  const v = Number(m[1])
+  return Number.isFinite(v) ? v : null
+}
+
+/**
+ * Static gain that moves a mix measured at `measuredLufs` to `targetLufs`.
+ * Silence (no measurement) gets no gain; boosts are capped so a near-silent
+ * mix isn't amplified into noise (the limiter still guards the peaks).
+ */
+export function loudnessGainDb(measuredLufs: number | null, targetLufs: number): number {
+  if (measuredLufs === null || measuredLufs < -70) return 0
+  return Math.max(-30, Math.min(20, targetLufs - measuredLufs))
 }

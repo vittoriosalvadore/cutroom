@@ -28,3 +28,46 @@ jobs:
 
       - name: Test
         run: npm test
+
+  # Installable builds for testing a pull request before release: the Windows
+  # installer and the Linux AppImage are attached to the workflow run as
+  # artifacts (Actions → this run → Artifacts). Each OS builds on its own
+  # runner so ffmpeg-static bundles the right FFmpeg binary.
+  package:
+    name: installer (${{ matrix.os }})
+    needs: verify
+    if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            script: package:win
+            files: dist/*.exe
+            artifact: cutroom-windows-installer
+          - os: ubuntu-latest
+            script: package:linux
+            files: dist/*.AppImage
+            artifact: cutroom-linux-appimage
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build installer
+        run: npm run ${{ matrix.script }}
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.files }}
+          if-no-files-found: error
+          retention-days: 14

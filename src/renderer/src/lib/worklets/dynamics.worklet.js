@@ -8,6 +8,11 @@
 // input[0] = the track signal (post fader, pre pan). input[1] = the OPTIONAL
 // duck trigger ("key") — another track's post-fader signal. output[0] = the
 // processed track signal. All params are k-rate (one value per render quantum).
+// The node is created with channelCount 2 / 'explicit' (audioPool.ts), so
+// inputs arrive down-mixed to at most stereo — the filter state is 2-channel.
+//
+// Lifetime: process() returns true (keep alive, even with no input) until the
+// node is sent the 'dispose' message, then false so the processor is released.
 //
 // Signal flow per sample: EQ -> [gate gain] x [comp gain] x [duck gain]. The EQ
 // uses RBJ-cookbook biquads, matching FFmpeg bass/equalizer/treble on export;
@@ -141,15 +146,20 @@ class DynamicsProcessor extends AudioWorkletProcessor {
     this.eqMid = NaN
     this.eqHi = NaN
     this.eqd = [0, 0]
+    this.alive = true
+    this.port.onmessage = (e) => {
+      if (e.data === 'dispose') this.alive = false
+    }
   }
 
   process(inputs, outputs, params) {
     const input = inputs[0]
     const key = inputs[1]
     const output = outputs[0]
+    if (!this.alive) return false
     if (!input || input.length === 0) return true // nothing upstream -> silence
 
-    const nCh = input.length
+    const nCh = Math.min(input.length, 2) // stereo-sized state (see header)
     const len = input[0].length
     const keyCh = key && key.length ? key.length : 0
 

@@ -22,12 +22,28 @@ function slotPath(dir: string, slot: number): string {
   return join(dir, slot === 0 ? 'recovery.json' : `recovery.${slot}.json`)
 }
 
+let tmpCounter = 0
+
 /**
- * Rotate down then atomically write the newest snapshot to the primary slot.
- * Rotation is best-effort per slot (a missing/unlinkable older file is skipped),
- * so a damaged filesystem degrades gracefully instead of throwing.
+ * Atomically write the newest snapshot to the primary slot, rotating older
+ * snapshots down. The new snapshot is fully written to a temp file BEFORE any
+ * rotation, so a crash or failed write (disk full) never leaves the ring
+ * without a primary. Rotation is best-effort per slot (a missing/unlinkable
+ * older file is skipped), so a damaged filesystem degrades gracefully instead
+ * of throwing. Callers must not run two writeRing calls on one dir at once
+ * (see the serialized queue in projectStore).
  */
 export async function writeRing(dir: string, json: string): Promise<void> {
+  const primary = slotPath(dir, 0)
+  tmpCounter += 1
+  const tmp = `${primary}.${process.pid}.${tmpCounter}.tmp`
+  try {
+    await writeFile(tmp, json, 'utf-8')
+  } catch (e) {
+    await unlink(tmp).catch(() => undefined)
+    throw e
+  }
+
   // Drop the oldest slot (falls off the ring).
   const oldest = slotPath(dir, RING_SLOTS)
   if (existsSync(oldest)) {
@@ -49,10 +65,6 @@ export async function writeRing(dir: string, json: string): Promise<void> {
       }
     }
   }
-  // Atomic write of the newest snapshot into the primary slot.
-  const primary = slotPath(dir, 0)
-  const tmp = `${primary}.tmp`
-  await writeFile(tmp, json, 'utf-8')
   await rename(tmp, primary)
 }
 

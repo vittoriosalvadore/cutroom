@@ -47,4 +47,26 @@ describe('webglRestore.RestoreMachine', () => {
     m.onRestored()
     expect(m.state).toBe('idle')
   })
+
+  it('ignores a stale markStable while a second loss is reconnecting', () => {
+    const m = new RestoreMachine()
+    m.onLost()
+    m.onRestored()
+    m.onLost() // lost again before the stable timer fired
+    m.markStable()
+    expect(m.state).toBe('reconnecting')
+    expect(m.onRestored()).toBe(true) // the rebuild still happens
+    expect(m.state).toBe('idle')
+  })
+
+  it('markStable does not leave failed', () => {
+    const m = new RestoreMachine()
+    for (let i = 0; i <= m.maxRetries; i++) {
+      m.onLost()
+      m.onRestored()
+    }
+    expect(m.state).toBe('failed')
+    m.markStable()
+    expect(m.state).toBe('failed')
+  })
 })

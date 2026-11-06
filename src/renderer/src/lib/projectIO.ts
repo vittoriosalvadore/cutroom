@@ -9,11 +9,14 @@ import { deserializeProject, serializeProject } from './projectFile'
 /** Save to the current file, or prompt for one. `forceDialog` => Save As. */
 export async function saveProject(forceDialog = false): Promise<boolean> {
   const st = useEditor.getState()
-  const json = serializeProject(st.project)
+  // Capture the exact state being written: edits made while the (async) dialog/
+  // write is in flight aren't on disk, so they must still read as unsaved.
+  const project = st.project
+  const json = serializeProject(project)
   const filePath = forceDialog ? null : st.projectFilePath
   const res = await window.cutroom.saveProject({ filePath, json })
   if (res.ok && res.filePath) {
-    useEditor.getState().markSaved(res.filePath)
+    useEditor.getState().markSaved(res.filePath, project)
     return true
   }
   return false
